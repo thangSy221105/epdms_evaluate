@@ -1,0 +1,36 @@
+{
+  "metric_profile": "nurec_safety_proxy_v1",
+  "horizon_s": 4.0,
+  "frequency_hz": 10.0,
+  "strict_mode": true,
+  "resume": true,
+  "random_seed": 2026,
+  "alphas": [0.0, 0.5, 1.0, 2.0],
+  "modes": [
+    "cross_scene",
+    "no_reasoning",
+    "noisy",
+    "opposite_action"
+  ],
+  "vehicle": {
+    "reference_point": "rear_axle",
+    "front_length_m": 4.049,
+    "rear_length_m": 1.127,
+    "width_m": 2.297
+  },
+  "proxy": {
+    "touch_is_collision": true,
+    "ttc_horizon_s": 1.0,
+    "progress_stationary_threshold_m": 5.0,
+    "practical_score_delta": 0.01,
+    "practical_ade_delta_m": 0.05
+  },
+  "paths": {
+    "prediction_jsonl": "D:\\300_clip_nurec\\00_raw\\ar1_output\\reasoning_intervention_nurec_selected_300.jsonl",
+    "context_jsonl": "D:\\300_clip_nurec\\01_context\\full\\nurec_context_full_300.jsonl",
+    "context_filtered_dir": "D:\\300_clip_nurec\\01_context\\reasoning_filtered\\nurec_reasoning_filtered_300_v2",
+    "ground_truth_jsonl": "D:\\300_clip_nurec\\00_raw\\ground_truth\\ego_future_gt_nurec_300.jsonl",
+    "score_dir": "D:\\300_clip_nurec\\02_gtrs\\scores\\epdms",
+    "analysis_dir": "D:\\300_clip_nurec\\04_analysis\\epdms"
+  }
+}
