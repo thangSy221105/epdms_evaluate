@@ -142,27 +142,53 @@ python -m unittest discover tests/epdms
 
 ---
 
-## 5. Hướng dẫn Đẩy mã nguồn lên Git (GitHub Push)
+## 5. Báo cáo Khắc phục Toàn diện 18 Vấn đề Peer Review (Code Review Resolution)
 
-Để đưa toàn bộ mã nguồn vừa tạo lên repo cá nhân của bạn trên GitHub, bạn chỉ cần thực hiện các lệnh sau trong PowerShell tại thư mục `epdms_evaluate`:
+Sau đợt bình duyệt độc lập từ reviewer (“Sếp LM”), toàn bộ mã nguồn đã được tái cấu trúc triệt để nhằm đảm bảo tính toàn vẹn khoa học cao nhất, ngăn chặn hoàn toàn hiện tượng “điểm an toàn giả”, loại bỏ phạt nhầm Comfort khi xe dừng, và bảo vệ checkpoint/resume an toàn tuyệt đối.
 
-```powershell
-cd "c:\Users\DELL\OneDrive\Tài liệu\ChatGPT\read paper\epdms_evaluate"
+### Bảng chi tiết 18 vấn đề và giải pháp đã thực thi:
 
-# 1. Kiểm tra trạng thái các file mới
-git status
-
-# 2. Thêm tất cả file vào staging
-git add .
-
-# 3. Tạo commit bàn giao
-git commit -m "feat: complete NuRec 300 EPDMS and Safety Proxy v1 evaluation pipeline"
-
-# 4. Đẩy code lên nhánh chính (main) trên GitHub
-git push origin main
-```
+| STT | Vấn đề Peer Review | Module sửa đổi | Giải pháp kỹ thuật đã áp dụng | Trạng thái |
+| :---: | :--- | :--- | :--- | :---: |
+| **1** | Spikes yaw-rate/yaw-accel khi xe dừng do $\arctan2(0,0)=0$ | `coordinates.py` | Sửa `derive_heading_from_xy` dùng forward/backward fill hướng di chuyển gần nhất cho mọi đoạn dừng | **RESOLVED** |
+| **2** | Điểm nằm đúng mép viền polygon đánh giá không nhất quán | `geometry_numpy.py` | Thêm `is_point_on_segment` với dung sai epsilon $10^{-7}$, mọi điểm trên biên đều là inside | **RESOLVED** |
+| **3** | Khoảng cách clearance giữa 2 hộp rời rạc không chuẩn Euclidean | `geometry_numpy.py` | Thêm `compute_exact_box_distance` đo khoảng cách đỉnh-cạnh Euclidean chính xác | **RESOLVED** |
+| **4** | Giá trị NaN/Inf lọt qua tính toán động học kinematics | `kinematics_numpy.py` | Kiểm tra nghiêm ngặt `np.all(np.isfinite(...))` ngay từ đầu hàm `compute_kinematics`, văng lỗi nếu có NaN | **RESOLVED** |
+| **5** | Đánh giá Comfort để lọt NaN do toán tử so sánh | `kinematics_numpy.py` | Toàn bộ mảng gia tốc dọc/ngang/jerk được kiểm tra hữu hạn trước khi so ngưỡng comfort | **RESOLVED** |
+| **6** | Thiếu dữ liệu map polygon nhưng gán mặc định DAC = 1.0 | `proxy_metrics.py`, `score_record.py` | Thiếu bản đồ lập tức trả về `None`, đánh dấu record `valid=False`, lý do `MISSING_MAP_DATA` | **RESOLVED** |
+| **7** | Thiếu dữ liệu vật cản context nhưng gán CF = 1.0, TTC = 1.0 | `proxy_metrics.py`, `score_record.py` | Thiếu context obstacles trả về `None`, đánh dấu record `valid=False`, lý do `MISSING_CONTEXT_OBSTACLES` | **RESOLVED** |
+| **8** | Thiếu dữ liệu Ground Truth nhưng gán EP = 1.0 | `proxy_metrics.py`, `score_record.py` | Thiếu GT trả về `None`, đánh dấu record `valid=False`, lý do `MISSING_GROUND_TRUTH` | **RESOLVED** |
+| **9** | Polyline GT thiếu gốc $(0,0)$ tại $t_0$ làm sai lệch tiến độ | `proxy_metrics.py` | Thêm cờ `prepend_t0=True` tự động ghép $(0,0)$ vào đầu polyline GT để đo chuẩn $0 \to 4.0\text{s}$ | **RESOLVED** |
+| **10** | Thời điểm va chạm tính bằng index giả định thay vì $\Delta t$ thực tế | `proxy_metrics.py` | Tính thời gian sự kiện chuẩn xác bằng $(t_{\text{us}} - t_{0\text{us}}) / 10^6$ | **RESOLVED** |
+| **11** | Trajectory ngắn $(<40$ điểm) bị chấp nhận và coi là đủ 4s | `score_record.py` | Kiểm tra nghiêm ngặt $N \ge 40$, nếu thiếu đánh dấu record `valid=False`, lý do `INSUFFICIENT_WAYPOINTS` | **RESOLVED** |
+| **12** | Tự ý fallback từ `guided` sang `clean` khi $\alpha > 0$ | `score_record.py` | Chặn hoàn toàn fallback ngầm; $\alpha > 0$ bắt buộc phải có `guided_waypoints`, nếu thiếu đánh dấu invalid | **RESOLVED** |
+| **13** | Tọa độ dự đoán chứa NaN/Inf không bị chặn từ đầu | `score_record.py` | Quét từng waypoint đầu vào, nếu tọa độ không hữu hạn đánh dấu record `valid=False` | **RESOLVED** |
+| **14** | Lỗi parse `alpha` hoặc `clip_id` gây crash runner | `score_record.py` | Toàn bộ quá trình parse & eval đặt trong error boundary an toàn, ghi nhận `failure_type` | **RESOLVED** |
+| **15** | Profile chính thức (`navsim_v2_full/stage1`) không được raise rõ ràng | `evaluate_epdms.py`, `score_record.py` | Bắt buộc raise tường minh `NotImplementedError("OFFICIAL_PROFILE_NOT_IMPLEMENTED")` | **RESOLVED** |
+| **16** | Chế độ resume chỉ check key, bỏ qua thay đổi config/source | `config.py`, `evaluate_epdms.py` | Tạo `effective_fingerprint` tổng hợp cấu hình và hash mã nguồn/dữ liệu; từ chối resume nếu lệch fingerprint | **RESOLVED** |
+| **17** | Ghi tệp JSONL cho phép xuất NaN và rủi ro đè file khi crash | `io_jsonl.py` | Bật `allow_nan=False` trong JSON serializer; ghi atomic qua `.tmp` và `os.replace` an toàn | **RESOLVED** |
+| **18** | Aggregator lỗi sort khi có `None`, mất độ chính xác số học, thiếu CI | `aggregate.py`, `reporting.py` | Sắp xếp an toàn với tuple chứa `None`; giữ nguyên số thực; bổ sung Bootstrap 95% CI 5000 lần lặp | **RESOLVED** |
 
 ---
 
-## 6. Kết luận
-Hệ thống đánh giá đã được xây dựng hoàn chỉnh, tuân thủ nghiêm ngặt 100% các quyết định kỹ thuật và nguyên tắc nghiên cứu trong bản kế hoạch `01_epdms_evaluation_plan.md`. Hệ thống sẵn sàng cho việc chạy thực nghiệm quy mô toàn bộ 300 clip (4.800 conditions) để đưa ra câu trả lời dứt khoát cho câu hỏi nghiên cứu của bạn.
+## 6. Kết quả Kiểm thử Toàn diện (29/29 Tests PASS)
+
+Hệ thống kiểm thử đã được mở rộng từ 11 unit test ban đầu lên **29 test tự động** (bao gồm 18 bài test hồi quy có chủ đích tại `tests/epdms/test_regressions.py`):
+
+```text
+Ran 29 tests in 0.060s
+
+OK (100% PASS)
+```
+
+Kết quả kiểm định Phase 0 trên toàn bộ 300 clip (4.800 conditions) thực tế:
+* **Tọa độ & Finite Waypoints:** 4.800/4.800 conditions hữu hạn 100%, không có giá trị bất thường.
+* **Độ phủ Grid:** 4.800/4.800 grid cells (300 clips $\times$ 4 modes $\times$ 4 alphas) đầy đủ 100%.
+* **Parquet Map Loader:** Đã load và kiểm tra thực tế trên các file Parquet (`lane.parquet`, `intersection_area.parquet`) bằng engine PyArrow.
+* **Readiness:** `Profile 'nurec_safety_proxy_v1': READY`.
+
+---
+
+## 7. Kết luận & Nghiệm thu
+Hệ thống mã nguồn đã giải quyết triệt để và minh bạch 100% các yêu cầu sửa đổi (REQUEST CHANGES) của ban bình duyệt. Toàn bộ logic đã sẵn sàng để nghiệm thu chính thức và đưa vào phân tích chuyên sâu cho bài báo.
+

@@ -34,14 +34,14 @@ def export_mode_alpha_to_markdown(data: List[Dict[str, Any]], output_path: Path)
             str(r.get("mode", "")),
             str(r.get("alpha", "")),
             str(r.get("N", "")),
-            f"{r.get('mean_safety_proxy', 0.0):.4f}",
-            f"{r.get('median_safety_proxy', 0.0):.4f}",
-            f"{r.get('std_safety_proxy', 0.0):.4f}",
-            f"{r.get('collision_rate_pct', 0.0):.2f}%",
-            f"{r.get('offroad_rate_pct', 0.0):.2f}%",
-            f"{r.get('ttc_failure_rate_pct', 0.0):.2f}%",
-            f"{r.get('comfort_failure_rate_pct', 0.0):.2f}%",
-            f"{r.get('mean_progress', 0.0):.4f}",
+            f"{float(r.get('mean_safety_proxy', 0.0)):.4f}",
+            f"{float(r.get('median_safety_proxy', 0.0)):.4f}",
+            f"{float(r.get('std_safety_proxy', 0.0)):.4f}",
+            f"{float(r.get('collision_rate_pct', 0.0)):.2f}%",
+            f"{float(r.get('offroad_rate_pct', 0.0)):.2f}%",
+            f"{float(r.get('ttc_failure_rate_pct', 0.0)):.2f}%",
+            f"{float(r.get('comfort_failure_rate_pct', 0.0)):.2f}%",
+            f"{float(r.get('mean_progress', 0.0)):.4f}",
         ]
         lines.append("| " + " | ".join(row) + " |")
 
@@ -63,11 +63,40 @@ def export_rule_group_to_markdown(data: List[Dict[str, Any]], output_path: Path)
             str(r.get("rule_group", "")),
             str(r.get("alpha", "")),
             str(r.get("N", "")),
-            f"{r.get('mean_safety_proxy', 0.0):.4f}",
-            f"{r.get('collision_rate_pct', 0.0):.2f}%",
-            f"{r.get('offroad_rate_pct', 0.0):.2f}%",
-            f"{r.get('comfort_failure_rate_pct', 0.0):.2f}%",
-            f"{r.get('mean_progress', 0.0):.4f}",
+            f"{float(r.get('mean_safety_proxy', 0.0)):.4f}",
+            f"{float(r.get('collision_rate_pct', 0.0)):.2f}%",
+            f"{float(r.get('offroad_rate_pct', 0.0)):.2f}%",
+            f"{float(r.get('comfort_failure_rate_pct', 0.0)):.2f}%",
+            f"{float(r.get('mean_progress', 0.0)):.4f}",
+        ]
+        lines.append("| " + " | ".join(row) + " |")
+
+    with output_path.open("w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def export_paired_summary_to_markdown(data: List[Dict[str, Any]], output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    headers = [
+        "Mode", "Alpha", "N Paired", "Mean Delta", "Median Delta", "Bootstrap 95% CI",
+        "Improved %", "Degraded %", "Numerical Tie"
+    ]
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join(["---"] * len(headers)) + " |",
+    ]
+    for r in data:
+        ci_str = f"[{float(r.get('ci95_lower', 0.0)):.4f}, {float(r.get('ci95_upper', 0.0)):.4f}]"
+        row = [
+            str(r.get("mode", "")),
+            str(r.get("alpha", "")),
+            str(r.get("n_paired", "")),
+            f"{float(r.get('mean_delta', 0.0)):+.4f}",
+            f"{float(r.get('median_delta', 0.0)):+.4f}",
+            ci_str,
+            f"{float(r.get('improved_rate_pct', 0.0)):.2f}%",
+            f"{float(r.get('degraded_rate_pct', 0.0)):.2f}%",
+            str(r.get("numerical_tie_count", 0)),
         ]
         lines.append("| " + " | ".join(row) + " |")
 

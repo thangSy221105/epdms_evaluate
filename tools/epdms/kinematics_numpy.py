@@ -53,6 +53,9 @@ def compute_kinematics(
     if n < 2:
         raise ValueError("Trajectory must have at least 2 points to compute kinematics")
 
+    if not (np.all(np.isfinite(x)) and np.all(np.isfinite(y)) and np.all(np.isfinite(headings))):
+        raise ValueError("Non-finite coordinates or headings encountered in trajectory")
+
     # Velocities
     dx = np.diff(x)
     dy = np.diff(y)

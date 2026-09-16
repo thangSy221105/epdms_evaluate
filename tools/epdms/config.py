@@ -56,6 +56,31 @@ class EvaluationConfig:
         s = json.dumps(self.raw, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
+    def compute_effective_fingerprint(self, source_hashes: Optional[Dict[str, str]] = None) -> str:
+        """Computes a strict fingerprint from effective runtime parameters and source file hashes."""
+        payload = {
+            "metric_profile": self.metric_profile,
+            "horizon_s": self.horizon_s,
+            "frequency_hz": self.frequency_hz,
+            "strict_mode": self.strict_mode,
+            "alphas": self.alphas,
+            "modes": self.modes,
+            "vehicle": {
+                "length_m": self.vehicle.length_m,
+                "width_m": self.vehicle.width_m,
+                "rear_axle_to_center_m": self.vehicle.rear_axle_to_center_m,
+            },
+            "proxy": {
+                "touch_is_collision": self.touch_is_collision,
+                "ttc_horizon_s": self.ttc_horizon_s,
+                "progress_stationary_threshold_m": self.progress_stationary_threshold_m,
+                "practical_score_delta": self.practical_score_delta,
+            },
+            "source_hashes": source_hashes or {},
+        }
+        s = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
     @classmethod
     def from_file(cls, path: str | Path) -> EvaluationConfig:
         p = Path(path)

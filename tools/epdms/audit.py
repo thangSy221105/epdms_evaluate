@@ -194,6 +194,132 @@ def audit_data_contracts(config: EvaluationConfig) -> Dict[str, Any]:
         "duplicate_count": gt_dup_count,
     }
 
+    # 4. Trajectory contract & finite verification on predictions
+    trajectory_validation_issues = []
+    checked_pred_count = 0
+    if pred_path.is_file():
+        for row in iter_jsonl(pred_path):
+            checked_pred_count += 1
+            cid = str(row.get("clip_id", ""))
+            mode = str(row.get("mode", ""))
+            if alpha > 0.0:
+                traj = row.get("guided_waypoints")
+                if traj is None and "trajectories" in row:
+                    traj = row["trajectories"].get("guided")
+            else:
+                traj = row.get("clean_waypoints")
+                if traj is None:
+                    traj = row.get("guided_waypoints")
+                if traj is None and "trajectories" in row:
+                    traj = row["trajectories"].get("clean") or row["trajectories"].get("guided")
+
+            if not isinstance(traj, list) or len(traj) < 40:
+                if len(trajectory_validation_issues) < 20:
+                    trajectory_validation_issues.append({
+                        "clip_id": cid, "mode": mode, "alpha": alpha,
+                        "issue": f"Insufficient waypoints: {len(traj) if isinstance(traj, list) else 'None'} < 40"
+                    })
+            else:
+                for pt_idx, pt in enumerate(traj[:40]):
+                    if not isinstance(pt, dict):
+                        if len(trajectory_validation_issues) < 20:
+                            trajectory_validation_issues.append({
+                                "clip_id": cid, "mode": mode, "alpha": alpha,
+                                "issue": f"Malformed waypoint at index {pt_idx}: {pt}"
+                            })
+                        break
+                    x = pt.get("x_m", pt.get("x"))
+                    y = pt.get("y_m", pt.get("y"))
+                    if x is None or y is None:
+                        if len(trajectory_validation_issues) < 20:
+                            trajectory_validation_issues.append({
+                                "clip_id": cid, "mode": mode, "alpha": alpha,
+                                "issue": f"Missing coordinates at index {pt_idx}: {pt}"
+                            })
+                        break
+                    try:
+                        xf, yf = float(x), float(y)
+                        import math
+                        if math.isnan(xf) or math.isinf(xf) or math.isnan(yf) or math.isinf(yf):
+                            if len(trajectory_validation_issues) < 20:
+                                trajectory_validation_issues.append({
+                                    "clip_id": cid, "mode": mode, "alpha": alpha,
+                                    "issue": f"Non-finite waypoint at index {pt_idx}: ({xf}, {yf})"
+                                })
+                            break
+                    except (TypeError, ValueError):
+                        if len(trajectory_validation_issues) < 20:
+                            trajectory_validation_issues.append({
+                                "clip_id": cid, "mode": mode, "alpha": alpha,
+                                "issue": f"Non-numeric coordinates at index {pt_idx}: ({x}, {y})"
+                            })
+                        break
+
+    report["trajectory_contract_stats"] = {
+        "checked_predictions": checked_pred_count,
+        "total_issues": len(trajectory_validation_issues),
+        "sample_issues": trajectory_validation_issues,
+    }
+
+    # 5. Grid completeness check (clip x mode x alpha)
+    expected_modes = config.modes or ["cross_scene", "no_reasoning", "noisy", "opposite_action"]
+    expected_alphas = config.alphas or [0.0, 0.5, 1.0, 2.0]
+    expected_grid_per_clip = len(expected_modes) * len(expected_alphas)
+    expected_total_grid = len(pred_clips) * expected_grid_per_clip
+    missing_grid_conditions = []
+
+    for cid in sorted(pred_clips):
+        for m in expected_modes:
+            for a in expected_alphas:
+                k = f"{cid}|{m}|{a}"
+                if k not in pred_conditions:
+                    if len(missing_grid_conditions) < 50:
+                        missing_grid_conditions.append({"clip_id": cid, "mode": m, "alpha": a})
+
+    report["grid_stats"] = {
+        "expected_modes": expected_modes,
+        "expected_alphas": expected_alphas,
+        "expected_total": expected_total_grid,
+        "actual_total": len(pred_conditions),
+        "missing_grid_count": len(missing_grid_conditions),
+        "missing_sample": missing_grid_conditions[:10],
+    }
+
+    # 6. Parquet loader verification
+    parquet_loader_status = "UNKNOWN"
+    parquet_error = None
+    if config.context_filtered_dir.is_dir():
+        try:
+            import pandas as pd
+            # Find first available clip directory with parquet
+            test_clip_dirs = list(config.context_filtered_dir.iterdir())[:5]
+            found_test_file = None
+            for cd in test_clip_dirs:
+                clipgt = cd / "clipgt"
+                if clipgt.is_dir():
+                    for fn in ["lane.parquet", "intersection_area.parquet", "obstacle.parquet"]:
+                        candidate = clipgt / fn
+                        if candidate.is_file():
+                            found_test_file = candidate
+                            break
+                if found_test_file:
+                    break
+            if found_test_file:
+                test_df = pd.read_parquet(found_test_file)
+                parquet_loader_status = f"OK (tested {found_test_file.name}, {len(test_df)} rows)"
+            else:
+                parquet_loader_status = "NO_PARQUET_FOUND"
+        except Exception as exc:
+            parquet_loader_status = f"FAILED: {exc}"
+            parquet_error = str(exc)
+    else:
+        parquet_loader_status = "DIR_NOT_FOUND"
+
+    report["parquet_loader"] = {
+        "status": parquet_loader_status,
+        "error": parquet_error,
+    }
+
     # Check intersection & missing
     all_clips = pred_clips.union(ctx_clips).union(gt_clips)
     for cid in all_clips:
@@ -210,9 +336,15 @@ def audit_data_contracts(config: EvaluationConfig) -> Dict[str, Any]:
     # Profile readiness
     env = audit_environment()
     has_inputs = bool(pred_path.is_file() and ctx_path.is_file() and gt_path.is_file())
+    proxy_ready = (
+        env["proxy_possible"]
+        and has_inputs
+        and len(trajectory_validation_issues) == 0
+        and ("FAILED" not in parquet_loader_status)
+    )
 
     report["readiness"] = {
-        "nurec_safety_proxy_v1": "READY" if (env["proxy_possible"] and has_inputs) else "NOT READY",
+        "nurec_safety_proxy_v1": "READY" if proxy_ready else "NOT READY",
         "navsim_v2_stage1": "READY" if (env["official_stage1_possible"] and has_inputs) else "NOT READY",
         "navsim_v2_full": "READY" if (env["official_full_possible"] and has_inputs) else "NOT READY",
     }
@@ -278,6 +410,12 @@ def run_and_save_audit(config: EvaluationConfig, output_dir: Path) -> Dict[str, 
         f"* **Ground Truth (`future_gt`):** {contracts['ground_truth_stats']['total_rows']} rows, {contracts['ground_truth_stats']['unique_clips']} unique clips.",
         f"* **Missing / Incomplete Clips:** {len(contracts['missing_records'])} missing records identified.",
         f"* **Duplicate Records:** {len(contracts['duplicate_records'])} duplicates found.",
+        "",
+        "## 3. Data Contracts & Parquet Engine Validation",
+        "",
+        f"* **Trajectory Horizon & Finite Check:** {contracts['trajectory_contract_stats']['checked_predictions']} trajectories inspected. Issues found: {contracts['trajectory_contract_stats']['total_issues']}.",
+        f"* **Clip x Mode x Alpha Grid Completeness:** {contracts['grid_stats']['actual_total']} / {contracts['grid_stats']['expected_total']} expected conditions present ({contracts['grid_stats']['missing_grid_count']} missing).",
+        f"* **Parquet Engine & Map Loader:** `{contracts['parquet_loader']['status']}`",
         "",
     ]
     with md_file.open("w", encoding="utf-8") as f:

@@ -14,11 +14,17 @@ REPO_ROOT = SCRIPT_DIR.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tools.epdms.aggregate import aggregate_by_group, compute_paired_deltas
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+
+from tools.epdms.aggregate import aggregate_by_group, compute_paired_deltas, compute_paired_summary
 from tools.epdms.config import EvaluationConfig
 from tools.epdms.io_jsonl import iter_jsonl
 from tools.epdms.reporting import (
     export_mode_alpha_to_markdown,
+    export_paired_summary_to_markdown,
     export_rule_group_to_markdown,
     export_table_to_csv,
 )
@@ -74,6 +80,12 @@ def main() -> None:
     paired_data = compute_paired_deltas(records, practical_delta=config.practical_score_delta)
     export_table_to_csv(paired_data, analysis_dir / "paired_delta_vs_alpha0.csv")
 
+    paired_summary = compute_paired_summary(paired_data)
+    export_table_to_csv(paired_summary, analysis_dir / "paired_summary_by_mode_alpha.csv")
+    export_paired_summary_to_markdown(paired_summary, analysis_dir / "paired_summary_by_mode_alpha.md")
+    with (analysis_dir / "paired_summary_by_mode_alpha.json").open("w", encoding="utf-8") as f:
+        json.dump(paired_summary, f, indent=2)
+
     # 4. Generate Research Summary Markdown
     summary_md = analysis_dir / "final_research_summary.md"
     lines = [
@@ -99,6 +111,15 @@ def main() -> None:
     with (analysis_dir / "epdms_by_rule_group_alpha.md").open("r", encoding="utf-8") as f:
         lines.append(f.read())
 
+    lines.extend([
+        "",
+        "## 3. Paired Delta Analysis vs Alpha 0 (Bootstrap 95% CI)",
+        "",
+    ])
+
+    with (analysis_dir / "paired_summary_by_mode_alpha.md").open("r", encoding="utf-8") as f:
+        lines.append(f.read())
+
     with summary_md.open("w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -106,6 +127,7 @@ def main() -> None:
     print(f"    - {analysis_dir / 'epdms_by_mode_alpha.md'}")
     print(f"    - {analysis_dir / 'epdms_by_rule_group_alpha.md'}")
     print(f"    - {analysis_dir / 'paired_delta_vs_alpha0.csv'}")
+    print(f"    - {analysis_dir / 'paired_summary_by_mode_alpha.md'}")
     print(f"    - {summary_md}")
 
 

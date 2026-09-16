@@ -92,22 +92,56 @@ def sat_box_intersection(
         gap = max(min_a - max_b, min_b - max_a)
         if touch_is_collision:
             if gap > 0:  # Strictly separated
-                return False, gap
+                exact_dist = compute_exact_box_distance(box_a, box_b)
+                return False, exact_dist
         else:
             if gap >= 0:  # Touching or separated
-                return False, max(0.0, gap)
+                exact_dist = compute_exact_box_distance(box_a, box_b)
+                return False, exact_dist
 
         if gap > min_clearance:
             min_clearance = gap
 
+    # If no separating axis found, boxes intersect
     return True, min_clearance
 
 
-def point_in_polygon_ray_casting(px: float, py: float, polygon: np.ndarray) -> bool:
-    """Ray casting algorithm to test if (px, py) is inside a 2D polygon."""
+def is_point_on_segment(px: float, py: float, ax: float, ay: float, bx: float, by: float, tol: float = 1e-7) -> bool:
+    """Checks if point (px, py) lies on line segment (ax, ay)-(bx, by) within tolerance."""
+    abx = bx - ax
+    aby = by - ay
+    apx = px - ax
+    apy = py - ay
+
+    # Cross product for collinearity
+    cross = abs(apx * aby - apy * abx)
+    seg_len = np.hypot(abx, aby)
+    if seg_len < tol:
+        return np.hypot(px - ax, py - ay) < tol
+    if cross / seg_len > tol:
+        return False
+
+    # Dot product for bounding segment
+    dot = apx * abx + apy * aby
+    if dot < -tol or dot > seg_len * seg_len + tol:
+        return False
+    return True
+
+
+def point_in_polygon_ray_casting(px: float, py: float, polygon: np.ndarray, tol: float = 1e-7) -> bool:
+    """Tests if (px, py) is inside or on the boundary of a 2D polygon with consistent boundary handling."""
     n = len(polygon)
     if n < 3:
         return False
+
+    # 1. Boundary check: If point is on any edge, it is inside
+    for i in range(n):
+        p1 = polygon[i]
+        p2 = polygon[(i + 1) % n]
+        if is_point_on_segment(px, py, p1[0], p1[1], p2[0], p2[1], tol=tol):
+            return True
+
+    # 2. Standard ray casting
     inside = False
     p1x, p1y = polygon[0]
     for i in range(n + 1):
@@ -123,7 +157,44 @@ def point_in_polygon_ray_casting(px: float, py: float, polygon: np.ndarray) -> b
     return inside
 
 
-def points_in_any_polygon(points: np.ndarray, polygons: list[np.ndarray]) -> np.ndarray:
+def point_to_segment_dist(px: float, py: float, ax: float, ay: float, bx: float, by: float) -> float:
+    """Computes minimum Euclidean distance from point (px, py) to segment AB."""
+    abx = bx - ax
+    aby = by - ay
+    seg_len_sq = abx * abx + aby * aby
+    if seg_len_sq < 1e-12:
+        return float(np.hypot(px - ax, py - ay))
+    t = max(0.0, min(1.0, ((px - ax) * abx + (py - ay) * aby) / seg_len_sq))
+    proj_x = ax + t * abx
+    proj_y = ay + t * aby
+    return float(np.hypot(px - proj_x, py - proj_y))
+
+
+def compute_exact_box_distance(box_a: np.ndarray, box_b: np.ndarray) -> float:
+    """Computes exact minimum Euclidean distance between two disjoint convex 2D boxes."""
+    min_dist = float("inf")
+    # Distance from vertices of A to edges of B
+    for i in range(len(box_a)):
+        v = box_a[i]
+        for j in range(len(box_b)):
+            e1 = box_b[j]
+            e2 = box_b[(j + 1) % len(box_b)]
+            d = point_to_segment_dist(v[0], v[1], e1[0], e1[1], e2[0], e2[1])
+            if d < min_dist:
+                min_dist = d
+    # Distance from vertices of B to edges of A
+    for i in range(len(box_b)):
+        v = box_b[i]
+        for j in range(len(box_a)):
+            e1 = box_a[j]
+            e2 = box_a[(j + 1) % len(box_a)]
+            d = point_to_segment_dist(v[0], v[1], e1[0], e1[1], e2[0], e2[1])
+            if d < min_dist:
+                min_dist = d
+    return min_dist
+
+
+def points_in_any_polygon(points: np.ndarray, polygons: list[np.ndarray], tol: float = 1e-7) -> np.ndarray:
     """Tests an array of points shape (N, 2) against a list of polygons.
     Returns boolean array of shape (N,).
     """
@@ -135,7 +206,7 @@ def points_in_any_polygon(points: np.ndarray, polygons: list[np.ndarray]) -> np.
     for pt_idx in range(n_pts):
         px, py = points[pt_idx, 0], points[pt_idx, 1]
         for poly in polygons:
-            if point_in_polygon_ray_casting(px, py, poly):
+            if point_in_polygon_ray_casting(px, py, poly, tol=tol):
                 inside_mask[pt_idx] = True
                 break
     return inside_mask

@@ -16,6 +16,11 @@ REPO_ROOT = SCRIPT_DIR.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+
 from tools.epdms.audit import audit_environment
 from tools.epdms.config import EvaluationConfig
 from tools.epdms.io_jsonl import AtomicJsonlWriter, compute_file_sha256, iter_jsonl, read_jsonl_indexed
@@ -31,12 +36,16 @@ def load_lane_polygons_for_clip(filtered_dir: Path, clip_id: str) -> List[Any]:
     if not clip_dir.is_dir():
         return polygons
 
-    # Check lane.parquet
+    try:
+        import numpy as np
+        import pandas as pd
+    except ImportError:
+        return polygons
+
+    # 1. Check lane.parquet
     lane_pq = clip_dir / "lane.parquet"
     if lane_pq.is_file():
         try:
-            import numpy as np
-            import pandas as pd
             df = pd.read_parquet(lane_pq)
             for _, row in df.iterrows():
                 lane_data = row.get("lane", {})
@@ -47,6 +56,22 @@ def load_lane_polygons_for_clip(filtered_dir: Path, clip_id: str) -> List[Any]:
                         pts_left = [[p["x"], p["y"]] for p in left]
                         pts_right = [[p["x"], p["y"]] for p in reversed(right)]
                         poly = np.array(pts_left + pts_right, dtype=float)
+                        if len(poly) >= 3:
+                            polygons.append(poly)
+        except Exception:
+            pass
+
+    # 2. Check intersection_area.parquet
+    ia_pq = clip_dir / "intersection_area.parquet"
+    if ia_pq.is_file():
+        try:
+            df = pd.read_parquet(ia_pq)
+            for _, row in df.iterrows():
+                ia_data = row.get("intersection_area", {})
+                if isinstance(ia_data, dict):
+                    loc = ia_data.get("location")
+                    if loc is not None and len(loc) >= 3:
+                        poly = np.array([[p["x"], p["y"]] for p in loc], dtype=float)
                         polygons.append(poly)
         except Exception:
             pass
@@ -81,18 +106,26 @@ def main() -> None:
     horizon_s = args.horizon or config.horizon_s
     resume = args.resume if args.resume is not None else config.resume
 
-    # Enforce profile contract
-    env = audit_environment()
+    # Enforce profile contract: official navsim profiles must raise NotImplementedError
     if profile in ("navsim_v2_full", "navsim_v2_stage1"):
-        if not (env["navsim_available"] and env["nuplan_available"]):
-            print(f"[!] Error: Profile '{profile}' requires NAVSIM and nuPlan packages.")
-            print("[!] Per project rules, we do not silently fallback to proxy when official profile is requested.")
-            sys.exit(1)
+        raise NotImplementedError("OFFICIAL_PROFILE_NOT_IMPLEMENTED")
 
-    print(f"[*] Profile:           {profile}")
-    print(f"[*] Horizon:           {horizon_s}s (@ {config.frequency_hz} Hz)")
-    print(f"[*] Strict Mode:       {config.strict_mode}")
-    print(f"[*] Resume Mode:       {resume}")
+    # Compute effective fingerprint including sources
+    source_hashes = {}
+    if config.prediction_jsonl.is_file():
+        source_hashes["prediction_jsonl"] = compute_file_sha256(config.prediction_jsonl)
+    if config.context_jsonl.is_file():
+        source_hashes["context_jsonl"] = compute_file_sha256(config.context_jsonl)
+    if config.ground_truth_jsonl.is_file():
+        source_hashes["ground_truth_jsonl"] = compute_file_sha256(config.ground_truth_jsonl)
+
+    current_effective_fingerprint = config.compute_effective_fingerprint(source_hashes=source_hashes)
+
+    print(f"[*] Profile:               {profile}")
+    print(f"[*] Horizon:               {horizon_s}s (@ {config.frequency_hz} Hz)")
+    print(f"[*] Strict Mode:           {config.strict_mode}")
+    print(f"[*] Resume Mode:           {resume}")
+    print(f"[*] Effective Fingerprint: {current_effective_fingerprint[:16]}...")
 
     # Output paths
     score_dir = config.score_dir
@@ -102,14 +135,34 @@ def main() -> None:
     error_jsonl = score_dir / "epdms_errors_300.jsonl"
     manifest_json = score_dir / "run_manifest.json"
 
-    # Read existing records if resume
     completed_keys = set()
-    if resume and score_jsonl.is_file():
-        for r in iter_jsonl(score_jsonl):
-            k = r.get("record_key")
-            if k:
-                completed_keys.add(k)
-        print(f"[*] Resuming: found {len(completed_keys)} already evaluated conditions in {score_jsonl.name}")
+    all_score_dicts: List[Dict[str, Any]] = []
+
+    # Read existing records if resume
+    if resume:
+        if manifest_json.is_file():
+            try:
+                with manifest_json.open("r", encoding="utf-8") as mf:
+                    prev_manifest = json.load(mf)
+                prev_fp = prev_manifest.get("effective_fingerprint")
+                if prev_fp and prev_fp != current_effective_fingerprint:
+                    raise ValueError(
+                        f"Resume rejected: effective fingerprint mismatch (prev={prev_fp}, current={current_effective_fingerprint})"
+                    )
+            except ValueError:
+                raise
+            except Exception:
+                pass
+
+        if score_jsonl.is_file():
+            for r in iter_jsonl(score_jsonl):
+                k = r.get("record_key")
+                if k:
+                    if k in completed_keys:
+                        raise ValueError(f"Corrupted score file: duplicate record key found on resume: {k}")
+                    completed_keys.add(k)
+                    all_score_dicts.append(r)
+            print(f"[*] Resuming: found {len(completed_keys)} already evaluated conditions in {score_jsonl.name}")
 
     # Load context & ground truth indexed by clip_id
     print(f"[*] Loading context index from: {config.context_jsonl}")
@@ -138,12 +191,6 @@ def main() -> None:
 
     total_conditions = len(all_pred_rows)
     print(f"[*] Total conditions to process: {total_conditions}")
-
-    all_score_dicts: List[Dict[str, Any]] = []
-    # If resuming, load existing records into all_score_dicts for CSV export
-    if resume and score_jsonl.is_file():
-        for r in iter_jsonl(score_jsonl):
-            all_score_dicts.append(r)
 
     score_writer = AtomicJsonlWriter(score_jsonl, append_if_exists=resume)
     error_writer = AtomicJsonlWriter(error_jsonl, append_if_exists=resume)
@@ -183,6 +230,7 @@ def main() -> None:
                 frequency_hz=config.frequency_hz,
                 rule_group=rg,
                 lane_polygons=polygons,
+                metric_profile=profile,
             )
 
             eval_record.config_sha256 = config.sha256
@@ -225,6 +273,7 @@ def main() -> None:
         "total_completed": len(all_score_dicts),
         "total_runtime_s": round(total_time, 2),
         "config_sha256": config.sha256,
+        "effective_fingerprint": current_effective_fingerprint,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     with manifest_json.open("w", encoding="utf-8") as f:
