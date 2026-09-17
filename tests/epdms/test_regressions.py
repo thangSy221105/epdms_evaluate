@@ -25,7 +25,7 @@ from tools.epdms.proxy_metrics import (
     normalize_obstacle_record,
 )
 from tools.epdms.schemas import EvaluationScoreRecord, VehicleParameters
-from tools.epdms.score_record import evaluate_single_condition
+from tools.epdms.score_record import evaluate_single_condition, extract_and_validate_trajectory
 from tools.epdms.io_jsonl import AtomicJsonlWriter, iter_jsonl
 from tools.epdms.config import EvaluationConfig
 from tools.epdms.aggregate import (
@@ -35,6 +35,8 @@ from tools.epdms.aggregate import (
     compute_paired_summary,
 )
 from tools.epdms.audit import audit_data_contracts
+from tools.epdms.map_loader import inspect_clip_map_status
+from tools.epdms.reporting import export_ade_disagreement_to_markdown
 
 
 class TestPeerReviewRegressions(unittest.TestCase):
@@ -296,6 +298,7 @@ class TestPeerReviewRegressions(unittest.TestCase):
             "clip_id": "clip_001",
             "mode": "cross_scene",
             "alpha": 0.0,
+            "t0_us": 5_100_000,
             "clean_waypoints": [{"x_m": i * 0.5, "y_m": 0.0} for i in range(40)]
         }
         context_row = {
@@ -322,6 +325,7 @@ class TestPeerReviewRegressions(unittest.TestCase):
             "clip_id": "clip_001",
             "mode": "cross_scene",
             "alpha": 0.0,
+            "t0_us": 5_100_000,
             "clean_waypoints": [{"x_m": i * 0.5, "y_m": 0.0} for i in range(40)]
         }
         context_row = {
@@ -374,6 +378,7 @@ class TestPeerReviewRegressions(unittest.TestCase):
             "clip_id": "clip_001",
             "mode": "cross_scene",
             "alpha": 0.0,
+            "t0_us": 5_100_000,
             "clean_waypoints": [{"x_m": i * 0.5, "y_m": 0.0} for i in range(40)]
         }
         context_empty = {
@@ -393,6 +398,7 @@ class TestPeerReviewRegressions(unittest.TestCase):
             "clip_id": "clip_001",
             "mode": "cross_scene",
             "alpha": 0.0,
+            "t0_us": 5_100_000,
             "clean_waypoints": [{"x_m": i * 0.5, "y_m": 0.0} for i in range(40)]
         }
         context_empty = {
@@ -416,6 +422,7 @@ class TestPeerReviewRegressions(unittest.TestCase):
             "clip_id": "clip_001",
             "mode": "cross_scene",
             "alpha": 0.0,
+            "t0_us": 5_100_000,
             "clean_waypoints": [{"x_m": i * 0.5, "y_m": 0.0} for i in range(40)]
         }
         context_empty = {
@@ -482,12 +489,14 @@ class TestPeerReviewRegressions(unittest.TestCase):
             "clip_id": "c1",
             "mode": "cross_scene",
             "alpha": 0.0,
+            "t0_us": 5_100_000,
             "clean_waypoints": [{"x_m": float(i), "y_m": 0.0} for i in range(40)],
         }
         pred_guided = {
             "clip_id": "c1",
             "mode": "cross_scene",
             "alpha": 0.5,
+            "t0_us": 5_100_000,
             "guided_waypoints": [{"x_m": float(i), "y_m": 2.0} for i in range(40)],
         }
 
@@ -568,6 +577,336 @@ class TestPeerReviewRegressions(unittest.TestCase):
             (td / "empty_dir").mkdir()
             report = audit_data_contracts(cfg)
             self.assertEqual(report["readiness"]["nurec_safety_proxy_v1"], "NOT READY")
+
+    # 30. Obstacle in expanded window (+/- 0.5s) but zero frames matched -> INSUFFICIENT_OBSERVATION_DATA
+    def test_30_obstacle_in_expanded_window_but_no_frame_matched_rejected(self):
+        pred_row = {
+            "clip_id": "clip_001",
+            "mode": "cross_scene",
+            "alpha": 0.0,
+            "t0_us": 5_100_000,
+            "clean_waypoints": [{"x_m": i * 0.5, "y_m": 0.0} for i in range(40)],
+        }
+        # Obstacle at t0 - 400_000 us (within 500_000 window, but > 50_000 discrete frame tolerance)
+        context_row = {
+            "clip_id": "clip_001",
+            "semantic_context": {
+                "obstacle": {
+                    "all_obstacles": [{
+                        "timestamp_micros": 5_100_000 - 400_000,
+                        "obstacle": {
+                            "center": {"x": 10.0, "y": 0.0, "z": 0.0},
+                            "size": {"x": 4.0, "y": 2.0, "z": 1.5},
+                            "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+                        },
+                    }]
+                }
+            },
+        }
+        rec = evaluate_single_condition(pred_row, context_row=context_row, gt_row=None, vehicle=self.vehicle)
+        self.assertFalse(rec.valid)
+        self.assertEqual(rec.failure_stage, "obstacle_observation_contract")
+        self.assertEqual(rec.failure_type, "INSUFFICIENT_OBSERVATION_DATA")
+
+    # 31. Corrupted / non-finite obstacle in window rejected
+    def test_31_corrupted_obstacle_in_window_rejected(self):
+        pred_row = {
+            "clip_id": "clip_001",
+            "mode": "cross_scene",
+            "alpha": 0.0,
+            "t0_us": 5_100_000,
+            "clean_waypoints": [{"x_m": i * 0.5, "y_m": 0.0} for i in range(40)],
+        }
+        context_row = {
+            "clip_id": "clip_001",
+            "semantic_context": {
+                "obstacle": {
+                    "all_obstacles": [{
+                        "timestamp_micros": 5_100_000,
+                        "obstacle": {
+                            "center": {"x": np.nan, "y": 0.0, "z": 0.0},
+                            "size": {"x": 4.0, "y": 2.0, "z": 1.5},
+                            "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+                        },
+                    }]
+                }
+            },
+        }
+        rec = evaluate_single_condition(pred_row, context_row=context_row, gt_row=None, vehicle=self.vehicle)
+        self.assertFalse(rec.valid)
+        self.assertEqual(rec.failure_stage, "obstacle_observation_contract")
+        self.assertEqual(rec.failure_type, "CORRUPTED_OBSERVATION_DATA")
+
+    # 32. Strict mode rejects missing t0_us across all sources
+    def test_32_strict_mode_missing_t0_rejected(self):
+        pred_row = {
+            "clip_id": "clip_001",
+            "mode": "cross_scene",
+            "alpha": 0.0,
+            "clean_waypoints": [{"x_m": i * 0.5, "y_m": 0.0} for i in range(40)],
+        }
+        context_row = {
+            "clip_id": "clip_001",
+            "semantic_context": {"obstacle": {"all_obstacles": []}},
+        }
+        rec = evaluate_single_condition(
+            pred_row, context_row=context_row, gt_row=None, vehicle=self.vehicle, strict_mode=True
+        )
+        self.assertFalse(rec.valid)
+        self.assertEqual(rec.failure_stage, "time_origin_contract")
+        self.assertEqual(rec.failure_type, "MissingTimeOriginError")
+
+    # 33. Inconsistent waypoint timeline metadata rejected
+    def test_33_inconsistent_waypoint_timeline_rejected(self):
+        # Constant timestamps (all 0.1) violate strict monotonicity
+        pred_row = {
+            "clip_id": "clip_001",
+            "mode": "cross_scene",
+            "alpha": 0.0,
+            "t0_us": 5_100_000,
+            "clean_waypoints": [{"x_m": float(i), "y_m": 0.0, "t_s": 0.1} for i in range(40)],
+        }
+        with self.assertRaises(ValueError) as ctx:
+            extract_and_validate_trajectory(pred_row, alpha=0.0)
+        self.assertIn("NonMonotonicWaypointTimelineError", str(ctx.exception))
+
+    # 34. GT with empty coordinate dicts rejected
+    def test_34_gt_empty_coordinate_dict_rejected(self):
+        pred_row = {
+            "clip_id": "clip_001",
+            "mode": "cross_scene",
+            "alpha": 0.0,
+            "t0_us": 5_100_000,
+            "clean_waypoints": [{"x_m": i * 0.5, "y_m": 0.0} for i in range(40)],
+        }
+        context_empty = {
+            "clip_id": "clip_001",
+            "semantic_context": {"obstacle": {"all_obstacles": []}},
+        }
+        lane_polys = [np.array([[-10.0, -10.0], [50.0, -10.0], [50.0, 10.0], [-10.0, 10.0]])]
+        gt_missing_coords = {
+            "clip_id": "clip_001",
+            "expert_future": [{"timestamp_micros": i * 100_000} for i in range(40)],
+        }
+        rec = evaluate_single_condition(
+            pred_row, context_row=context_empty, gt_row=gt_missing_coords, vehicle=self.vehicle, lane_polygons=lane_polys
+        )
+        self.assertFalse(rec.valid)
+        self.assertEqual(rec.failure_stage, "ground_truth_contract")
+        self.assertEqual(rec.failure_type, "MissingGroundTruthCoordinatesError")
+
+    # 35. Full content map hashing detects byte changes with identical size
+    def test_35_full_content_map_hashing(self):
+        import hashlib
+        def hash_map_dir(m_dir):
+            m_hasher = hashlib.sha256()
+            for cdir in sorted(m_dir.iterdir()):
+                if cdir.is_dir():
+                    clipgt = cdir / "clipgt"
+                    for pq_name in ["lane.parquet", "intersection_area.parquet"]:
+                        pq_file = clipgt / pq_name
+                        if pq_file.is_file():
+                            m_hasher.update(f"{cdir.name}/{pq_name}:".encode("utf-8"))
+                            with pq_file.open("rb") as f:
+                                while chunk := f.read(65536):
+                                    m_hasher.update(chunk)
+            return m_hasher.hexdigest()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            d1 = base_dir / "dir1"
+            d2 = base_dir / "dir2"
+            f1 = d1 / "clip1" / "clipgt" / "lane.parquet"
+            f2 = d2 / "clip1" / "clipgt" / "lane.parquet"
+            f1.parent.mkdir(parents=True)
+            f2.parent.mkdir(parents=True)
+            # Same length (4 bytes) but different bytes
+            f1.write_bytes(b"ABCD")
+            f2.write_bytes(b"ABCE")
+            h1 = hash_map_dir(d1)
+            h2 = hash_map_dir(d2)
+            self.assertNotEqual(h1, h2)
+
+    # 36. Score file exists without manifest rejected on resume
+    def test_36_score_file_exists_without_manifest_rejected_on_resume(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            score_file = Path(tmpdir) / "scores.jsonl"
+            manifest_file = Path(tmpdir) / "run_manifest.json"
+            score_file.write_text('{"record_key": "c1|m|0", "score": 1.0}\n', encoding="utf-8")
+            self.assertTrue(score_file.is_file() and score_file.stat().st_size > 0)
+            self.assertFalse(manifest_file.is_file())
+            with self.assertRaises(ValueError) as ctx:
+                if score_file.is_file() and score_file.stat().st_size > 0 and not manifest_file.is_file():
+                    raise ValueError(
+                        f"Resume rejected: score file exists ({score_file.name}) but run manifest ({manifest_file.name}) is missing."
+                    )
+            self.assertIn("Resume rejected", str(ctx.exception))
+
+    # 37. Pre-run manifest written with RUNNING status
+    def test_37_pre_run_manifest_written_before_loop(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest_path = Path(tmpdir) / "run_manifest.json"
+            manifest_data = {
+                "status": "RUNNING",
+                "profile": "nurec_safety_proxy_v1",
+                "effective_fingerprint": "abc12345",
+            }
+            with manifest_path.open("w", encoding="utf-8") as f:
+                json.dump(manifest_data, f)
+            read_back = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(read_back["status"], "RUNNING")
+            self.assertEqual(read_back["effective_fingerprint"], "abc12345")
+
+    # 38. Missing ADE rendered as None and N/A in table
+    def test_38_missing_ade_rendered_as_none_and_na(self):
+        paired_no_ade = [{
+            "clip_id": "c1",
+            "mode": "cross_scene",
+            "alpha": 0.5,
+            "delta_safety_proxy_raw": 0.0,
+            "delta_ade": None,
+            "out_cf": 1.0,
+            "out_dac": 1.0,
+        }]
+        summary = compute_ade_disagreement_summary(paired_no_ade)
+        self.assertEqual(len(summary), 1)
+        self.assertEqual(summary[0]["n_with_ade"], 0)
+        self.assertIsNone(summary[0]["mean_delta_ade"])
+        self.assertIsNone(summary[0]["disagreement_rate_pct"])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_md = Path(tmpdir) / "ade_table.md"
+            export_ade_disagreement_to_markdown(summary, out_md)
+            text = out_md.read_text(encoding="utf-8")
+            self.assertIn("N/A", text)
+
+    # 39. Paired deltas rejects horizon mismatch
+    def test_39_paired_deltas_rejects_horizon_mismatch(self):
+        r_base = {
+            "clip_id": "c1", "mode": "cross_scene", "alpha": 0.0,
+            "horizon_s": 4.0, "frequency_hz": 10.0, "metric_profile": "nurec_safety_proxy_v1",
+            "nurec_safety_proxy_v1": 1.0,
+        }
+        r_cand_diff_horizon = {
+            "clip_id": "c1", "mode": "cross_scene", "alpha": 0.5,
+            "horizon_s": 6.4, "frequency_hz": 10.0, "metric_profile": "nurec_safety_proxy_v1",
+            "nurec_safety_proxy_v1": 1.0,
+        }
+        paired = compute_paired_deltas([r_base, r_cand_diff_horizon])
+        self.assertEqual(len(paired), 0)
+
+    # 40. Disagreement distinguishes gate regression from genuine safety
+    def test_40_disagreement_distinguishes_gate_regression(self):
+        # Candidate maintained score (delta = 0) but dropped CF from 1.0 to 0.0 while DAC rose
+        paired = [{
+            "clip_id": "c1",
+            "mode": "cross_scene",
+            "alpha": 0.5,
+            "delta_safety_proxy_raw": 0.0,
+            "delta_ade": 0.2,
+            "base_cf": 1.0,
+            "out_cf": 0.0,
+            "base_dac": 0.0,
+            "out_dac": 1.0,
+        }]
+        summary = compute_ade_disagreement_summary(paired, ade_penalty_threshold_m=0.05)
+        self.assertEqual(len(summary), 1)
+        self.assertEqual(summary[0]["ade_penalized_cases"], 1)
+        self.assertEqual(summary[0]["disagreement_count"], 1)
+        self.assertEqual(summary[0]["genuinely_safe_count"], 0)
+        self.assertEqual(summary[0]["safety_compromised_count"], 1)
+
+    # 41. Dynamic TTC projection horizon up to 2.0s
+    def test_41_dynamic_ttc_projection_2s(self):
+        x = np.array([0.0, 0.0])
+        y = np.array([0.0, 0.0])
+        headings = np.array([0.0, 0.0])
+        speeds = np.array([10.0, 10.0])  # 10 m/s forward projection
+        timestamps_us = np.array([0, 100_000], dtype=np.int64)
+
+        # Place one obstacle at t=0.5s (y=10m, no collision) and one at t=1.8s (x=22m, collision at dt=1.8s)
+        obs = [
+            {
+                "timestamp_micros": int(0.5 * 1_000_000),
+                "center": {"x": 5.0, "y": 10.0, "z": 0.0},
+                "size": {"x": 2.0, "y": 2.0, "z": 1.5},
+                "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+            },
+            {
+                "timestamp_micros": int(1.8 * 1_000_000),
+                "center": {"x": 22.0, "y": 0.0, "z": 0.0},
+                "size": {"x": 2.0, "y": 2.0, "z": 1.5},
+                "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+            },
+        ]
+        ttc_score_1s, min_ttc_1s, _, _ = compute_ttc_proxy(
+            x, y, headings, speeds, timestamps_us, obs, self.vehicle, t0_us=0, ttc_horizon_s=1.0
+        )
+        # At 1.0s horizon, projection only goes up to 1.0s, so 1.8s collision is NOT in horizon
+        self.assertEqual(ttc_score_1s, 1.0)
+
+        ttc_score_2s, min_ttc_2s, _, _ = compute_ttc_proxy(
+            x, y, headings, speeds, timestamps_us, obs, self.vehicle, t0_us=0, ttc_horizon_s=2.0
+        )
+        # At 2.0s horizon, projection reaches 1.8s and detects collision
+        self.assertEqual(ttc_score_2s, 0.0)
+        self.assertAlmostEqual(min_ttc_2s, 1.8, places=1)
+
+    # 42. Map inventory status breakdown classification
+    def test_42_map_inventory_status_breakdown(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            # 1. FILE_NOT_FOUND
+            res_fnf = inspect_clip_map_status(base_dir, "clip_fnf")
+            self.assertEqual(res_fnf["status"], "FILE_NOT_FOUND")
+
+            # 2. NO_DRIVABLE_POLYGON (empty location parquet)
+            import pandas as pd
+            c_nodrive = base_dir / "clip_nodrive" / "clipgt"
+            c_nodrive.mkdir(parents=True)
+            df_empty = pd.DataFrame([{"intersection_area": {"location": []}}])
+            df_empty.to_parquet(c_nodrive / "intersection_area.parquet")
+            res_nodrive = inspect_clip_map_status(base_dir, "clip_nodrive")
+            self.assertEqual(res_nodrive["status"], "NO_DRIVABLE_POLYGON")
+
+            # 3. OK
+            c_ok = base_dir / "clip_ok" / "clipgt"
+            c_ok.mkdir(parents=True)
+            df_ok = pd.DataFrame([{"intersection_area": {"location": [{"x": 0.0, "y": 0.0}, {"x": 5.0, "y": 0.0}, {"x": 5.0, "y": 5.0}]}}])
+            df_ok.to_parquet(c_ok / "intersection_area.parquet")
+            res_ok = inspect_clip_map_status(base_dir, "clip_ok")
+            self.assertEqual(res_ok["status"], "OK")
+            self.assertEqual(res_ok["total_polygons"], 1)
+
+    # 43. Observation coverage metrics recorded in EvaluationScoreRecord
+    def test_43_observation_coverage_metrics_recorded(self):
+        # 10 poses
+        x = np.linspace(0.0, 10.0, 11)
+        y = np.zeros(11)
+        headings = np.zeros(11)
+        timestamps_us = np.arange(11, dtype=np.int64) * 100_000  # 0 to 1s
+        # 5 obstacle frames matching timestamps 0 to 400_000
+        obs = [
+            {
+                "timestamp_micros": int(t),
+                "trackline_id": "trk1",
+                "category": "car",
+                "center": {"x": 50.0, "y": 50.0, "z": 0.0},
+                "size": {"x": 4.0, "y": 2.0, "z": 1.5},
+                "orientation": {"w": 1.0, "z": 0.0},
+            }
+            for t in timestamps_us[:5]
+        ]
+        res = compute_collision_free_proxy(
+            x, y, headings, timestamps_us, obs, self.vehicle, t0_us=0, touch_is_collision=True, context_present=True
+        )
+        self.assertEqual(res.matched_observation_frames, 5)
+        self.assertEqual(res.required_observation_frames, 11)
+        self.assertAlmostEqual(res.observation_coverage_ratio, 5.0 / 11.0, places=3)
+        # Verify tuple unpacking still works seamlessly
+        cf, col_t, min_clr, trks, typs = res
+        self.assertEqual(cf, 1.0)
+        self.assertIsNone(col_t)
 
 
 if __name__ == "__main__":

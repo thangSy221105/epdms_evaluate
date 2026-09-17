@@ -107,23 +107,36 @@ def export_paired_summary_to_markdown(data: List[Dict[str, Any]], output_path: P
 def export_ade_disagreement_to_markdown(data: List[Dict[str, Any]], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     headers = [
-        "Mode", "Alpha", "N Paired", "Mean Delta ADE (m)", "Mean Delta Safety",
-        "ADE Penalized", "Disagreement (Safe/Unchanged)", "Disagreement %", "Both Degraded"
+        "Mode", "Alpha", "N Paired", "N with ADE", "Mean Delta ADE (m)", "Mean Delta Safety",
+        "ADE Penalized", "Disagreement (Safe/Unchanged)", "Disagreement %", "Genuinely Safe (Gate Kept)",
+        "Safety Compromised", "Both Degraded"
     ]
     lines = [
         "| " + " | ".join(headers) + " |",
         "| " + " | ".join(["---"] * len(headers)) + " |",
     ]
     for r in data:
+        d_ade = r.get("mean_delta_ade")
+        d_ade_str = f"{float(d_ade):+.4f}" if d_ade is not None else "N/A"
+
+        d_safe = r.get("mean_delta_safety")
+        d_safe_str = f"{float(d_safe):+.4f}" if d_safe is not None else "N/A"
+
+        dis_pct = r.get("disagreement_rate_pct")
+        dis_pct_str = f"{float(dis_pct):.2f}%" if dis_pct is not None else "N/A"
+
         row = [
             str(r.get("mode", "")),
             str(r.get("alpha", "")),
             str(r.get("n_paired", "")),
-            f"{float(r.get('mean_delta_ade', 0.0)):+.4f}",
-            f"{float(r.get('mean_delta_safety', 0.0)):+.4f}",
+            str(r.get("n_with_ade", "N/A")),
+            d_ade_str,
+            d_safe_str,
             str(r.get("ade_penalized_cases", 0)),
             str(r.get("disagreement_count", 0)),
-            f"{float(r.get('disagreement_rate_pct', 0.0)):.2f}%",
+            dis_pct_str,
+            str(r.get("genuinely_safe_count", 0)),
+            str(r.get("safety_compromised_count", 0)),
             str(r.get("both_degraded_count", 0)),
         ]
         lines.append("| " + " | ".join(row) + " |")

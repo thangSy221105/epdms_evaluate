@@ -15,6 +15,7 @@ from .geometry_numpy import (
 )
 from .kinematics_numpy import compute_kinematics
 from .proxy_metrics import (
+    CorruptedObservationDataError,
     compute_collision_free_proxy,
     compute_dac_proxy,
     compute_nurec_safety_proxy_v1_composite,
@@ -35,11 +36,12 @@ def extract_and_validate_trajectory(
       - 'guided_waypoints' / 'clean_waypoints'
       - 'trajectories.guided' / 'trajectories.clean'
       - Coordinates under 'x_m'/'y_m' or 'x'/'y'
+      - Timeline monotonicity check if timestamps are present
       
     Returns:
       (xs, ys, future_wps)
     Raises:
-      ValueError or TypeError if missing, insufficient, or non-finite.
+      ValueError or TypeError if missing, insufficient, non-monotonic, or non-finite.
     """
     if alpha == 0.0:
         raw_wps = pred_row.get("clean_waypoints")
@@ -67,10 +69,24 @@ def extract_and_validate_trajectory(
     future_wps = raw_wps[:target_future_poses]
     xs: List[float] = []
     ys: List[float] = []
+    prev_wp_time = None
 
     for i, wp in enumerate(future_wps):
         if not isinstance(wp, dict):
             raise TypeError(f"Waypoint {i} is not a dict: {wp}")
+
+        # Check timestamp monotonicity if timestamps are present
+        wp_time = wp.get("timestamp_micros") or wp.get("t_us") or wp.get("t_s") or wp.get("timestamp_s") or wp.get("time_s")
+        if wp_time is not None:
+            try:
+                wp_time_f = float(wp_time)
+                if prev_wp_time is not None and wp_time_f <= prev_wp_time:
+                    raise ValueError(f"NonMonotonicWaypointTimelineError: Waypoint {i} timestamp {wp_time_f} <= previous {prev_wp_time}")
+                prev_wp_time = wp_time_f
+            except (ValueError, TypeError) as ex:
+                if "NonMonotonic" in str(ex):
+                    raise
+
         x_val = wp.get("x_m", wp.get("x"))
         y_val = wp.get("y_m", wp.get("y"))
         if x_val is None or y_val is None:
@@ -158,13 +174,32 @@ def evaluate_single_condition(
         n_poses = len(x_arr)
 
         raw_t0 = pred_row.get("t0_us")
+        if raw_t0 is None and context_row:
+            raw_t0 = context_row.get("t0_us")
+        if raw_t0 is None and gt_row:
+            raw_t0 = gt_row.get("t0_us")
+
         if raw_t0 is None:
             if strict_mode:
-                t0_us = int(context_row.get("t0_us", gt_row.get("t0_us", 5_100_000) if gt_row else 5_100_000)) if context_row else 5_100_000
-            else:
-                t0_us = 5_100_000
+                rec.valid = False
+                rec.failure_stage = "time_origin_contract"
+                rec.failure_type = "MissingTimeOriginError"
+                rec.failure_reason = "Missing 't0_us' across all input sources (prediction, context, ground truth)"
+                rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
+                return rec
+            t0_us = 5_100_000
         else:
-            t0_us = int(raw_t0)
+            try:
+                t0_us = int(raw_t0)
+            except (TypeError, ValueError):
+                if strict_mode:
+                    rec.valid = False
+                    rec.failure_stage = "time_origin_contract"
+                    rec.failure_type = "InvalidTimeOriginError"
+                    rec.failure_reason = f"Invalid non-integer 't0_us': {raw_t0}"
+                    rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
+                    return rec
+                t0_us = 5_100_000
 
         dt_us = int(round(1_000_000 / frequency_hz))
         timestamps_us = t0_us + np.arange(n_poses, dtype=np.int64) * dt_us
@@ -197,15 +232,28 @@ def evaluate_single_condition(
             raise ValueError("missing_obstacles: 'all_obstacles' not found in context")
 
         # Compute Collision Free (CF)
-        cf_score, col_t, min_clear, col_tracks, col_types = compute_collision_free_proxy(
-            x_arr, y_arr, headings, timestamps_us, obstacles, vehicle,
-            t0_us=t0_us, touch_is_collision=touch_is_collision, context_present=True
-        )
+        try:
+            cf_res = compute_collision_free_proxy(
+                x_arr, y_arr, headings, timestamps_us, obstacles, vehicle,
+                t0_us=t0_us, touch_is_collision=touch_is_collision, context_present=True
+            )
+            cf_score, col_t, min_clear, col_tracks, col_types = cf_res
+            rec.matched_observation_frames = getattr(cf_res, "matched_observation_frames", 0)
+            rec.required_observation_frames = getattr(cf_res, "required_observation_frames", len(x_arr))
+            rec.observation_coverage_ratio = getattr(cf_res, "observation_coverage_ratio", 0.0)
+        except CorruptedObservationDataError as e:
+            rec.valid = False
+            rec.failure_stage = "obstacle_observation_contract"
+            rec.failure_type = "CORRUPTED_OBSERVATION_DATA"
+            rec.failure_reason = str(e)
+            rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
+            return rec
+
         if obstacles is not None and len(obstacles) > 0 and cf_score is None:
             rec.valid = False
             rec.failure_stage = "obstacle_observation_contract"
             rec.failure_type = "INSUFFICIENT_OBSERVATION_DATA"
-            rec.failure_reason = "Obstacles exist but lack timestamps or all timestamps are out of evaluation window"
+            rec.failure_reason = "Obstacles exist in context but zero frames matched observation window"
             rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
             return rec
 
@@ -218,10 +266,19 @@ def evaluate_single_condition(
 
         # Compute Time-to-Collision (TTC)
         speeds = kin.velocities
-        ttc_score, min_ttc, ttc_fail_t, ttc_tr = compute_ttc_proxy(
-            x_arr, y_arr, headings, speeds, timestamps_us, obstacles, vehicle,
-            t0_us=t0_us, ttc_horizon_s=ttc_horizon_s, context_present=True
-        )
+        try:
+            ttc_score, min_ttc, ttc_fail_t, ttc_tr = compute_ttc_proxy(
+                x_arr, y_arr, headings, speeds, timestamps_us, obstacles, vehicle,
+                t0_us=t0_us, ttc_horizon_s=ttc_horizon_s, context_present=True
+            )
+        except CorruptedObservationDataError as e:
+            rec.valid = False
+            rec.failure_stage = "obstacle_observation_contract"
+            rec.failure_type = "CORRUPTED_OBSERVATION_DATA"
+            rec.failure_reason = str(e)
+            rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
+            return rec
+
         rec.ttc_proxy = ttc_score
         rec.min_ttc_s = min_ttc if (min_ttc is not None and np.isfinite(min_ttc) and min_ttc < float("inf")) else None
         rec.ttc_failure_time_s = ttc_fail_t
@@ -263,10 +320,63 @@ def evaluate_single_condition(
             return rec
 
         if isinstance(raw_gt[0], dict):
-            gt_pts = [
-                [float(p.get("x", p.get("x_m", 0.0))), float(p.get("y", p.get("y_m", 0.0))), float(p.get("z", p.get("z_m", 0.0)))]
-                for p in raw_gt[:target_future_poses]
-            ]
+            gt_pts = []
+            prev_gt_time = None
+            for idx, p in enumerate(raw_gt[:target_future_poses]):
+                if not isinstance(p, dict):
+                    rec.valid = False
+                    rec.failure_stage = "ground_truth_contract"
+                    rec.failure_type = "InvalidGroundTruthWaypointError"
+                    rec.failure_reason = f"Ground truth waypoint {idx} is not a dict: {p}"
+                    rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
+                    return rec
+
+                gt_t = p.get("timestamp_micros") or p.get("t_us") or p.get("t_s") or p.get("timestamp_s") or p.get("time_s")
+                if gt_t is not None:
+                    try:
+                        gt_tf = float(gt_t)
+                        if prev_gt_time is not None and gt_tf <= prev_gt_time:
+                            rec.valid = False
+                            rec.failure_stage = "ground_truth_contract"
+                            rec.failure_type = "NonMonotonicTimelineError"
+                            rec.failure_reason = f"Ground truth waypoint {idx} timestamp {gt_tf} <= previous {prev_gt_time}"
+                            rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
+                            return rec
+                        prev_gt_time = gt_tf
+                    except (TypeError, ValueError):
+                        pass
+
+                x_val = p.get("x_m", p.get("x"))
+                y_val = p.get("y_m", p.get("y"))
+                if x_val is None or y_val is None:
+                    rec.valid = False
+                    rec.failure_stage = "ground_truth_contract"
+                    rec.failure_type = "MissingGroundTruthCoordinatesError"
+                    rec.failure_reason = f"Ground truth waypoint {idx} missing 'x' and 'y' coordinates: {p}"
+                    rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
+                    return rec
+
+                try:
+                    xf = float(x_val)
+                    yf = float(y_val)
+                    zf = float(p.get("z_m", p.get("z", 0.0)))
+                except (TypeError, ValueError) as ex:
+                    rec.valid = False
+                    rec.failure_stage = "ground_truth_contract"
+                    rec.failure_type = "NonNumericGroundTruthError"
+                    rec.failure_reason = f"Non-numeric Ground Truth coordinate at {idx}: {ex}"
+                    rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
+                    return rec
+
+                if not (np.isfinite(xf) and np.isfinite(yf) and np.isfinite(zf)):
+                    rec.valid = False
+                    rec.failure_stage = "ground_truth_contract"
+                    rec.failure_type = "NonFiniteGroundTruthError"
+                    rec.failure_reason = f"NaN or Inf found in Ground Truth at {idx}"
+                    rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
+                    return rec
+
+                gt_pts.append([xf, yf, zf])
             gt_xyz = np.array(gt_pts, dtype=float)
         else:
             gt_xyz = np.array(raw_gt[:target_future_poses], dtype=float)

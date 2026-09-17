@@ -97,15 +97,18 @@ def compute_paired_deltas(
     
     Maintains full float precision in delta_safety_proxy_raw.
     """
-    baseline_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    baseline_map: Dict[Tuple[str, str, Any, Any, Any], Dict[str, Any]] = {}
     for r in records:
         if not r.get("valid", True):
             continue
         cid = str(r.get("clip_id", ""))
         mode = str(r.get("mode", ""))
         alpha = float(r.get("alpha", 0.0))
+        horizon = r.get("horizon_s")
+        freq = r.get("frequency_hz")
+        profile = r.get("metric_profile")
         if alpha == 0.0:
-            baseline_map[(cid, mode)] = r
+            baseline_map[(cid, mode, horizon, freq, profile)] = r
 
     paired_rows = []
     for r in records:
@@ -116,8 +119,11 @@ def compute_paired_deltas(
         alpha = float(r.get("alpha", 0.0))
         if alpha == 0.0:
             continue
+        horizon = r.get("horizon_s")
+        freq = r.get("frequency_hz")
+        profile = r.get("metric_profile")
 
-        base = baseline_map.get((cid, mode))
+        base = baseline_map.get((cid, mode, horizon, freq, profile))
         if not base:
             continue
 
@@ -151,6 +157,9 @@ def compute_paired_deltas(
             "clip_id": cid,
             "mode": mode,
             "alpha": alpha,
+            "horizon_s": horizon,
+            "frequency_hz": freq,
+            "metric_profile": profile,
             "rule_group": r.get("rule_group"),
             "baseline_safety_proxy": base_score,
             "output_safety_proxy": out_score,
@@ -273,28 +282,59 @@ def compute_ade_disagreement_summary(
             disagreement = [it for it in penalized if float(it["delta_safety_proxy_raw"]) >= -practical_delta_safety]
             n_disagreement = len(disagreement)
 
+            # Genuinely safe: output has no collision (CF=1) and no offroad (DAC=1)
+            genuinely_safe = [
+                it for it in disagreement
+                if (it.get("out_cf") is not None and float(it["out_cf"]) >= 1.0)
+                and (it.get("out_dac") is not None and float(it["out_dac"]) >= 1.0)
+            ]
+            n_genuinely_safe = len(genuinely_safe)
+
+            # Safety compromised: safety proxy degraded or gate violated
+            def _cf_val(d: Dict[str, Any], k: str) -> float:
+                return float(d[k]) if (d.get(k) is not None) else 1.0
+
+            def _dac_val(d: Dict[str, Any], k: str) -> float:
+                return float(d[k]) if (d.get(k) is not None) else 1.0
+
+            safety_compromised = [
+                it for it in penalized
+                if float(it["delta_safety_proxy_raw"]) < -practical_delta_safety
+                or _cf_val(it, "out_cf") < _cf_val(it, "base_cf")
+                or _dac_val(it, "out_dac") < _dac_val(it, "base_dac")
+            ]
+            n_safety_compromised = len(safety_compromised)
+
             # Both degraded: ADE degraded AND safety actually degraded
             both_degraded = [it for it in penalized if float(it["delta_safety_proxy_raw"]) < -practical_delta_safety]
             n_both_degraded = len(both_degraded)
 
-            disagreement_pct = (n_disagreement / n_penalized * 100.0) if n_penalized > 0 else 0.0
+            disagreement_pct = (n_disagreement / n_penalized * 100.0) if n_penalized > 0 else None
+            gen_safe_pct = (n_genuinely_safe / n_penalized * 100.0) if n_penalized > 0 else None
         else:
-            mean_d_ade = 0.0
-            mean_d_safety = 0.0
+            mean_d_ade = None
+            mean_d_safety = None
             n_penalized = 0
             n_disagreement = 0
+            n_genuinely_safe = 0
+            n_safety_compromised = 0
             n_both_degraded = 0
-            disagreement_pct = 0.0
+            disagreement_pct = None
+            gen_safe_pct = None
 
         res = {group_keys[i]: g[i] for i in range(len(group_keys))}
         res.update({
             "n_paired": n,
             "n_with_ade": n_ade,
+            "n_excluded_missing_ade": n - n_ade,
             "mean_delta_ade": mean_d_ade,
             "mean_delta_safety": mean_d_safety,
             "ade_penalized_cases": n_penalized,
             "disagreement_count": n_disagreement,
             "disagreement_rate_pct": disagreement_pct,
+            "genuinely_safe_count": n_genuinely_safe,
+            "genuinely_safe_rate_pct": gen_safe_pct,
+            "safety_compromised_count": n_safety_compromised,
             "both_degraded_count": n_both_degraded,
         })
         results.append(res)

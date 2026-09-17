@@ -76,13 +76,16 @@ def main() -> None:
         try:
             import hashlib
             m_hasher = hashlib.sha256()
-            sample_clips = sorted([d.name for d in config.context_filtered_dir.iterdir() if d.is_dir()])[:10]
-            for cname in sample_clips:
-                m_hasher.update(cname.encode("utf-8"))
-                for pq in ["lane.parquet", "intersection_area.parquet"]:
-                    fp = config.context_filtered_dir / cname / "clipgt" / pq
-                    if fp.is_file():
-                        m_hasher.update(f"{pq}_{fp.stat().st_size}".encode("utf-8"))
+            for cdir in sorted(config.context_filtered_dir.iterdir()):
+                if cdir.is_dir():
+                    clipgt = cdir / "clipgt"
+                    for pq_name in ["lane.parquet", "intersection_area.parquet"]:
+                        pq_file = clipgt / pq_name
+                        if pq_file.is_file():
+                            m_hasher.update(f"{cdir.name}/{pq_name}:".encode("utf-8"))
+                            with pq_file.open("rb") as f:
+                                while chunk := f.read(65536):
+                                    m_hasher.update(chunk)
             source_hashes["context_filtered_map"] = m_hasher.hexdigest()
         except Exception:
             pass
@@ -108,7 +111,11 @@ def main() -> None:
 
     # 1. Validate identity on resume
     if resume:
-        if manifest_json.is_file():
+        if score_jsonl.is_file() and score_jsonl.stat().st_size > 0:
+            if not manifest_json.is_file():
+                raise ValueError(
+                    f"Resume rejected: score file exists ({score_jsonl.name}) but run manifest ({manifest_json.name}) is missing. Cannot verify configuration fingerprint."
+                )
             with manifest_json.open("r", encoding="utf-8") as mf:
                 prev_manifest = json.load(mf)
             prev_fp = prev_manifest.get("effective_fingerprint")
@@ -172,6 +179,25 @@ def main() -> None:
     start_time = time.time()
     processed_this_run = 0
     skipped_count = 0
+
+    # Write pre-run manifest with RUNNING status before loop
+    manifest_data = {
+        "status": "RUNNING",
+        "profile": profile,
+        "horizon_s": horizon_s,
+        "frequency_hz": config.frequency_hz,
+        "total_conditions": total_conditions,
+        "processed_this_run": 0,
+        "skipped_resumed": len(completed_keys),
+        "total_completed": len(all_score_dicts),
+        "total_runtime_s": 0.0,
+        "config_sha256": config.sha256,
+        "effective_fingerprint": current_effective_fingerprint,
+        "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    with manifest_json.open("w", encoding="utf-8") as f:
+        json.dump(manifest_data, f, indent=2)
 
     try:
         for idx, pred_row in enumerate(all_pred_rows, start=1):
@@ -255,21 +281,17 @@ def main() -> None:
         print(f"[*] Writing complete CSV table to: {score_csv}")
         export_table_to_csv(all_score_dicts, score_csv)
 
-    # Save run manifest
+    # Save final run manifest with COMPLETED status
     total_time = time.time() - start_time
-    manifest_data = {
-        "profile": profile,
-        "horizon_s": horizon_s,
-        "frequency_hz": config.frequency_hz,
-        "total_conditions": total_conditions,
+    manifest_data.update({
+        "status": "COMPLETED",
         "processed_this_run": processed_this_run,
         "skipped_resumed": skipped_count,
         "total_completed": len(all_score_dicts),
         "total_runtime_s": round(total_time, 2),
-        "config_sha256": config.sha256,
-        "effective_fingerprint": current_effective_fingerprint,
+        "end_time": time.strftime("%Y-%m-%d %H:%M:%S"),
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-    }
+    })
     with manifest_json.open("w", encoding="utf-8") as f:
         json.dump(manifest_data, f, indent=2)
 

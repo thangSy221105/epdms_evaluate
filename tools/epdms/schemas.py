@@ -90,6 +90,11 @@ class EvaluationScoreRecord:
     ade_m: Optional[float] = None
     fde_m: Optional[float] = None
 
+    # Observation coverage diagnostics
+    matched_observation_frames: int = 0
+    required_observation_frames: int = 0
+    observation_coverage_ratio: float = 0.0
+
     # Kinematics
     max_abs_longitudinal_accel: Optional[float] = None
     max_abs_lateral_accel: Optional[float] = None
@@ -141,6 +146,9 @@ class EvaluationScoreRecord:
             "endpoint_displacement_error_m": self.endpoint_displacement_error_m,
             "ade_m": self.ade_m,
             "fde_m": self.fde_m,
+            "matched_observation_frames": self.matched_observation_frames,
+            "required_observation_frames": self.required_observation_frames,
+            "observation_coverage_ratio": self.observation_coverage_ratio,
             "max_abs_longitudinal_accel": self.max_abs_longitudinal_accel,
             "max_abs_lateral_accel": self.max_abs_lateral_accel,
             "max_jerk_magnitude": self.max_jerk_magnitude,

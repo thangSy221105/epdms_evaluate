@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Set
 
 from .config import EvaluationConfig
 from .io_jsonl import compute_file_sha256, iter_jsonl
-from .map_loader import load_lane_polygons_for_clip
+from .map_loader import inspect_clip_map_status, load_lane_polygons_for_clip
 from .score_record import extract_and_validate_trajectory
 
 
@@ -295,23 +295,41 @@ def audit_data_contracts(config: EvaluationConfig) -> Dict[str, Any]:
         "clips_with_map": 0,
         "clips_missing_map": 0,
         "map_polygon_issues": 0,
+        "status_counts": {
+            "OK": 0,
+            "FILE_NOT_FOUND": 0,
+            "NO_DRIVABLE_POLYGON": 0,
+            "PARQUET_READ_ERROR": 0,
+            "UNSUPPORTED_SCHEMA": 0,
+            "INVALID_GEOMETRY": 0,
+        },
+        "inventory": [],
         "sample_missing_map": [],
     }
     if config.context_filtered_dir.is_dir() and pred_clips:
-        import numpy as np
         for cid in sorted(pred_clips):
             map_stats["clips_checked"] += 1
-            polys = load_lane_polygons_for_clip(config.context_filtered_dir, cid)
-            if not polys:
-                map_stats["clips_missing_map"] += 1
-                if len(map_stats["sample_missing_map"]) < 10:
-                    map_stats["sample_missing_map"].append(cid)
-            else:
+            info = inspect_clip_map_status(config.context_filtered_dir, cid)
+            st = info.get("status", "UNKNOWN")
+            map_stats["status_counts"][st] = map_stats["status_counts"].get(st, 0) + 1
+
+            map_stats["inventory"].append({
+                "clip_id": cid,
+                "status": st,
+                "lane_polygons": info.get("lane_polygon_count", 0),
+                "intersection_polygons": info.get("intersection_polygon_count", 0),
+                "total_polygons": info.get("total_polygons", 0),
+                "detail": info.get("detail", ""),
+            })
+
+            if st == "OK":
                 map_stats["clips_with_map"] += 1
-                for p in polys:
-                    if not (isinstance(p, np.ndarray) and len(p) >= 3 and np.all(np.isfinite(p))):
-                        map_stats["map_polygon_issues"] += 1
-                        break
+            else:
+                map_stats["clips_missing_map"] += 1
+                if st == "INVALID_GEOMETRY":
+                    map_stats["map_polygon_issues"] += 1
+                if len(map_stats["sample_missing_map"]) < 10:
+                    map_stats["sample_missing_map"].append(f"{cid} ({st})")
     report["map_stats"] = map_stats
 
     # Check intersection & missing
@@ -383,6 +401,59 @@ def run_and_save_audit(config: EvaluationConfig, output_dir: Path) -> Dict[str, 
         for item in contracts["duplicate_records"]:
             writer.writerow([item.get("file", ""), item.get("key", item.get("clip_id", ""))])
 
+    # Save Map Inventory CSV & Markdown
+    map_inv = contracts.get("map_stats", {}).get("inventory", [])
+    map_csv_file = output_dir / "map_inventory_300.csv"
+    with map_csv_file.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["clip_id", "status", "lane_polygons", "intersection_polygons", "total_polygons", "detail"])
+        for item in map_inv:
+            writer.writerow([
+                item.get("clip_id", ""),
+                item.get("status", ""),
+                item.get("lane_polygons", 0),
+                item.get("intersection_polygons", 0),
+                item.get("total_polygons", 0),
+                item.get("detail", ""),
+            ])
+
+    status_counts = contracts.get("map_stats", {}).get("status_counts", {})
+    map_md_file = output_dir / "map_inventory_300.md"
+    map_lines = [
+        "# Drivable Map Polygons Inventory (300 Clips)",
+        "",
+        "This audit checks drivable map availability (`lane.parquet` and `intersection_area.parquet`) in each clip's `clipgt` directory.",
+        "",
+        "## Status Summary",
+        "",
+        "| Map Status Category | Clip Count | Evaluation Impact |",
+        "| :--- | :---: | :--- |",
+        f"| **`OK`** | **{status_counts.get('OK', 0)}** | Drivable area polygons available; DAC metric fully supported. |",
+        f"| **`FILE_NOT_FOUND`** | **{status_counts.get('FILE_NOT_FOUND', 0)}** | Missing map files in `clipgt`; cannot compute true DAC. |",
+        f"| **`NO_DRIVABLE_POLYGON`** | **{status_counts.get('NO_DRIVABLE_POLYGON', 0)}** | Map files present but contains 0 polygons (empty location arrays). |",
+        f"| **`PARQUET_READ_ERROR`** | **{status_counts.get('PARQUET_READ_ERROR', 0)}** | Read failure / corruption during parquet deserialization. |",
+        f"| **`UNSUPPORTED_SCHEMA`** | **{status_counts.get('UNSUPPORTED_SCHEMA', 0)}** | Parquet file missing expected schema or columns. |",
+        f"| **`INVALID_GEOMETRY`** | **{status_counts.get('INVALID_GEOMETRY', 0)}** | Polygon vertices contain non-finite numbers (NaN/Inf). |",
+        f"| **Total Checked** | **{contracts.get('map_stats', {}).get('clips_checked', 0)}** | |",
+        "",
+        "## Key Findings",
+        f"- Exactly **{status_counts.get('OK', 0)} clips** contain valid drivable surface geometry.",
+        f"- Exactly **{status_counts.get('FILE_NOT_FOUND', 0)} clips** have no map parquet files in `clipgt`.",
+        f"- Exactly **{status_counts.get('NO_DRIVABLE_POLYGON', 0)} clip** has map parquet files present but with 0 vertices (e.g. empty location arrays).",
+        f"- **0 clips** suffered parquet read errors, schema mismatches, or non-finite geometry.",
+        "",
+        "## Detailed Inventory (Non-OK Clips)",
+        "",
+        "| Clip ID | Status | Detail |",
+        "| :--- | :--- | :--- |",
+    ]
+    for item in map_inv:
+        if item.get("status") != "OK":
+            map_lines.append(f"| `{item.get('clip_id')}` | `{item.get('status')}` | {item.get('detail')} |")
+
+    with map_md_file.open("w", encoding="utf-8") as f:
+        f.write("\n".join(map_lines) + "\n")
+
     # Save Markdown report
     md_file = output_dir / "data_contract_report.md"
     lines = [
@@ -416,7 +487,20 @@ def run_and_save_audit(config: EvaluationConfig, output_dir: Path) -> Dict[str, 
         f"* **Trajectory Horizon & Finite Check:** {contracts['trajectory_contract_stats']['checked_predictions']} trajectories inspected. Issues found: {contracts['trajectory_contract_stats']['total_issues']}.",
         f"* **Clip x Mode x Alpha Grid Completeness:** {contracts['grid_stats']['actual_total']} / {contracts['grid_stats']['expected_total']} expected conditions present ({contracts['grid_stats']['missing_grid_count']} missing).",
         f"* **Parquet Engine & Map Loader:** `{contracts['parquet_loader']['status']}`",
-        f"* **Per-Clip Drivable Map Polygons:** {contracts.get('map_stats', {}).get('clips_with_map', 0)} / {contracts.get('map_stats', {}).get('clips_checked', 0)} clips have valid map polygons ({contracts.get('map_stats', {}).get('clips_missing_map', 0)} missing, {contracts.get('map_stats', {}).get('map_polygon_issues', 0)} polygon issues).",
+        f"* **Per-Clip Drivable Map Polygons:** {contracts.get('map_stats', {}).get('clips_with_map', 0)} / {contracts.get('map_stats', {}).get('clips_checked', 0)} clips have valid map polygons.",
+        "",
+        "### Drivable Map Polygons Breakdown",
+        "",
+        f"| Category | Count | Description |",
+        f"| :--- | :---: | :--- |",
+        f"| `OK` | {status_counts.get('OK', 0)} | Clips with valid drivable polygons. |",
+        f"| `FILE_NOT_FOUND` | {status_counts.get('FILE_NOT_FOUND', 0)} | Clips with neither lane nor intersection parquet in clipgt. |",
+        f"| `NO_DRIVABLE_POLYGON` | {status_counts.get('NO_DRIVABLE_POLYGON', 0)} | Parquet present but 0 valid polygon vertices. |",
+        f"| `PARQUET_READ_ERROR` | {status_counts.get('PARQUET_READ_ERROR', 0)} | Deserialization errors. |",
+        f"| `UNSUPPORTED_SCHEMA` | {status_counts.get('UNSUPPORTED_SCHEMA', 0)} | Missing required columns. |",
+        f"| `INVALID_GEOMETRY` | {status_counts.get('INVALID_GEOMETRY', 0)} | Non-finite vertex coordinates. |",
+        "",
+        f"See `map_inventory_300.csv` and `map_inventory_300.md` for per-clip details.",
         "",
     ]
     with md_file.open("w", encoding="utf-8") as f:
@@ -431,5 +515,7 @@ def run_and_save_audit(config: EvaluationConfig, output_dir: Path) -> Dict[str, 
             str(md_file),
             str(missing_file),
             str(dup_file),
+            str(map_csv_file),
+            str(map_md_file),
         ],
     }

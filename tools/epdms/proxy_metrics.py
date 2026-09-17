@@ -20,7 +20,12 @@ from .kinematics_numpy import ComfortThresholds, KinematicProfile, compute_kinem
 from .schemas import VehicleParameters
 
 
-def normalize_obstacle_record(obs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+class CorruptedObservationDataError(ValueError):
+    """Raised when an obstacle observation contains corrupted, missing, or non-finite geometry."""
+    pass
+
+
+def normalize_obstacle_record(obs: Dict[str, Any], raise_on_corrupt: bool = False) -> Optional[Dict[str, Any]]:
     """Normalizes an obstacle record from either flat or nested schema into a standard format.
     
     Supports:
@@ -28,9 +33,11 @@ def normalize_obstacle_record(obs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
       - Nested schema: { "obstacle": { "center": ..., "size": ..., "orientation": ... }, "timestamp_micros": ..., ... }
       - Or wrapper where timestamp_micros is inside "key": { "key": { "timestamp_micros": ... }, "obstacle": ... }
       
-    Returns None if required geometric attributes are missing or non-finite.
+    Returns None if required geometric attributes are missing or non-finite (or raises if raise_on_corrupt=True).
     """
     if not isinstance(obs, dict):
+        if raise_on_corrupt:
+            raise CorruptedObservationDataError(f"Obstacle is not a dict: {obs}")
         return None
 
     data = obs.get("obstacle") if isinstance(obs.get("obstacle"), dict) else obs
@@ -45,42 +52,62 @@ def normalize_obstacle_record(obs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     # 2. Extract Center
     center = data.get("center")
     if not isinstance(center, dict) or "x" not in center or "y" not in center:
+        if raise_on_corrupt:
+            raise CorruptedObservationDataError(f"Obstacle missing center coordinates: {center}")
         return None
     try:
         ox = float(center["x"])
         oy = float(center["y"])
         oz = float(center.get("z", 0.0))
         if not (np.isfinite(ox) and np.isfinite(oy) and np.isfinite(oz)):
+            if raise_on_corrupt:
+                raise CorruptedObservationDataError(f"Obstacle contains non-finite center coordinates: ({ox}, {oy}, {oz})")
             return None
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as ex:
+        if raise_on_corrupt:
+            raise CorruptedObservationDataError(f"Obstacle non-numeric center coordinates: {ex}")
         return None
 
     # 3. Extract Size
     size = data.get("size")
     if not isinstance(size, dict) or "x" not in size or "y" not in size:
+        if raise_on_corrupt:
+            raise CorruptedObservationDataError(f"Obstacle missing size dimensions: {size}")
         return None
     try:
         olength = float(size["x"])
         owidth = float(size["y"])
         oheight = float(size.get("z", 1.5))
         if not (np.isfinite(olength) and np.isfinite(owidth) and np.isfinite(oheight)):
+            if raise_on_corrupt:
+                raise CorruptedObservationDataError(f"Obstacle contains non-finite size dimensions: ({olength}, {owidth}, {oheight})")
             return None
         if olength <= 0.0 or owidth <= 0.0:
+            if raise_on_corrupt:
+                raise CorruptedObservationDataError(f"Obstacle non-positive dimensions: length={olength}, width={owidth}")
             return None
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as ex:
+        if raise_on_corrupt:
+            raise CorruptedObservationDataError(f"Obstacle non-numeric size: {ex}")
         return None
 
     # 4. Extract Orientation
     orient = data.get("orientation")
     if not isinstance(orient, dict) or "w" not in orient:
+        if raise_on_corrupt:
+            raise CorruptedObservationDataError(f"Obstacle missing orientation: {orient}")
         return None
     try:
         qw = float(orient["w"])
         qz = float(orient.get("z", 0.0))
         if not (np.isfinite(qw) and np.isfinite(qz)):
+            if raise_on_corrupt:
+                raise CorruptedObservationDataError(f"Obstacle non-finite orientation: ({qw}, {qz})")
             return None
         obs_yaw = 2.0 * np.arctan2(qz, qw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as ex:
+        if raise_on_corrupt:
+            raise CorruptedObservationDataError(f"Obstacle non-numeric orientation: {ex}")
         return None
 
     trackline_id = str(data.get("trackline_id", obs.get("trackline_id", "unknown")))
@@ -100,6 +127,31 @@ def normalize_obstacle_record(obs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
+class CollisionFreeResult(tuple):
+    """5-element tuple (cf_score, first_col_time, min_clearance, collided_tracks, collided_types)
+    extended with observation coverage metadata for reviewer contract compliance.
+    """
+    def __new__(
+        cls,
+        cf_score: Optional[float],
+        first_collision_time_s: Optional[float],
+        min_clearance_m: Optional[float],
+        collided_tracks: List[str],
+        collided_types: List[str],
+        matched_observation_frames: int = 0,
+        required_observation_frames: int = 0,
+        observation_coverage_ratio: float = 0.0,
+    ):
+        inst = super().__new__(
+            cls,
+            (cf_score, first_collision_time_s, min_clearance_m, collided_tracks, collided_types),
+        )
+        inst.matched_observation_frames = matched_observation_frames
+        inst.required_observation_frames = required_observation_frames
+        inst.observation_coverage_ratio = observation_coverage_ratio
+        return inst
+
+
 def compute_collision_free_proxy(
     x: np.ndarray,
     y: np.ndarray,
@@ -110,11 +162,16 @@ def compute_collision_free_proxy(
     t0_us: int,
     touch_is_collision: bool = True,
     context_present: bool = True,
-) -> Tuple[Optional[float], Optional[float], Optional[float], List[str], List[str]]:
+) -> CollisionFreeResult:
     """Evaluates Collision Free (CF) proxy metric across the trajectory.
     
     Returns:
+      CollisionFreeResult tuple:
       (cf_score, first_collision_time_s, min_clearance_m, collided_tracks, collided_types)
+      with attributes:
+      .matched_observation_frames
+      .required_observation_frames
+      .observation_coverage_ratio
       
     State rules:
       1. Missing context: returns (None, None, None, [], []) -> invalid
@@ -124,28 +181,29 @@ def compute_collision_free_proxy(
       4. Normal matching: returns (cf_score, col_time, min_clearance, tracks, types)
     """
     if not context_present or obstacles is None:
-        return None, None, None, [], []
+        return CollisionFreeResult(None, None, None, [], [], 0, len(x) if x is not None else 0, 0.0)
 
     n_poses = len(x)
+    required_frames = n_poses
     if len(obstacles) == 0:
-        return 1.0, None, None, [], []
+        return CollisionFreeResult(1.0, None, None, [], [], 0, 0, 1.0)
 
-    # Normalize all obstacles
+    # Normalize all obstacles; reject non-finite / corrupted geometry
     norm_obstacles: List[Dict[str, Any]] = []
     for obs in obstacles:
-        normalized = normalize_obstacle_record(obs)
+        normalized = normalize_obstacle_record(obs, raise_on_corrupt=True)
         if normalized is not None:
             norm_obstacles.append(normalized)
 
     # If obstacles were provided but none could be parsed, fail validation
     if len(norm_obstacles) == 0:
-        return None, None, None, [], []
+        return CollisionFreeResult(None, None, None, [], [], 0, required_frames, 0.0)
 
     # Filter obstacles with timestamps
     obs_with_ts = [o for o in norm_obstacles if o["timestamp_micros"] is not None]
     if len(obs_with_ts) == 0:
         # Obstacles exist, but none have timestamps -> insufficient observation data
-        return None, None, None, [], []
+        return CollisionFreeResult(None, None, None, [], [], 0, required_frames, 0.0)
 
     t_start_us = int(timestamps_us[0])
     t_end_us = int(timestamps_us[-1])
@@ -155,19 +213,20 @@ def compute_collision_free_proxy(
     in_window_obs = [o for o in obs_with_ts if window_start_us <= o["timestamp_micros"] <= window_end_us]
     if len(in_window_obs) == 0:
         # Obstacles exist in context, but all timestamps are completely outside evaluation window
-        return None, None, None, [], []
+        return CollisionFreeResult(None, None, None, [], [], 0, required_frames, 0.0)
 
     # Index in-window obstacles by timestamp
     obs_by_time: Dict[int, List[Dict[str, Any]]] = {}
     for obs in in_window_obs:
         obs_by_time.setdefault(obs["timestamp_micros"], []).append(obs)
 
-    all_obs_timestamps = np.array(sorted(obs_by_time.keys())) if obs_by_time else np.array([])
+    all_obs_timestamps = np.array(sorted(obs_by_time.keys())) if obs_by_time else np.array([], dtype=np.int64)
 
     min_clearance = float("inf")
     first_col_time = None
     collided_tracks = []
     collided_types = []
+    matched_observation_frames = 0
 
     for i in range(n_poses):
         t_us = timestamps_us[i]
@@ -191,6 +250,9 @@ def compute_collision_free_proxy(
             if abs(best_ts - t_us) <= half_step:
                 matching_obs = obs_by_time[best_ts]
 
+        if len(matching_obs) > 0:
+            matched_observation_frames += 1
+
         for obs in matching_obs:
             obs_corners = get_oriented_box_corners(
                 obs["center_x"], obs["center_y"], obs["yaw_rad"], obs["length_m"], obs["width_m"]
@@ -212,10 +274,30 @@ def compute_collision_free_proxy(
                 if clearance < min_clearance:
                     min_clearance = clearance
 
+    coverage_ratio = float(matched_observation_frames / required_frames) if required_frames > 0 else 0.0
+
+    # Reject if obstacles existed in context but none matched any trajectory frame
+    if len(obstacles) > 0 and matched_observation_frames == 0:
+        return CollisionFreeResult(
+            None, None, None, [], [],
+            matched_observation_frames=0,
+            required_observation_frames=required_frames,
+            observation_coverage_ratio=0.0,
+        )
+
     cf_score = 0.0 if first_col_time is not None else 1.0
     # Clearance must be finite number or None (never Infinity in JSON output)
     final_clearance = float(min_clearance) if (min_clearance < float("inf") and np.isfinite(min_clearance)) else None
-    return cf_score, first_col_time, final_clearance, collided_tracks, collided_types
+    return CollisionFreeResult(
+        cf_score,
+        first_col_time,
+        final_clearance,
+        collided_tracks,
+        collided_types,
+        matched_observation_frames=matched_observation_frames,
+        required_observation_frames=required_frames,
+        observation_coverage_ratio=coverage_ratio,
+    )
 
 
 def compute_dac_proxy(
@@ -284,10 +366,10 @@ def compute_ttc_proxy(
     if len(obstacles) == 0 or len(x) < 2:
         return 1.0, None, None, None
 
-    # Normalize all obstacles
+    # Normalize all obstacles; reject non-finite / corrupted geometry
     norm_obstacles: List[Dict[str, Any]] = []
     for obs in obstacles:
-        normalized = normalize_obstacle_record(obs)
+        normalized = normalize_obstacle_record(obs, raise_on_corrupt=True)
         if normalized is not None:
             norm_obstacles.append(normalized)
 
@@ -306,15 +388,17 @@ def compute_ttc_proxy(
     if len(in_window_obs) == 0:
         return None, None, None, None
 
-    dt_proj_list = [0.0, 0.3, 0.6, 0.9]
+    step_s = 0.2
+    dt_proj_list = [round(float(dt), 2) for dt in np.arange(0.0, float(ttc_horizon_s) + 1e-6, step_s)]
     min_ttc = float("inf")
     failure_time = None
     failure_track = None
+    matched_projections = 0
 
     obs_by_time: Dict[int, List[Dict[str, Any]]] = {}
     for obs in in_window_obs:
         obs_by_time.setdefault(obs["timestamp_micros"], []).append(obs)
-    all_obs_timestamps = np.array(sorted(obs_by_time.keys())) if obs_by_time else np.array([])
+    all_obs_timestamps = np.array(sorted(obs_by_time.keys())) if obs_by_time else np.array([], dtype=np.int64)
 
     n_poses = len(x)
     for i in range(n_poses):
@@ -346,6 +430,9 @@ def compute_ttc_proxy(
                 if abs(best_ts - proj_t_us) <= 100_000:
                     matching_obs = obs_by_time[best_ts]
 
+            if len(matching_obs) > 0:
+                matched_projections += 1
+
             for obs in matching_obs:
                 obs_corners = get_oriented_box_corners(
                     obs["center_x"], obs["center_y"], obs["yaw_rad"], obs["length_m"], obs["width_m"]
@@ -357,6 +444,9 @@ def compute_ttc_proxy(
                         min_ttc = dt_proj
                         failure_time = float((curr_t_us - t0_us) / 1_000_000.0)
                         failure_track = obs["trackline_id"]
+
+    if len(obstacles) > 0 and matched_projections == 0:
+        return None, None, None, None
 
     ttc_score = 0.0 if (min_ttc <= ttc_horizon_s) else 1.0
     final_ttc = float(min_ttc) if (min_ttc < float("inf") and np.isfinite(min_ttc)) else None
