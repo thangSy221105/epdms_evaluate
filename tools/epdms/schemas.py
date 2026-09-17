@@ -90,7 +90,26 @@ class EvaluationScoreRecord:
     ade_m: Optional[float] = None
     fde_m: Optional[float] = None
 
-    # Observation coverage diagnostics
+    # Observation coverage diagnostics (Group A)
+    cf_required_frames: int = 0
+    cf_observed_frames: int = 0
+    cf_confirmed_empty_frames: int = 0
+    cf_missing_frames: int = 0
+    cf_coverage_ratio: Optional[float] = None
+    ttc_required_observations: int = 0
+    ttc_observed_observations: int = 0
+    ttc_missing_observations: int = 0
+    ttc_coverage_ratio: Optional[float] = None
+    invalid_obstacle_count: int = 0
+    missing_timestamp_obstacle_count: int = 0
+    observation_policy: str = "strict_full_coverage"
+
+    # Timeline and Map provenance (Groups B & D)
+    timeline_policy: str = "strict_grid"
+    t0_source: Optional[str] = None
+    map_status: Optional[str] = None
+
+    # Backward compatibility aliases
     matched_observation_frames: int = 0
     required_observation_frames: int = 0
     observation_coverage_ratio: float = 0.0
@@ -146,6 +165,21 @@ class EvaluationScoreRecord:
             "endpoint_displacement_error_m": self.endpoint_displacement_error_m,
             "ade_m": self.ade_m,
             "fde_m": self.fde_m,
+            "cf_required_frames": self.cf_required_frames,
+            "cf_observed_frames": self.cf_observed_frames,
+            "cf_confirmed_empty_frames": self.cf_confirmed_empty_frames,
+            "cf_missing_frames": self.cf_missing_frames,
+            "cf_coverage_ratio": self.cf_coverage_ratio,
+            "ttc_required_observations": self.ttc_required_observations,
+            "ttc_observed_observations": self.ttc_observed_observations,
+            "ttc_missing_observations": self.ttc_missing_observations,
+            "ttc_coverage_ratio": self.ttc_coverage_ratio,
+            "invalid_obstacle_count": self.invalid_obstacle_count,
+            "missing_timestamp_obstacle_count": self.missing_timestamp_obstacle_count,
+            "observation_policy": self.observation_policy,
+            "timeline_policy": self.timeline_policy,
+            "t0_source": self.t0_source,
+            "map_status": self.map_status,
             "matched_observation_frames": self.matched_observation_frames,
             "required_observation_frames": self.required_observation_frames,
             "observation_coverage_ratio": self.observation_coverage_ratio,

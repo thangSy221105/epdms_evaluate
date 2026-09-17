@@ -24,8 +24,13 @@ if hasattr(sys.stderr, "reconfigure"):
 from tools.epdms.audit import audit_environment
 from tools.epdms.config import EvaluationConfig
 from tools.epdms.io_jsonl import AtomicJsonlWriter, compute_file_sha256, iter_jsonl, read_jsonl_indexed
-from tools.epdms.map_loader import load_lane_polygons_for_clip
+from tools.epdms.map_loader import inspect_clip_map_status, load_lane_polygons_for_clip
 from tools.epdms.reporting import export_table_to_csv
+from tools.epdms.run_identity import (
+    compute_map_directory_content_sha256,
+    verify_resume_safety_before_recovery,
+    write_manifest_atomic,
+)
 from tools.epdms.schemas import EvaluationScoreRecord
 from tools.epdms.score_record import evaluate_single_condition
 
@@ -73,22 +78,9 @@ def main() -> None:
         source_hashes["ground_truth_jsonl"] = compute_file_sha256(config.ground_truth_jsonl)
 
     if config.context_filtered_dir.is_dir():
-        try:
-            import hashlib
-            m_hasher = hashlib.sha256()
-            for cdir in sorted(config.context_filtered_dir.iterdir()):
-                if cdir.is_dir():
-                    clipgt = cdir / "clipgt"
-                    for pq_name in ["lane.parquet", "intersection_area.parquet"]:
-                        pq_file = clipgt / pq_name
-                        if pq_file.is_file():
-                            m_hasher.update(f"{cdir.name}/{pq_name}:".encode("utf-8"))
-                            with pq_file.open("rb") as f:
-                                while chunk := f.read(65536):
-                                    m_hasher.update(chunk)
-            source_hashes["context_filtered_map"] = m_hasher.hexdigest()
-        except Exception:
-            pass
+        map_sha = compute_map_directory_content_sha256(config.context_filtered_dir)
+        if map_sha:
+            source_hashes["context_filtered_map"] = map_sha
 
     current_effective_fingerprint = config.compute_effective_fingerprint(
         source_hashes=source_hashes,
@@ -109,22 +101,20 @@ def main() -> None:
     error_jsonl = score_dir / "epdms_errors_300.jsonl"
     manifest_json = score_dir / "run_manifest.json"
 
-    # 1. Validate identity on resume
+    # 1. Validate identity on resume BEFORE any recovery or file modification
     if resume:
-        if score_jsonl.is_file() and score_jsonl.stat().st_size > 0:
-            if not manifest_json.is_file():
-                raise ValueError(
-                    f"Resume rejected: score file exists ({score_jsonl.name}) but run manifest ({manifest_json.name}) is missing. Cannot verify configuration fingerprint."
-                )
-            with manifest_json.open("r", encoding="utf-8") as mf:
-                prev_manifest = json.load(mf)
-            prev_fp = prev_manifest.get("effective_fingerprint")
-            if not prev_fp or prev_fp != current_effective_fingerprint:
-                raise ValueError(
-                    f"Resume rejected: previous run manifest missing fingerprint or mismatch (prev={prev_fp}, current={current_effective_fingerprint})"
-                )
+        verify_resume_safety_before_recovery(
+            score_dir=score_dir,
+            expected_fingerprint=current_effective_fingerprint,
+            artifact_names=[
+                score_jsonl.name,
+                f"{score_jsonl.name}.tmp",
+                error_jsonl.name,
+                f"{error_jsonl.name}.tmp",
+            ],
+        )
 
-        # 2. Recover .tmp and repair truncated lines BEFORE reading completed keys
+        # 2. Recover .tmp and repair truncated lines AFTER verifying safety
         AtomicJsonlWriter.prepare_file_for_resume(score_jsonl)
         AtomicJsonlWriter.prepare_file_for_resume(error_jsonl)
 
@@ -196,8 +186,7 @@ def main() -> None:
         "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
-    with manifest_json.open("w", encoding="utf-8") as f:
-        json.dump(manifest_data, f, indent=2)
+    write_manifest_atomic(manifest_json, manifest_data)
 
     try:
         for idx, pred_row in enumerate(all_pred_rows, start=1):
@@ -219,8 +208,10 @@ def main() -> None:
                 rg = rule_group_map.get(record_key)
 
                 if clip_id not in cached_polygons:
-                    cached_polygons[clip_id] = load_lane_polygons_for_clip(config.context_filtered_dir, clip_id)
-                polygons = cached_polygons[clip_id]
+                    cached_polygons[clip_id] = inspect_clip_map_status(config.context_filtered_dir, clip_id)
+                map_res = cached_polygons[clip_id]
+                polygons = map_res.get("lane_polygons", []) + map_res.get("intersection_polygons", [])
+                clip_map_status = map_res.get("status")
 
                 # Evaluate condition with full parameter propagation
                 eval_record = evaluate_single_condition(
@@ -232,6 +223,7 @@ def main() -> None:
                     frequency_hz=config.frequency_hz,
                     rule_group=rg,
                     lane_polygons=polygons,
+                    map_status=clip_map_status,
                     touch_is_collision=config.touch_is_collision,
                     ttc_horizon_s=config.ttc_horizon_s,
                     progress_stationary_threshold_m=config.progress_stationary_threshold_m,
@@ -292,8 +284,7 @@ def main() -> None:
         "end_time": time.strftime("%Y-%m-%d %H:%M:%S"),
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
     })
-    with manifest_json.open("w", encoding="utf-8") as f:
-        json.dump(manifest_data, f, indent=2)
+    write_manifest_atomic(manifest_json, manifest_data)
 
     print(f"\n[+] Finished Evaluation:")
     print(f"    Total Completed: {len(all_score_dicts)}")

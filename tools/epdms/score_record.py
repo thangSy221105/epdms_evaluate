@@ -1,48 +1,57 @@
-"""Single-condition evaluation engine with strict contract validation and error boundary."""
+"""Score record calculation with strict time and observation contracts."""
 
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from .coordinates import derive_heading_from_xy
-from .geometry_numpy import (
-    get_ego_box_corners,
-    point_in_polygon_ray_casting,
-    points_in_any_polygon,
-)
 from .kinematics_numpy import compute_kinematics
+from .observation_contract import CorruptedObservationDataError
 from .proxy_metrics import (
-    CorruptedObservationDataError,
     compute_collision_free_proxy,
     compute_dac_proxy,
-    compute_nurec_safety_proxy_v1_composite,
     compute_progress_gt_proxy,
     compute_ttc_proxy,
 )
 from .schemas import EvaluationScoreRecord, VehicleParameters
+from .time_contract import (
+    ConflictingTimeOriginError,
+    InconsistentWaypointTimelineError,
+    MissingGroundTruthCoordinatesError,
+    MissingTimeOriginError,
+    NonMonotonicWaypointTimelineError,
+    TimeContractError,
+    TimelineHorizonMismatchError,
+    resolve_time_origin,
+    validate_and_normalize_timeline,
+)
+
+
+def compute_nurec_safety_proxy_v1_composite(
+    cf: Optional[float],
+    dac: Optional[float],
+    ttc: Optional[float],
+    ep_gt: Optional[float],
+    fc: Optional[float],
+) -> Optional[float]:
+    """Computes composite score: S = CF * DAC * (5*TTC + 5*EP_GT + 2*FC) / 12."""
+    if any(m is None for m in (cf, dac, ttc, ep_gt, fc)):
+        return None
+    return float(cf * dac * (5.0 * ttc + 5.0 * ep_gt + 2.0 * fc) / 12.0)
 
 
 def extract_and_validate_trajectory(
     pred_row: Dict[str, Any],
     alpha: float,
     target_future_poses: int = 40,
+    expected_frequency_hz: float = 10.0,
+    expected_horizon_s: float = 4.0,
+    strict_grid: bool = True,
 ) -> Tuple[List[float], List[float], List[Dict[str, Any]]]:
-    """Shared helper function to extract, check schema, and validate future waypoints for a condition.
-    
-    Supports:
-      - 'guided_waypoints' / 'clean_waypoints'
-      - 'trajectories.guided' / 'trajectories.clean'
-      - Coordinates under 'x_m'/'y_m' or 'x'/'y'
-      - Timeline monotonicity check if timestamps are present
-      
-    Returns:
-      (xs, ys, future_wps)
-    Raises:
-      ValueError or TypeError if missing, insufficient, non-monotonic, or non-finite.
-    """
+    """Extracts waypoints from prediction record and validates geometry and timeline."""
     if alpha == 0.0:
         raw_wps = pred_row.get("clean_waypoints")
         if raw_wps is None and "trajectories" in pred_row and isinstance(pred_row["trajectories"], dict):
@@ -58,52 +67,15 @@ def extract_and_validate_trajectory(
         if raw_wps is None or len(raw_wps) == 0:
             raise ValueError("missing_guided_trajectory: alpha > 0 requires 'guided_waypoints'")
 
-    if not isinstance(raw_wps, list):
-        raise TypeError(f"Waypoints must be a list, got {type(raw_wps)}")
-
-    if len(raw_wps) < target_future_poses:
-        raise ValueError(
-            f"InsufficientWaypointsError: Expected at least {target_future_poses} future waypoints, found {len(raw_wps)}"
-        )
-
-    future_wps = raw_wps[:target_future_poses]
-    xs: List[float] = []
-    ys: List[float] = []
-    prev_wp_time = None
-
-    for i, wp in enumerate(future_wps):
-        if not isinstance(wp, dict):
-            raise TypeError(f"Waypoint {i} is not a dict: {wp}")
-
-        # Check timestamp monotonicity if timestamps are present
-        wp_time = wp.get("timestamp_micros") or wp.get("t_us") or wp.get("t_s") or wp.get("timestamp_s") or wp.get("time_s")
-        if wp_time is not None:
-            try:
-                wp_time_f = float(wp_time)
-                if prev_wp_time is not None and wp_time_f <= prev_wp_time:
-                    raise ValueError(f"NonMonotonicWaypointTimelineError: Waypoint {i} timestamp {wp_time_f} <= previous {prev_wp_time}")
-                prev_wp_time = wp_time_f
-            except (ValueError, TypeError) as ex:
-                if "NonMonotonic" in str(ex):
-                    raise
-
-        x_val = wp.get("x_m", wp.get("x"))
-        y_val = wp.get("y_m", wp.get("y"))
-        if x_val is None or y_val is None:
-            raise ValueError(f"Waypoint {i} missing 'x_m'/'y_m' or 'x'/'y': {wp}")
-        try:
-            xf = float(x_val)
-            yf = float(y_val)
-        except (TypeError, ValueError):
-            raise ValueError(f"Non-numeric coordinate at waypoint {i}: x={x_val}, y={y_val}")
-
-        if not (np.isfinite(xf) and np.isfinite(yf)):
-            raise ValueError(f"Non-finite coordinate at waypoint {i}: x={xf}, y={yf}")
-
-        xs.append(xf)
-        ys.append(yf)
-
-    return xs, ys, future_wps
+    xs_arr, ys_arr, future_wps, _ = validate_and_normalize_timeline(
+        raw_waypoints=raw_wps,
+        target_poses=target_future_poses,
+        expected_frequency_hz=expected_frequency_hz,
+        expected_horizon_s=expected_horizon_s,
+        allow_fixed_rate_grid=True,
+        strict_grid=strict_grid,
+    )
+    return list(xs_arr), list(ys_arr), future_wps
 
 
 def evaluate_single_condition(
@@ -120,8 +92,9 @@ def evaluate_single_condition(
     progress_stationary_threshold_m: float = 5.0,
     strict_mode: bool = True,
     metric_profile: str = "nurec_safety_proxy_v1",
+    map_status: Optional[str] = None,
 ) -> EvaluationScoreRecord:
-    """Evaluates a single condition (clip_id, mode, alpha) safely within an error boundary."""
+    """Evaluates a single condition safely within an error boundary under strict contracts."""
     if metric_profile in ("navsim_v2_full", "navsim_v2_stage1"):
         raise NotImplementedError("OFFICIAL_PROFILE_NOT_IMPLEMENTED")
 
@@ -136,6 +109,9 @@ def evaluate_single_condition(
         metric_profile=metric_profile,
         horizon_s=horizon_s,
         frequency_hz=frequency_hz,
+        observation_policy="strict_full_coverage" if strict_mode else "relaxed",
+        timeline_policy="strict_grid" if strict_mode else "relaxed",
+        map_status=map_status,
     )
 
     try:
@@ -164,50 +140,46 @@ def evaluate_single_condition(
         rec.mode = mode
         rec.alpha = alpha
 
-        # 2. Extract and validate waypoints using shared function
-        target_future_poses = int(round(horizon_s * frequency_hz))  # 40 for 4.0s @ 10Hz
-        xs, ys, future_wps = extract_and_validate_trajectory(pred_row, alpha, target_future_poses=target_future_poses)
+        # 2. Extract and validate trajectory waypoints and timeline
+        target_future_poses = int(round(horizon_s * frequency_hz))
+        try:
+            xs, ys, future_wps = extract_and_validate_trajectory(
+                pred_row, alpha, target_future_poses=target_future_poses,
+                expected_frequency_hz=frequency_hz, expected_horizon_s=horizon_s,
+                strict_grid=strict_mode,
+            )
+        except (NonMonotonicWaypointTimelineError, TimelineHorizonMismatchError, InconsistentWaypointTimelineError) as t_err:
+            rec.valid = False
+            rec.failure_stage = "timeline_contract"
+            rec.failure_type = type(t_err).__name__
+            rec.failure_reason = str(t_err)
+            rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
+            return rec
 
         # Prepend state at t=0.0 (origin of ar1_ego frame)
         x_arr = np.array([0.0] + xs, dtype=float)
         y_arr = np.array([0.0] + ys, dtype=float)
         n_poses = len(x_arr)
 
-        raw_t0 = pred_row.get("t0_us")
-        if raw_t0 is None and context_row:
-            raw_t0 = context_row.get("t0_us")
-        if raw_t0 is None and gt_row:
-            raw_t0 = gt_row.get("t0_us")
-
-        if raw_t0 is None:
-            if strict_mode:
-                rec.valid = False
-                rec.failure_stage = "time_origin_contract"
-                rec.failure_type = "MissingTimeOriginError"
-                rec.failure_reason = "Missing 't0_us' across all input sources (prediction, context, ground truth)"
-                rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
-                return rec
-            t0_us = 5_100_000
-        else:
-            try:
-                t0_us = int(raw_t0)
-            except (TypeError, ValueError):
-                if strict_mode:
-                    rec.valid = False
-                    rec.failure_stage = "time_origin_contract"
-                    rec.failure_type = "InvalidTimeOriginError"
-                    rec.failure_reason = f"Invalid non-integer 't0_us': {raw_t0}"
-                    rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
-                    return rec
-                t0_us = 5_100_000
+        # 3. Resolve time origin t0
+        try:
+            t0_us, t0_src = resolve_time_origin(
+                pred_row, context_row, gt_row, strict_mode=strict_mode
+            )
+            rec.t0_source = t0_src
+        except (MissingTimeOriginError, ConflictingTimeOriginError) as t0_err:
+            rec.valid = False
+            rec.failure_stage = "time_origin_contract"
+            rec.failure_type = type(t0_err).__name__
+            rec.failure_reason = str(t0_err)
+            rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
+            return rec
 
         dt_us = int(round(1_000_000 / frequency_hz))
         timestamps_us = t0_us + np.arange(n_poses, dtype=np.int64) * dt_us
 
-        # 3. Derive headings with stationary protection
+        # 4. Derive headings and Kinematics
         headings = derive_heading_from_xy(x_arr, y_arr)
-
-        # 4. Kinematics & Comfort Proxy
         kin = compute_kinematics(x_arr, y_arr, headings, dt=1.0 / frequency_hz)
         rec.max_abs_longitudinal_accel = kin.max_abs_longitudinal_accel
         rec.max_abs_lateral_accel = kin.max_abs_lateral_accel
@@ -235,12 +207,21 @@ def evaluate_single_condition(
         try:
             cf_res = compute_collision_free_proxy(
                 x_arr, y_arr, headings, timestamps_us, obstacles, vehicle,
-                t0_us=t0_us, touch_is_collision=touch_is_collision, context_present=True
+                t0_us=t0_us, touch_is_collision=touch_is_collision, context_present=True,
+                strict_mode=strict_mode,
             )
             cf_score, col_t, min_clear, col_tracks, col_types = cf_res
-            rec.matched_observation_frames = getattr(cf_res, "matched_observation_frames", 0)
-            rec.required_observation_frames = getattr(cf_res, "required_observation_frames", len(x_arr))
-            rec.observation_coverage_ratio = getattr(cf_res, "observation_coverage_ratio", 0.0)
+            rec.cf_required_frames = getattr(cf_res, "cf_required_frames", len(x_arr))
+            rec.cf_observed_frames = getattr(cf_res, "cf_observed_frames", 0)
+            rec.cf_confirmed_empty_frames = getattr(cf_res, "cf_confirmed_empty_frames", 0)
+            rec.cf_missing_frames = getattr(cf_res, "cf_missing_frames", 0)
+            rec.cf_coverage_ratio = getattr(cf_res, "cf_coverage_ratio", 0.0)
+            rec.invalid_obstacle_count = getattr(cf_res, "invalid_obstacle_count", 0)
+            rec.missing_timestamp_obstacle_count = getattr(cf_res, "missing_timestamp_obstacle_count", 0)
+            # Backward compatibility aliases
+            rec.matched_observation_frames = rec.cf_observed_frames
+            rec.required_observation_frames = rec.cf_required_frames
+            rec.observation_coverage_ratio = rec.cf_coverage_ratio or 0.0
         except CorruptedObservationDataError as e:
             rec.valid = False
             rec.failure_stage = "obstacle_observation_contract"
@@ -253,13 +234,12 @@ def evaluate_single_condition(
             rec.valid = False
             rec.failure_stage = "obstacle_observation_contract"
             rec.failure_type = "INSUFFICIENT_OBSERVATION_DATA"
-            rec.failure_reason = "Obstacles exist in context but zero frames matched observation window"
+            rec.failure_reason = f"Obstacles exist but observation coverage is incomplete (coverage={rec.cf_coverage_ratio})"
             rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
             return rec
 
         rec.collision_free_proxy = cf_score
         rec.first_collision_time_s = col_t
-        # Ensure clearance is finite or None (never Infinity in output)
         rec.minimum_clearance_m = min_clear if (min_clear is not None and np.isfinite(min_clear) and min_clear < float("inf")) else None
         rec.collided_track_ids = col_tracks
         rec.collided_object_types = col_types
@@ -267,15 +247,29 @@ def evaluate_single_condition(
         # Compute Time-to-Collision (TTC)
         speeds = kin.velocities
         try:
-            ttc_score, min_ttc, ttc_fail_t, ttc_tr = compute_ttc_proxy(
+            ttc_res = compute_ttc_proxy(
                 x_arr, y_arr, headings, speeds, timestamps_us, obstacles, vehicle,
-                t0_us=t0_us, ttc_horizon_s=ttc_horizon_s, context_present=True
+                t0_us=t0_us, ttc_horizon_s=ttc_horizon_s, context_present=True,
+                strict_mode=strict_mode,
             )
+            ttc_score, min_ttc, ttc_fail_t, ttc_tr = ttc_res
+            rec.ttc_required_observations = getattr(ttc_res, "ttc_required_observations", 0)
+            rec.ttc_observed_observations = getattr(ttc_res, "ttc_observed_observations", 0)
+            rec.ttc_missing_observations = getattr(ttc_res, "ttc_missing_observations", 0)
+            rec.ttc_coverage_ratio = getattr(ttc_res, "ttc_coverage_ratio", 0.0)
         except CorruptedObservationDataError as e:
             rec.valid = False
             rec.failure_stage = "obstacle_observation_contract"
             rec.failure_type = "CORRUPTED_OBSERVATION_DATA"
             rec.failure_reason = str(e)
+            rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
+            return rec
+
+        if obstacles is not None and len(obstacles) > 0 and ttc_score is None:
+            rec.valid = False
+            rec.failure_stage = "obstacle_observation_contract"
+            rec.failure_type = "INSUFFICIENT_OBSERVATION_DATA"
+            rec.failure_reason = f"TTC observation coverage is incomplete (coverage={rec.ttc_coverage_ratio})"
             rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
             return rec
 
@@ -285,6 +279,14 @@ def evaluate_single_condition(
         rec.ttc_track_id = ttc_tr
 
         # 6. Drivable Area Compliance (DAC)
+        if map_status == "PARTIAL" and strict_mode:
+            rec.valid = False
+            rec.failure_stage = "map_geometry_contract"
+            rec.failure_type = "PartialCorruptedMapError"
+            rec.failure_reason = "Map contains corrupted/partial polygons and cannot be used for strict scoring"
+            rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
+            return rec
+
         if lane_polygons is not None and len(lane_polygons) > 0:
             for p in lane_polygons:
                 if not isinstance(p, np.ndarray) or len(p) < 3 or not np.all(np.isfinite(p)):
@@ -296,7 +298,7 @@ def evaluate_single_condition(
                     return rec
             dac_score, off_t, off_count = compute_dac_proxy(
                 x_arr, y_arr, headings, timestamps_us, lane_polygons, vehicle,
-                t0_us=t0_us, require_drivable_geometry=strict_mode
+                t0_us=t0_us, require_drivable_geometry=strict_mode,
             )
             rec.dac_proxy = dac_score
             rec.first_offroad_time_s = off_t
@@ -338,7 +340,7 @@ def evaluate_single_condition(
                         if prev_gt_time is not None and gt_tf <= prev_gt_time:
                             rec.valid = False
                             rec.failure_stage = "ground_truth_contract"
-                            rec.failure_type = "NonMonotonicTimelineError"
+                            rec.failure_type = "NonMonotonicWaypointTimelineError"
                             rec.failure_reason = f"Ground truth waypoint {idx} timestamp {gt_tf} <= previous {prev_gt_time}"
                             rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
                             return rec
@@ -426,7 +428,6 @@ def evaluate_single_condition(
         rec.failure_stage = "evaluate_single_condition"
         rec.failure_type = type(e).__name__
         rec.failure_reason = str(e)
-        # Clear out scores to avoid false reporting of failed conditions
         rec.nurec_safety_proxy_v1 = None
         rec.collision_free_proxy = None
         rec.dac_proxy = None

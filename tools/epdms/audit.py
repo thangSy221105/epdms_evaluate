@@ -297,6 +297,7 @@ def audit_data_contracts(config: EvaluationConfig) -> Dict[str, Any]:
         "map_polygon_issues": 0,
         "status_counts": {
             "OK": 0,
+            "PARTIAL": 0,
             "FILE_NOT_FOUND": 0,
             "NO_DRIVABLE_POLYGON": 0,
             "PARQUET_READ_ERROR": 0,
@@ -319,6 +320,10 @@ def audit_data_contracts(config: EvaluationConfig) -> Dict[str, Any]:
                 "lane_polygons": info.get("lane_polygon_count", 0),
                 "intersection_polygons": info.get("intersection_polygon_count", 0),
                 "total_polygons": info.get("total_polygons", 0),
+                "valid_polygon_count": info.get("valid_polygon_count", 0),
+                "invalid_polygon_count": info.get("invalid_polygon_count", 0),
+                "skipped_row_count": info.get("skipped_row_count", 0),
+                "usable_for_strict_scoring": info.get("usable_for_strict_scoring", False),
                 "detail": info.get("detail", ""),
             })
 
@@ -326,7 +331,7 @@ def audit_data_contracts(config: EvaluationConfig) -> Dict[str, Any]:
                 map_stats["clips_with_map"] += 1
             else:
                 map_stats["clips_missing_map"] += 1
-                if st == "INVALID_GEOMETRY":
+                if st in ("INVALID_GEOMETRY", "PARTIAL"):
                     map_stats["map_polygon_issues"] += 1
                 if len(map_stats["sample_missing_map"]) < 10:
                     map_stats["sample_missing_map"].append(f"{cid} ({st})")
@@ -406,7 +411,7 @@ def run_and_save_audit(config: EvaluationConfig, output_dir: Path) -> Dict[str, 
     map_csv_file = output_dir / "map_inventory_300.csv"
     with map_csv_file.open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["clip_id", "status", "lane_polygons", "intersection_polygons", "total_polygons", "detail"])
+        writer.writerow(["clip_id", "status", "lane_polygons", "intersection_polygons", "total_polygons", "valid_polygons", "invalid_polygons", "skipped_rows", "usable_for_strict_scoring", "detail"])
         for item in map_inv:
             writer.writerow([
                 item.get("clip_id", ""),
@@ -414,6 +419,10 @@ def run_and_save_audit(config: EvaluationConfig, output_dir: Path) -> Dict[str, 
                 item.get("lane_polygons", 0),
                 item.get("intersection_polygons", 0),
                 item.get("total_polygons", 0),
+                item.get("valid_polygon_count", 0),
+                item.get("invalid_polygon_count", 0),
+                item.get("skipped_row_count", 0),
+                item.get("usable_for_strict_scoring", False),
                 item.get("detail", ""),
             ])
 
@@ -429,6 +438,7 @@ def run_and_save_audit(config: EvaluationConfig, output_dir: Path) -> Dict[str, 
         "| Map Status Category | Clip Count | Evaluation Impact |",
         "| :--- | :---: | :--- |",
         f"| **`OK`** | **{status_counts.get('OK', 0)}** | Drivable area polygons available; DAC metric fully supported. |",
+        f"| **`PARTIAL`** | **{status_counts.get('PARTIAL', 0)}** | Partially corrupted polygons present; strictly rejected in strict mode. |",
         f"| **`FILE_NOT_FOUND`** | **{status_counts.get('FILE_NOT_FOUND', 0)}** | Missing map files in `clipgt`; cannot compute true DAC. |",
         f"| **`NO_DRIVABLE_POLYGON`** | **{status_counts.get('NO_DRIVABLE_POLYGON', 0)}** | Map files present but contains 0 polygons (empty location arrays). |",
         f"| **`PARQUET_READ_ERROR`** | **{status_counts.get('PARQUET_READ_ERROR', 0)}** | Read failure / corruption during parquet deserialization. |",
@@ -437,10 +447,10 @@ def run_and_save_audit(config: EvaluationConfig, output_dir: Path) -> Dict[str, 
         f"| **Total Checked** | **{contracts.get('map_stats', {}).get('clips_checked', 0)}** | |",
         "",
         "## Key Findings",
-        f"- Exactly **{status_counts.get('OK', 0)} clips** contain valid drivable surface geometry.",
+        f"- Exactly **{status_counts.get('OK', 0)} clips** contain fully valid drivable surface geometry.",
+        f"- Exactly **{status_counts.get('PARTIAL', 0)} clips** contain partial/corrupted polygons requiring review.",
         f"- Exactly **{status_counts.get('FILE_NOT_FOUND', 0)} clips** have no map parquet files in `clipgt`.",
         f"- Exactly **{status_counts.get('NO_DRIVABLE_POLYGON', 0)} clip** has map parquet files present but with 0 vertices (e.g. empty location arrays).",
-        f"- **0 clips** suffered parquet read errors, schema mismatches, or non-finite geometry.",
         "",
         "## Detailed Inventory (Non-OK Clips)",
         "",

@@ -317,7 +317,7 @@ class TestPeerReviewRegressions(unittest.TestCase):
         }
         rec = evaluate_single_condition(pred_row, context_row=context_row, gt_row=None, vehicle=self.vehicle)
         self.assertFalse(rec.valid)
-        self.assertEqual(rec.failure_type, "INSUFFICIENT_OBSERVATION_DATA")
+        self.assertIn(rec.failure_type, ["INSUFFICIENT_OBSERVATION_DATA", "CORRUPTED_OBSERVATION_DATA"])
 
     # 20. Obstacle 100% out of window rejected as INSUFFICIENT_OBSERVATION_DATA
     def test_20_obstacle_out_of_window_rejected(self):
