@@ -11,6 +11,8 @@ from typing import Any, Dict, List, Set
 
 from .config import EvaluationConfig
 from .io_jsonl import compute_file_sha256, iter_jsonl
+from .map_loader import load_lane_polygons_for_clip
+from .score_record import extract_and_validate_trajectory
 
 
 def audit_environment() -> Dict[str, Any]:
@@ -202,58 +204,25 @@ def audit_data_contracts(config: EvaluationConfig) -> Dict[str, Any]:
             checked_pred_count += 1
             cid = str(row.get("clip_id", ""))
             mode = str(row.get("mode", ""))
-            if alpha > 0.0:
-                traj = row.get("guided_waypoints")
-                if traj is None and "trajectories" in row:
-                    traj = row["trajectories"].get("guided")
-            else:
-                traj = row.get("clean_waypoints")
-                if traj is None:
-                    traj = row.get("guided_waypoints")
-                if traj is None and "trajectories" in row:
-                    traj = row["trajectories"].get("clean") or row["trajectories"].get("guided")
+            raw_alpha = row.get("alpha", 0.0)
+            try:
+                alpha = float(raw_alpha)
+            except (TypeError, ValueError):
+                if len(trajectory_validation_issues) < 20:
+                    trajectory_validation_issues.append({
+                        "clip_id": cid, "mode": mode, "alpha": raw_alpha,
+                        "issue": f"Non-numeric alpha value: {raw_alpha}"
+                    })
+                continue
 
-            if not isinstance(traj, list) or len(traj) < 40:
+            try:
+                extract_and_validate_trajectory(row, alpha, target_future_poses=40)
+            except Exception as err:
                 if len(trajectory_validation_issues) < 20:
                     trajectory_validation_issues.append({
                         "clip_id": cid, "mode": mode, "alpha": alpha,
-                        "issue": f"Insufficient waypoints: {len(traj) if isinstance(traj, list) else 'None'} < 40"
+                        "issue": str(err)
                     })
-            else:
-                for pt_idx, pt in enumerate(traj[:40]):
-                    if not isinstance(pt, dict):
-                        if len(trajectory_validation_issues) < 20:
-                            trajectory_validation_issues.append({
-                                "clip_id": cid, "mode": mode, "alpha": alpha,
-                                "issue": f"Malformed waypoint at index {pt_idx}: {pt}"
-                            })
-                        break
-                    x = pt.get("x_m", pt.get("x"))
-                    y = pt.get("y_m", pt.get("y"))
-                    if x is None or y is None:
-                        if len(trajectory_validation_issues) < 20:
-                            trajectory_validation_issues.append({
-                                "clip_id": cid, "mode": mode, "alpha": alpha,
-                                "issue": f"Missing coordinates at index {pt_idx}: {pt}"
-                            })
-                        break
-                    try:
-                        xf, yf = float(x), float(y)
-                        import math
-                        if math.isnan(xf) or math.isinf(xf) or math.isnan(yf) or math.isinf(yf):
-                            if len(trajectory_validation_issues) < 20:
-                                trajectory_validation_issues.append({
-                                    "clip_id": cid, "mode": mode, "alpha": alpha,
-                                    "issue": f"Non-finite waypoint at index {pt_idx}: ({xf}, {yf})"
-                                })
-                            break
-                    except (TypeError, ValueError):
-                        if len(trajectory_validation_issues) < 20:
-                            trajectory_validation_issues.append({
-                                "clip_id": cid, "mode": mode, "alpha": alpha,
-                                "issue": f"Non-numeric coordinates at index {pt_idx}: ({x}, {y})"
-                            })
-                        break
 
     report["trajectory_contract_stats"] = {
         "checked_predictions": checked_pred_count,
@@ -320,9 +289,34 @@ def audit_data_contracts(config: EvaluationConfig) -> Dict[str, Any]:
         "error": parquet_error,
     }
 
+    # 7. Map & Drivable Polygon verification per clip
+    map_stats = {
+        "clips_checked": 0,
+        "clips_with_map": 0,
+        "clips_missing_map": 0,
+        "map_polygon_issues": 0,
+        "sample_missing_map": [],
+    }
+    if config.context_filtered_dir.is_dir() and pred_clips:
+        import numpy as np
+        for cid in sorted(pred_clips):
+            map_stats["clips_checked"] += 1
+            polys = load_lane_polygons_for_clip(config.context_filtered_dir, cid)
+            if not polys:
+                map_stats["clips_missing_map"] += 1
+                if len(map_stats["sample_missing_map"]) < 10:
+                    map_stats["sample_missing_map"].append(cid)
+            else:
+                map_stats["clips_with_map"] += 1
+                for p in polys:
+                    if not (isinstance(p, np.ndarray) and len(p) >= 3 and np.all(np.isfinite(p))):
+                        map_stats["map_polygon_issues"] += 1
+                        break
+    report["map_stats"] = map_stats
+
     # Check intersection & missing
     all_clips = pred_clips.union(ctx_clips).union(gt_clips)
-    for cid in all_clips:
+    for cid in sorted(all_clips):
         missing = []
         if cid not in pred_clips:
             missing.append("prediction")
@@ -339,8 +333,14 @@ def audit_data_contracts(config: EvaluationConfig) -> Dict[str, Any]:
     proxy_ready = (
         env["proxy_possible"]
         and has_inputs
+        and len(report["missing_records"]) == 0
+        and len(report["duplicate_records"]) == 0
+        and report["grid_stats"]["missing_grid_count"] == 0
         and len(trajectory_validation_issues) == 0
-        and ("FAILED" not in parquet_loader_status)
+        and parquet_loader_status.startswith("OK")
+        and map_stats["clips_missing_map"] == 0
+        and map_stats["map_polygon_issues"] == 0
+        and map_stats["clips_with_map"] > 0
     )
 
     report["readiness"] = {
@@ -416,6 +416,7 @@ def run_and_save_audit(config: EvaluationConfig, output_dir: Path) -> Dict[str, 
         f"* **Trajectory Horizon & Finite Check:** {contracts['trajectory_contract_stats']['checked_predictions']} trajectories inspected. Issues found: {contracts['trajectory_contract_stats']['total_issues']}.",
         f"* **Clip x Mode x Alpha Grid Completeness:** {contracts['grid_stats']['actual_total']} / {contracts['grid_stats']['expected_total']} expected conditions present ({contracts['grid_stats']['missing_grid_count']} missing).",
         f"* **Parquet Engine & Map Loader:** `{contracts['parquet_loader']['status']}`",
+        f"* **Per-Clip Drivable Map Polygons:** {contracts.get('map_stats', {}).get('clips_with_map', 0)} / {contracts.get('map_stats', {}).get('clips_checked', 0)} clips have valid map polygons ({contracts.get('map_stats', {}).get('clips_missing_map', 0)} missing, {contracts.get('map_stats', {}).get('map_polygon_issues', 0)} polygon issues).",
         "",
     ]
     with md_file.open("w", encoding="utf-8") as f:

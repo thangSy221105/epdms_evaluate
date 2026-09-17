@@ -102,3 +102,32 @@ def export_paired_summary_to_markdown(data: List[Dict[str, Any]], output_path: P
 
     with output_path.open("w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
+
+
+def export_ade_disagreement_to_markdown(data: List[Dict[str, Any]], output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    headers = [
+        "Mode", "Alpha", "N Paired", "Mean Delta ADE (m)", "Mean Delta Safety",
+        "ADE Penalized", "Disagreement (Safe/Unchanged)", "Disagreement %", "Both Degraded"
+    ]
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join(["---"] * len(headers)) + " |",
+    ]
+    for r in data:
+        row = [
+            str(r.get("mode", "")),
+            str(r.get("alpha", "")),
+            str(r.get("n_paired", "")),
+            f"{float(r.get('mean_delta_ade', 0.0)):+.4f}",
+            f"{float(r.get('mean_delta_safety', 0.0)):+.4f}",
+            str(r.get("ade_penalized_cases", 0)),
+            str(r.get("disagreement_count", 0)),
+            f"{float(r.get('disagreement_rate_pct', 0.0)):.2f}%",
+            str(r.get("both_degraded_count", 0)),
+        ]
+        lines.append("| " + " | ".join(row) + " |")
+
+    with output_path.open("w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+

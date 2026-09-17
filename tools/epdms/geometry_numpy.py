@@ -130,6 +130,11 @@ def is_point_on_segment(px: float, py: float, ax: float, ay: float, bx: float, b
 
 def point_in_polygon_ray_casting(px: float, py: float, polygon: np.ndarray, tol: float = 1e-7) -> bool:
     """Tests if (px, py) is inside or on the boundary of a 2D polygon with consistent boundary handling."""
+    if not (np.isfinite(px) and np.isfinite(py)):
+        raise ValueError(f"Non-finite point coordinates: ({px}, {py})")
+    if not np.all(np.isfinite(polygon)):
+        raise ValueError("Non-finite polygon coordinates")
+
     n = len(polygon)
     if n < 3:
         return False
@@ -201,6 +206,9 @@ def points_in_any_polygon(points: np.ndarray, polygons: list[np.ndarray], tol: f
     n_pts = len(points)
     if n_pts == 0 or len(polygons) == 0:
         return np.zeros(n_pts, dtype=bool)
+
+    if not np.all(np.isfinite(points)):
+        raise ValueError("Non-finite point coordinates in points_in_any_polygon")
 
     inside_mask = np.zeros(n_pts, dtype=bool)
     for pt_idx in range(n_pts):

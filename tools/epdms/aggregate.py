@@ -139,6 +139,14 @@ def compute_paired_deltas(
         else:
             practical_status = "unchanged"
 
+        base_ade = base.get("ade_m")
+        out_ade = r.get("ade_m")
+        delta_ade = (float(out_ade) - float(base_ade)) if (base_ade is not None and out_ade is not None) else None
+
+        base_fde = base.get("fde_m")
+        out_fde = r.get("fde_m")
+        delta_fde = (float(out_fde) - float(base_fde)) if (base_fde is not None and out_fde is not None) else None
+
         paired_rows.append({
             "clip_id": cid,
             "mode": mode,
@@ -160,6 +168,12 @@ def compute_paired_deltas(
             "out_comfort": r.get("future_comfort_proxy"),
             "base_progress": base.get("progress_gt_proxy"),
             "out_progress": r.get("progress_gt_proxy"),
+            "base_ade": base_ade,
+            "out_ade": out_ade,
+            "delta_ade": delta_ade,
+            "base_fde": base_fde,
+            "out_fde": out_fde,
+            "delta_fde": delta_fde,
         })
 
     return paired_rows
@@ -215,3 +229,75 @@ def compute_paired_summary(
         results.append(res)
 
     return results
+
+
+def compute_ade_disagreement_summary(
+    paired_rows: List[Dict[str, Any]],
+    group_keys: List[str] = ["mode", "alpha"],
+    ade_penalty_threshold_m: float = 0.05,
+    practical_delta_safety: float = 0.01,
+) -> List[Dict[str, Any]]:
+    """Analyzes whether increases in ADE error correspond to real safety degradation or harmless deviation.
+    
+    A condition is considered in 'Disagreement' if ADE got worse (delta_ade > threshold)
+    but Safety Proxy stayed unchanged or improved (delta_safety >= -practical_delta).
+    """
+    buckets: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
+    for r in paired_rows:
+        g = tuple(r.get(k) for k in group_keys)
+        buckets.setdefault(g, []).append(r)
+
+    results = []
+    sorted_items = sorted(
+        buckets.items(),
+        key=lambda item: tuple(str(x) if x is not None else "" for x in item[0]),
+    )
+
+    for g, items in sorted_items:
+        n = len(items)
+        valid_ade_items = [it for it in items if it.get("delta_ade") is not None]
+        n_ade = len(valid_ade_items)
+
+        if n_ade > 0:
+            delta_ades = np.array([float(it["delta_ade"]) for it in valid_ade_items])
+            delta_safeties = np.array([float(it["delta_safety_proxy_raw"]) for it in valid_ade_items])
+
+            mean_d_ade = float(np.mean(delta_ades))
+            mean_d_safety = float(np.mean(delta_safeties))
+
+            # Penalized by ADE (error relative to GT increased)
+            penalized = [it for it in valid_ade_items if float(it["delta_ade"]) > ade_penalty_threshold_m]
+            n_penalized = len(penalized)
+
+            # Disagreement: ADE degraded, but safety did NOT degrade
+            disagreement = [it for it in penalized if float(it["delta_safety_proxy_raw"]) >= -practical_delta_safety]
+            n_disagreement = len(disagreement)
+
+            # Both degraded: ADE degraded AND safety actually degraded
+            both_degraded = [it for it in penalized if float(it["delta_safety_proxy_raw"]) < -practical_delta_safety]
+            n_both_degraded = len(both_degraded)
+
+            disagreement_pct = (n_disagreement / n_penalized * 100.0) if n_penalized > 0 else 0.0
+        else:
+            mean_d_ade = 0.0
+            mean_d_safety = 0.0
+            n_penalized = 0
+            n_disagreement = 0
+            n_both_degraded = 0
+            disagreement_pct = 0.0
+
+        res = {group_keys[i]: g[i] for i in range(len(group_keys))}
+        res.update({
+            "n_paired": n,
+            "n_with_ade": n_ade,
+            "mean_delta_ade": mean_d_ade,
+            "mean_delta_safety": mean_d_safety,
+            "ade_penalized_cases": n_penalized,
+            "disagreement_count": n_disagreement,
+            "disagreement_rate_pct": disagreement_pct,
+            "both_degraded_count": n_both_degraded,
+        })
+        results.append(res)
+
+    return results
+

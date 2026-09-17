@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -19,6 +20,86 @@ from .kinematics_numpy import ComfortThresholds, KinematicProfile, compute_kinem
 from .schemas import VehicleParameters
 
 
+def normalize_obstacle_record(obs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Normalizes an obstacle record from either flat or nested schema into a standard format.
+    
+    Supports:
+      - Flat schema: { "center": ..., "size": ..., "orientation": ..., "timestamp_micros": ..., ... }
+      - Nested schema: { "obstacle": { "center": ..., "size": ..., "orientation": ... }, "timestamp_micros": ..., ... }
+      - Or wrapper where timestamp_micros is inside "key": { "key": { "timestamp_micros": ... }, "obstacle": ... }
+      
+    Returns None if required geometric attributes are missing or non-finite.
+    """
+    if not isinstance(obs, dict):
+        return None
+
+    data = obs.get("obstacle") if isinstance(obs.get("obstacle"), dict) else obs
+
+    # 1. Extract timestamp_micros
+    ts = obs.get("timestamp_micros")
+    if ts is None and "key" in obs and isinstance(obs["key"], dict):
+        ts = obs["key"].get("timestamp_micros")
+    if ts is None and "timestamp_micros" in data:
+        ts = data.get("timestamp_micros")
+
+    # 2. Extract Center
+    center = data.get("center")
+    if not isinstance(center, dict) or "x" not in center or "y" not in center:
+        return None
+    try:
+        ox = float(center["x"])
+        oy = float(center["y"])
+        oz = float(center.get("z", 0.0))
+        if not (np.isfinite(ox) and np.isfinite(oy) and np.isfinite(oz)):
+            return None
+    except (TypeError, ValueError):
+        return None
+
+    # 3. Extract Size
+    size = data.get("size")
+    if not isinstance(size, dict) or "x" not in size or "y" not in size:
+        return None
+    try:
+        olength = float(size["x"])
+        owidth = float(size["y"])
+        oheight = float(size.get("z", 1.5))
+        if not (np.isfinite(olength) and np.isfinite(owidth) and np.isfinite(oheight)):
+            return None
+        if olength <= 0.0 or owidth <= 0.0:
+            return None
+    except (TypeError, ValueError):
+        return None
+
+    # 4. Extract Orientation
+    orient = data.get("orientation")
+    if not isinstance(orient, dict) or "w" not in orient:
+        return None
+    try:
+        qw = float(orient["w"])
+        qz = float(orient.get("z", 0.0))
+        if not (np.isfinite(qw) and np.isfinite(qz)):
+            return None
+        obs_yaw = 2.0 * np.arctan2(qz, qw)
+    except (TypeError, ValueError):
+        return None
+
+    trackline_id = str(data.get("trackline_id", obs.get("trackline_id", "unknown")))
+    category = str(data.get("category", obs.get("category", "unknown")))
+
+    return {
+        "timestamp_micros": int(ts) if ts is not None else None,
+        "center_x": ox,
+        "center_y": oy,
+        "center_z": oz,
+        "length_m": olength,
+        "width_m": owidth,
+        "height_m": oheight,
+        "yaw_rad": obs_yaw,
+        "trackline_id": trackline_id,
+        "category": category,
+    }
+
+
 def compute_collision_free_proxy(
     x: np.ndarray,
     y: np.ndarray,
@@ -32,22 +113,54 @@ def compute_collision_free_proxy(
 ) -> Tuple[Optional[float], Optional[float], Optional[float], List[str], List[str]]:
     """Evaluates Collision Free (CF) proxy metric across the trajectory.
     
-    If context is missing, returns None for score to fail validation.
-    If context is present and obstacle list is legitimately empty (clear road), returns 1.0.
+    Returns:
+      (cf_score, first_collision_time_s, min_clearance_m, collided_tracks, collided_types)
+      
+    State rules:
+      1. Missing context: returns (None, None, None, [], []) -> invalid
+      2. Clear road (0 obstacles): returns (1.0, None, None, [], []) -> pass
+      3. Obstacles exist but lack timestamps or all timestamps are out of window:
+         returns (None, None, None, [], []) -> invalid (insufficient observation)
+      4. Normal matching: returns (cf_score, col_time, min_clearance, tracks, types)
     """
     if not context_present or obstacles is None:
         return None, None, None, [], []
 
     n_poses = len(x)
     if len(obstacles) == 0:
-        return 1.0, None, float("inf"), [], []
+        return 1.0, None, None, [], []
 
-    # Index obstacles by timestamp for fast lookup
-    obs_by_time: Dict[int, List[Dict[str, Any]]] = {}
+    # Normalize all obstacles
+    norm_obstacles: List[Dict[str, Any]] = []
     for obs in obstacles:
-        ts = obs.get("timestamp_micros")
-        if ts is not None:
-            obs_by_time.setdefault(int(ts), []).append(obs)
+        normalized = normalize_obstacle_record(obs)
+        if normalized is not None:
+            norm_obstacles.append(normalized)
+
+    # If obstacles were provided but none could be parsed, fail validation
+    if len(norm_obstacles) == 0:
+        return None, None, None, [], []
+
+    # Filter obstacles with timestamps
+    obs_with_ts = [o for o in norm_obstacles if o["timestamp_micros"] is not None]
+    if len(obs_with_ts) == 0:
+        # Obstacles exist, but none have timestamps -> insufficient observation data
+        return None, None, None, [], []
+
+    t_start_us = int(timestamps_us[0])
+    t_end_us = int(timestamps_us[-1])
+    # Check if observation timestamps overlap evaluation horizon (with +/- 0.5s tolerance)
+    window_start_us = t_start_us - 500_000
+    window_end_us = t_end_us + 500_000
+    in_window_obs = [o for o in obs_with_ts if window_start_us <= o["timestamp_micros"] <= window_end_us]
+    if len(in_window_obs) == 0:
+        # Obstacles exist in context, but all timestamps are completely outside evaluation window
+        return None, None, None, [], []
+
+    # Index in-window obstacles by timestamp
+    obs_by_time: Dict[int, List[Dict[str, Any]]] = {}
+    for obs in in_window_obs:
+        obs_by_time.setdefault(obs["timestamp_micros"], []).append(obs)
 
     all_obs_timestamps = np.array(sorted(obs_by_time.keys())) if obs_by_time else np.array([])
 
@@ -74,31 +187,22 @@ def compute_collision_free_proxy(
             if idx > 0:
                 candidates.append(all_obs_timestamps[idx - 1])
             best_ts = min(candidates, key=lambda c: abs(c - t_us))
-            if abs(best_ts - t_us) <= 50_000:
+            half_step = int(round(abs(timestamps_us[1] - timestamps_us[0]) / 2.0)) if len(timestamps_us) > 1 else 50_000
+            if abs(best_ts - t_us) <= half_step:
                 matching_obs = obs_by_time[best_ts]
 
         for obs in matching_obs:
-            center = obs.get("center", {})
-            size = obs.get("size", {})
-            orient = obs.get("orientation", {})
-            ox = float(center.get("x", 0.0))
-            oy = float(center.get("y", 0.0))
-            olength = float(size.get("x", 4.0))
-            owidth = float(size.get("y", 2.0))
-
-            qw = float(orient.get("w", 1.0))
-            qz = float(orient.get("z", 0.0))
-            obs_yaw = 2.0 * np.arctan2(qz, qw)
-
-            obs_corners = get_oriented_box_corners(ox, oy, obs_yaw, olength, owidth)
+            obs_corners = get_oriented_box_corners(
+                obs["center_x"], obs["center_y"], obs["yaw_rad"], obs["length_m"], obs["width_m"]
+            )
             is_col, clearance = sat_box_intersection(ego_corners, obs_corners, touch_is_collision)
 
             if is_col:
                 t_s = float((t_us - t0_us) / 1_000_000.0)
                 if first_col_time is None:
                     first_col_time = t_s
-                track_id = str(obs.get("trackline_id", "unknown"))
-                cat = str(obs.get("category", "unknown"))
+                track_id = obs["trackline_id"]
+                cat = obs["category"]
                 if track_id not in collided_tracks:
                     collided_tracks.append(track_id)
                 if cat not in collided_types:
@@ -109,7 +213,9 @@ def compute_collision_free_proxy(
                     min_clearance = clearance
 
     cf_score = 0.0 if first_col_time is not None else 1.0
-    return cf_score, first_col_time, min_clearance, collided_tracks, collided_types
+    # Clearance must be finite number or None (never Infinity in JSON output)
+    final_clearance = float(min_clearance) if (min_clearance < float("inf") and np.isfinite(min_clearance)) else None
+    return cf_score, first_col_time, final_clearance, collided_tracks, collided_types
 
 
 def compute_dac_proxy(
@@ -124,12 +230,17 @@ def compute_dac_proxy(
 ) -> Tuple[Optional[float], Optional[float], int]:
     """Evaluates Drivable Area Compliance (DAC) proxy metric.
     
-    If road_polygons is missing and required, returns (None, None, 0) to flag missing data.
+    If road_polygons is missing, empty, or contains non-finite vertices, returns (None, None, 0).
     """
     if road_polygons is None or len(road_polygons) == 0:
         if require_drivable_geometry:
             return None, None, 0
         return 1.0, None, 0
+
+    # Strict geometry validation: reject NaN / Inf polygons
+    for poly in road_polygons:
+        if not isinstance(poly, np.ndarray) or len(poly) < 3 or not np.all(np.isfinite(poly)):
+            return None, None, 0
 
     n_poses = len(x)
     offroad_count = 0
@@ -140,7 +251,11 @@ def compute_dac_proxy(
             x[i], y[i], headings[i],
             vehicle.length_m, vehicle.width_m, vehicle.rear_axle_to_center_m
         )
-        inside_mask = points_in_any_polygon(corners, road_polygons)
+        try:
+            inside_mask = points_in_any_polygon(corners, road_polygons)
+        except ValueError:
+            return None, None, 0
+
         if not np.all(inside_mask):
             offroad_count += 1
             if first_offroad_time is None:
@@ -162,15 +277,34 @@ def compute_ttc_proxy(
     ttc_horizon_s: float = 1.0,
     context_present: bool = True,
 ) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[str]]:
-    """Evaluates Time-to-Collision (TTC) proxy metric using forward projections.
-    
-    If context is missing, returns (None, None, None, None).
-    """
+    """Evaluates Time-to-Collision (TTC) proxy metric using forward projections."""
     if not context_present or obstacles is None:
         return None, None, None, None
 
     if len(obstacles) == 0 or len(x) < 2:
         return 1.0, None, None, None
+
+    # Normalize all obstacles
+    norm_obstacles: List[Dict[str, Any]] = []
+    for obs in obstacles:
+        normalized = normalize_obstacle_record(obs)
+        if normalized is not None:
+            norm_obstacles.append(normalized)
+
+    if len(norm_obstacles) == 0:
+        return None, None, None, None
+
+    obs_with_ts = [o for o in norm_obstacles if o["timestamp_micros"] is not None]
+    if len(obs_with_ts) == 0:
+        return None, None, None, None
+
+    t_start_us = int(timestamps_us[0])
+    t_end_us = int(timestamps_us[-1])
+    window_start_us = t_start_us - 500_000
+    window_end_us = t_end_us + int(ttc_horizon_s * 1_000_000) + 500_000
+    in_window_obs = [o for o in obs_with_ts if window_start_us <= o["timestamp_micros"] <= window_end_us]
+    if len(in_window_obs) == 0:
+        return None, None, None, None
 
     dt_proj_list = [0.0, 0.3, 0.6, 0.9]
     min_ttc = float("inf")
@@ -178,10 +312,8 @@ def compute_ttc_proxy(
     failure_track = None
 
     obs_by_time: Dict[int, List[Dict[str, Any]]] = {}
-    for obs in obstacles:
-        ts = obs.get("timestamp_micros")
-        if ts is not None:
-            obs_by_time.setdefault(int(ts), []).append(obs)
+    for obs in in_window_obs:
+        obs_by_time.setdefault(obs["timestamp_micros"], []).append(obs)
     all_obs_timestamps = np.array(sorted(obs_by_time.keys())) if obs_by_time else np.array([])
 
     n_poses = len(x)
@@ -215,28 +347,20 @@ def compute_ttc_proxy(
                     matching_obs = obs_by_time[best_ts]
 
             for obs in matching_obs:
-                center = obs.get("center", {})
-                size = obs.get("size", {})
-                orient = obs.get("orientation", {})
-                ox = float(center.get("x", 0.0))
-                oy = float(center.get("y", 0.0))
-                olength = float(size.get("x", 4.0))
-                owidth = float(size.get("y", 2.0))
-                qw = float(orient.get("w", 1.0))
-                qz = float(orient.get("z", 0.0))
-                obs_yaw = 2.0 * np.arctan2(qz, qw)
-
-                obs_corners = get_oriented_box_corners(ox, oy, obs_yaw, olength, owidth)
+                obs_corners = get_oriented_box_corners(
+                    obs["center_x"], obs["center_y"], obs["yaw_rad"], obs["length_m"], obs["width_m"]
+                )
                 is_col, _ = sat_box_intersection(proj_corners, obs_corners, touch_is_collision=True)
 
                 if is_col:
                     if dt_proj < min_ttc:
                         min_ttc = dt_proj
                         failure_time = float((curr_t_us - t0_us) / 1_000_000.0)
-                        failure_track = str(obs.get("trackline_id", "unknown"))
+                        failure_track = obs["trackline_id"]
 
     ttc_score = 0.0 if (min_ttc <= ttc_horizon_s) else 1.0
-    return ttc_score, (min_ttc if min_ttc < float("inf") else None), failure_time, failure_track
+    final_ttc = float(min_ttc) if (min_ttc < float("inf") and np.isfinite(min_ttc)) else None
+    return ttc_score, final_ttc, failure_time, failure_track
 
 
 def compute_progress_gt_proxy(
@@ -245,12 +369,16 @@ def compute_progress_gt_proxy(
     gt_xyz: Optional[np.ndarray],
     stationary_threshold_m: float = 5.0,
     prepend_t0: bool = True,
+    min_future_poses: int = 40,
 ) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
     """Computes Ego Progress proxy (EP_GT) along Ground Truth polyline.
     
-    If GT is missing or has fewer than 2 points, returns None to flag missing data.
+    If GT is missing or has fewer than min_future_poses points, returns None to flag missing data.
     """
-    if gt_xyz is None or len(gt_xyz) < 2:
+    if gt_xyz is None or len(gt_xyz) < min_future_poses:
+        return None, None, None, None
+
+    if not np.all(np.isfinite(gt_xyz)):
         return None, None, None, None
 
     gt_polyline = gt_xyz[:, :2]

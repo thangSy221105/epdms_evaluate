@@ -85,18 +85,15 @@ def repair_truncated_jsonl(file_path: Path) -> None:
 class AtomicJsonlWriter:
     """Crash-safe JSONL writer with atomic rename, checkpoint recovery, and NaN prevention."""
 
-    def __init__(self, target_path: Path, append_if_exists: bool = True):
-        self.target_path = Path(target_path)
-        self.target_path.parent.mkdir(parents=True, exist_ok=True)
-        self.temp_path = self.target_path.with_suffix(self.target_path.suffix + ".tmp")
-        self.append = append_if_exists
-
-        # Checkpoint recovery: If temp file exists from a previous hard crash, recover its valid lines
-        if self.temp_path.is_file():
-            if self.target_path.is_file() and self.append:
-                repair_truncated_jsonl(self.target_path)
-                # Append complete lines from temp into target
-                with self.temp_path.open("r", encoding="utf-8") as tf, self.target_path.open("a", encoding="utf-8") as af:
+    @classmethod
+    def prepare_file_for_resume(cls, target_path: Path) -> None:
+        """Recovers any pending .tmp file and repairs truncated trailing lines in target_path before reading."""
+        target_path = Path(target_path)
+        temp_path = target_path.with_suffix(target_path.suffix + ".tmp")
+        if temp_path.is_file():
+            if target_path.is_file():
+                repair_truncated_jsonl(target_path)
+                with temp_path.open("r", encoding="utf-8") as tf, target_path.open("a", encoding="utf-8") as af:
                     for line in tf:
                         s = line.strip()
                         if s:
@@ -106,18 +103,26 @@ class AtomicJsonlWriter:
                             except Exception:
                                 pass
                 try:
-                    os.remove(self.temp_path)
+                    os.remove(temp_path)
                 except OSError:
                     pass
-            elif not self.target_path.is_file():
-                # Recover temp as target directly if target didn't exist
+            else:
                 try:
-                    os.replace(self.temp_path, self.target_path)
+                    os.replace(temp_path, target_path)
                 except OSError:
                     pass
 
-        if self.append and self.target_path.is_file():
-            repair_truncated_jsonl(self.target_path)
+        if target_path.is_file():
+            repair_truncated_jsonl(target_path)
+
+    def __init__(self, target_path: Path, append_if_exists: bool = True):
+        self.target_path = Path(target_path)
+        self.target_path.parent.mkdir(parents=True, exist_ok=True)
+        self.temp_path = self.target_path.with_suffix(self.target_path.suffix + ".tmp")
+        self.append = append_if_exists
+
+        if self.append:
+            self.prepare_file_for_resume(self.target_path)
             self._file = self.target_path.open("a", encoding="utf-8")
             self._is_temp = False
         else:

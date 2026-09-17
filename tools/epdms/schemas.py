@@ -87,6 +87,8 @@ class EvaluationScoreRecord:
     gt_progress_m: Optional[float] = None
     pred_projected_progress_m: Optional[float] = None
     endpoint_displacement_error_m: Optional[float] = None
+    ade_m: Optional[float] = None
+    fde_m: Optional[float] = None
 
     # Kinematics
     max_abs_longitudinal_accel: Optional[float] = None
@@ -137,6 +139,8 @@ class EvaluationScoreRecord:
             "gt_progress_m": self.gt_progress_m,
             "pred_projected_progress_m": self.pred_projected_progress_m,
             "endpoint_displacement_error_m": self.endpoint_displacement_error_m,
+            "ade_m": self.ade_m,
+            "fde_m": self.fde_m,
             "max_abs_longitudinal_accel": self.max_abs_longitudinal_accel,
             "max_abs_lateral_accel": self.max_abs_lateral_accel,
             "max_jerk_magnitude": self.max_jerk_magnitude,

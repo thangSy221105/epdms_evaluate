@@ -24,59 +24,11 @@ if hasattr(sys.stderr, "reconfigure"):
 from tools.epdms.audit import audit_environment
 from tools.epdms.config import EvaluationConfig
 from tools.epdms.io_jsonl import AtomicJsonlWriter, compute_file_sha256, iter_jsonl, read_jsonl_indexed
+from tools.epdms.map_loader import load_lane_polygons_for_clip
 from tools.epdms.reporting import export_table_to_csv
 from tools.epdms.schemas import EvaluationScoreRecord
 from tools.epdms.score_record import evaluate_single_condition
 
-
-def load_lane_polygons_for_clip(filtered_dir: Path, clip_id: str) -> List[Any]:
-    """Loads lane and road boundaries for a clip if available."""
-    clip_dir = filtered_dir / clip_id / "clipgt"
-    polygons = []
-    if not clip_dir.is_dir():
-        return polygons
-
-    try:
-        import numpy as np
-        import pandas as pd
-    except ImportError:
-        return polygons
-
-    # 1. Check lane.parquet
-    lane_pq = clip_dir / "lane.parquet"
-    if lane_pq.is_file():
-        try:
-            df = pd.read_parquet(lane_pq)
-            for _, row in df.iterrows():
-                lane_data = row.get("lane", {})
-                if isinstance(lane_data, dict):
-                    left = lane_data.get("left_rail")
-                    right = lane_data.get("right_rail")
-                    if left is not None and right is not None and len(left) > 1 and len(right) > 1:
-                        pts_left = [[p["x"], p["y"]] for p in left]
-                        pts_right = [[p["x"], p["y"]] for p in reversed(right)]
-                        poly = np.array(pts_left + pts_right, dtype=float)
-                        if len(poly) >= 3:
-                            polygons.append(poly)
-        except Exception:
-            pass
-
-    # 2. Check intersection_area.parquet
-    ia_pq = clip_dir / "intersection_area.parquet"
-    if ia_pq.is_file():
-        try:
-            df = pd.read_parquet(ia_pq)
-            for _, row in df.iterrows():
-                ia_data = row.get("intersection_area", {})
-                if isinstance(ia_data, dict):
-                    loc = ia_data.get("location")
-                    if loc is not None and len(loc) >= 3:
-                        poly = np.array([[p["x"], p["y"]] for p in loc], dtype=float)
-                        polygons.append(poly)
-        except Exception:
-            pass
-
-    return polygons
 
 
 def main() -> None:
@@ -95,7 +47,8 @@ def main() -> None:
         help="Evaluation profile override.",
     )
     parser.add_argument("--horizon", type=float, default=None, help="Evaluation horizon in seconds (default: 4.0).")
-    parser.add_argument("--resume", action="store_true", default=None, help="Resume from existing score file.")
+    parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=None, help="Resume from existing score file.")
+    parser.add_argument("--score-dir", type=Path, default=None, help="Output directory for scores.")
     parser.add_argument("--max-clips", type=int, default=None, help="Limit number of clips to evaluate.")
     args = parser.parse_args()
 
@@ -110,7 +63,7 @@ def main() -> None:
     if profile in ("navsim_v2_full", "navsim_v2_stage1"):
         raise NotImplementedError("OFFICIAL_PROFILE_NOT_IMPLEMENTED")
 
-    # Compute effective fingerprint including sources
+    # Compute effective fingerprint including sources and map
     source_hashes = {}
     if config.prediction_jsonl.is_file():
         source_hashes["prediction_jsonl"] = compute_file_sha256(config.prediction_jsonl)
@@ -119,7 +72,25 @@ def main() -> None:
     if config.ground_truth_jsonl.is_file():
         source_hashes["ground_truth_jsonl"] = compute_file_sha256(config.ground_truth_jsonl)
 
-    current_effective_fingerprint = config.compute_effective_fingerprint(source_hashes=source_hashes)
+    if config.context_filtered_dir.is_dir():
+        try:
+            import hashlib
+            m_hasher = hashlib.sha256()
+            sample_clips = sorted([d.name for d in config.context_filtered_dir.iterdir() if d.is_dir()])[:10]
+            for cname in sample_clips:
+                m_hasher.update(cname.encode("utf-8"))
+                for pq in ["lane.parquet", "intersection_area.parquet"]:
+                    fp = config.context_filtered_dir / cname / "clipgt" / pq
+                    if fp.is_file():
+                        m_hasher.update(f"{pq}_{fp.stat().st_size}".encode("utf-8"))
+            source_hashes["context_filtered_map"] = m_hasher.hexdigest()
+        except Exception:
+            pass
+
+    current_effective_fingerprint = config.compute_effective_fingerprint(
+        source_hashes=source_hashes,
+        runtime_overrides={"horizon_s": horizon_s, "metric_profile": profile},
+    )
 
     print(f"[*] Profile:               {profile}")
     print(f"[*] Horizon:               {horizon_s}s (@ {config.frequency_hz} Hz)")
@@ -128,41 +99,45 @@ def main() -> None:
     print(f"[*] Effective Fingerprint: {current_effective_fingerprint[:16]}...")
 
     # Output paths
-    score_dir = config.score_dir
+    score_dir = args.score_dir or config.score_dir
     score_dir.mkdir(parents=True, exist_ok=True)
     score_jsonl = score_dir / "epdms_scores_300.jsonl"
     score_csv = score_dir / "epdms_scores_300.csv"
     error_jsonl = score_dir / "epdms_errors_300.jsonl"
     manifest_json = score_dir / "run_manifest.json"
 
+    # 1. Validate identity on resume
+    if resume:
+        if manifest_json.is_file():
+            with manifest_json.open("r", encoding="utf-8") as mf:
+                prev_manifest = json.load(mf)
+            prev_fp = prev_manifest.get("effective_fingerprint")
+            if not prev_fp or prev_fp != current_effective_fingerprint:
+                raise ValueError(
+                    f"Resume rejected: previous run manifest missing fingerprint or mismatch (prev={prev_fp}, current={current_effective_fingerprint})"
+                )
+
+        # 2. Recover .tmp and repair truncated lines BEFORE reading completed keys
+        AtomicJsonlWriter.prepare_file_for_resume(score_jsonl)
+        AtomicJsonlWriter.prepare_file_for_resume(error_jsonl)
+
+    # 3. Open writers
+    score_writer = AtomicJsonlWriter(score_jsonl, append_if_exists=resume)
+    error_writer = AtomicJsonlWriter(error_jsonl, append_if_exists=resume)
+
     completed_keys = set()
     all_score_dicts: List[Dict[str, Any]] = []
 
-    # Read existing records if resume
-    if resume:
-        if manifest_json.is_file():
-            try:
-                with manifest_json.open("r", encoding="utf-8") as mf:
-                    prev_manifest = json.load(mf)
-                prev_fp = prev_manifest.get("effective_fingerprint")
-                if prev_fp and prev_fp != current_effective_fingerprint:
-                    raise ValueError(
-                        f"Resume rejected: effective fingerprint mismatch (prev={prev_fp}, current={current_effective_fingerprint})"
-                    )
-            except ValueError:
-                raise
-            except Exception:
-                pass
-
-        if score_jsonl.is_file():
-            for r in iter_jsonl(score_jsonl):
-                k = r.get("record_key")
-                if k:
-                    if k in completed_keys:
-                        raise ValueError(f"Corrupted score file: duplicate record key found on resume: {k}")
-                    completed_keys.add(k)
-                    all_score_dicts.append(r)
-            print(f"[*] Resuming: found {len(completed_keys)} already evaluated conditions in {score_jsonl.name}")
+    # 4. Read cleanly recovered records from score_jsonl
+    if resume and score_jsonl.is_file():
+        for r in iter_jsonl(score_jsonl):
+            k = r.get("record_key")
+            if k:
+                if k in completed_keys:
+                    raise ValueError(f"Corrupted score file: duplicate record key found on resume: {k}")
+                completed_keys.add(k)
+                all_score_dicts.append(r)
+        print(f"[*] Resuming: found {len(completed_keys)} already evaluated conditions in {score_jsonl.name}")
 
     # Load context & ground truth indexed by clip_id
     print(f"[*] Loading context index from: {config.context_jsonl}")
@@ -192,9 +167,6 @@ def main() -> None:
     total_conditions = len(all_pred_rows)
     print(f"[*] Total conditions to process: {total_conditions}")
 
-    score_writer = AtomicJsonlWriter(score_jsonl, append_if_exists=resume)
-    error_writer = AtomicJsonlWriter(error_jsonl, append_if_exists=resume)
-
     cached_polygons: Dict[str, List[Any]] = {}
 
     start_time = time.time()
@@ -203,35 +175,57 @@ def main() -> None:
 
     try:
         for idx, pred_row in enumerate(all_pred_rows, start=1):
-            clip_id = str(pred_row.get("clip_id", ""))
-            mode = str(pred_row.get("mode", ""))
-            alpha = float(pred_row.get("alpha", 0.0))
-            record_key = f"{clip_id}|{mode}|{alpha:.3f}".rstrip("0").rstrip(".") if alpha != 0 else f"{clip_id}|{mode}|0"
+            eval_record: Optional[EvaluationScoreRecord] = None
+            record_key: Optional[str] = None
+            try:
+                raw_alpha = pred_row.get("alpha")
+                alpha = float(raw_alpha) if raw_alpha is not None else 0.0
+                clip_id = str(pred_row.get("clip_id", "unknown"))
+                mode = str(pred_row.get("mode", "unknown"))
+                record_key = f"{clip_id}|{mode}|{alpha:.3f}".rstrip("0").rstrip(".") if alpha != 0 else f"{clip_id}|{mode}|0"
 
-            if record_key in completed_keys:
-                skipped_count += 1
-                continue
+                if record_key in completed_keys:
+                    skipped_count += 1
+                    continue
 
-            ctx_row = context_map.get(clip_id)
-            gt_row = gt_map.get(clip_id)
-            rg = rule_group_map.get(record_key)
+                ctx_row = context_map.get(clip_id)
+                gt_row = gt_map.get(clip_id)
+                rg = rule_group_map.get(record_key)
 
-            if clip_id not in cached_polygons:
-                cached_polygons[clip_id] = load_lane_polygons_for_clip(config.context_filtered_dir, clip_id)
-            polygons = cached_polygons[clip_id]
+                if clip_id not in cached_polygons:
+                    cached_polygons[clip_id] = load_lane_polygons_for_clip(config.context_filtered_dir, clip_id)
+                polygons = cached_polygons[clip_id]
 
-            # Evaluate condition
-            eval_record: EvaluationScoreRecord = evaluate_single_condition(
-                pred_row=pred_row,
-                context_row=ctx_row,
-                gt_row=gt_row,
-                vehicle=config.vehicle,
-                horizon_s=horizon_s,
-                frequency_hz=config.frequency_hz,
-                rule_group=rg,
-                lane_polygons=polygons,
-                metric_profile=profile,
-            )
+                # Evaluate condition with full parameter propagation
+                eval_record = evaluate_single_condition(
+                    pred_row=pred_row,
+                    context_row=ctx_row,
+                    gt_row=gt_row,
+                    vehicle=config.vehicle,
+                    horizon_s=horizon_s,
+                    frequency_hz=config.frequency_hz,
+                    rule_group=rg,
+                    lane_polygons=polygons,
+                    touch_is_collision=config.touch_is_collision,
+                    ttc_horizon_s=config.ttc_horizon_s,
+                    progress_stationary_threshold_m=config.progress_stationary_threshold_m,
+                    strict_mode=config.strict_mode,
+                    metric_profile=profile,
+                )
+            except Exception as exc:
+                cid = str(pred_row.get("clip_id", "unknown")) if isinstance(pred_row, dict) else "unknown"
+                m = str(pred_row.get("mode", "unknown")) if isinstance(pred_row, dict) else "unknown"
+                record_key = record_key or f"{cid}|{m}|err"
+                eval_record = EvaluationScoreRecord(
+                    record_key=record_key,
+                    clip_id=cid,
+                    mode=m,
+                    alpha=0.0,
+                    valid=False,
+                    failure_stage="cli_condition_loop",
+                    failure_type=type(exc).__name__,
+                    failure_reason=str(exc),
+                )
 
             eval_record.config_sha256 = config.sha256
             rec_dict = eval_record.to_dict()

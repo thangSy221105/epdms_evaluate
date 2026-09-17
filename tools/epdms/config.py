@@ -56,16 +56,27 @@ class EvaluationConfig:
         s = json.dumps(self.raw, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
-    def compute_effective_fingerprint(self, source_hashes: Optional[Dict[str, str]] = None) -> str:
-        """Computes a strict fingerprint from effective runtime parameters and source file hashes."""
+    def compute_effective_fingerprint(
+        self,
+        source_hashes: Optional[Dict[str, str]] = None,
+        runtime_overrides: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Computes a strict fingerprint from effective runtime parameters, overrides, and source file hashes."""
+        overrides = runtime_overrides or {}
+        effective_horizon_s = float(overrides.get("horizon_s", self.horizon_s))
+        effective_profile = str(overrides.get("metric_profile", self.metric_profile))
+
         payload = {
-            "metric_profile": self.metric_profile,
-            "horizon_s": self.horizon_s,
+            "algorithm_version": "2.1.0",
+            "metric_profile": effective_profile,
+            "horizon_s": effective_horizon_s,
             "frequency_hz": self.frequency_hz,
             "strict_mode": self.strict_mode,
             "alphas": self.alphas,
             "modes": self.modes,
             "vehicle": {
+                "front_length_m": self.vehicle.front_length_m,
+                "rear_length_m": self.vehicle.rear_length_m,
                 "length_m": self.vehicle.length_m,
                 "width_m": self.vehicle.width_m,
                 "rear_axle_to_center_m": self.vehicle.rear_axle_to_center_m,

@@ -1,5 +1,6 @@
 """Regression tests covering all 18 peer review findings for EPDMS evaluation pipeline."""
 
+import json
 import math
 import tempfile
 import unittest
@@ -21,12 +22,19 @@ from tools.epdms.proxy_metrics import (
     compute_nurec_safety_proxy_v1_composite,
     compute_progress_gt_proxy,
     compute_ttc_proxy,
+    normalize_obstacle_record,
 )
 from tools.epdms.schemas import EvaluationScoreRecord, VehicleParameters
 from tools.epdms.score_record import evaluate_single_condition
 from tools.epdms.io_jsonl import AtomicJsonlWriter, iter_jsonl
 from tools.epdms.config import EvaluationConfig
-from tools.epdms.aggregate import aggregate_by_group, compute_paired_deltas, compute_paired_summary
+from tools.epdms.aggregate import (
+    aggregate_by_group,
+    compute_ade_disagreement_summary,
+    compute_paired_deltas,
+    compute_paired_summary,
+)
+from tools.epdms.audit import audit_data_contracts
 
 
 class TestPeerReviewRegressions(unittest.TestCase):
@@ -281,6 +289,285 @@ class TestPeerReviewRegressions(unittest.TestCase):
         self.assertTrue(len(summary) > 0)
         self.assertIn("ci95_lower", summary[0])
         self.assertIn("ci95_upper", summary[0])
+
+    # 19. Obstacle missing timestamp rejected as INSUFFICIENT_OBSERVATION_DATA
+    def test_19_obstacle_missing_timestamp_rejected(self):
+        pred_row = {
+            "clip_id": "clip_001",
+            "mode": "cross_scene",
+            "alpha": 0.0,
+            "clean_waypoints": [{"x_m": i * 0.5, "y_m": 0.0} for i in range(40)]
+        }
+        context_row = {
+            "clip_id": "clip_001",
+            "semantic_context": {
+                "obstacle": {
+                    "all_obstacles": [{
+                        "obstacle": {
+                            "center": {"x": 10.0, "y": 0.0, "z": 0.0},
+                            "size": {"x": 4.0, "y": 2.0, "z": 1.5},
+                            "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+                        }
+                    }]
+                }
+            }
+        }
+        rec = evaluate_single_condition(pred_row, context_row=context_row, gt_row=None, vehicle=self.vehicle)
+        self.assertFalse(rec.valid)
+        self.assertEqual(rec.failure_type, "INSUFFICIENT_OBSERVATION_DATA")
+
+    # 20. Obstacle 100% out of window rejected as INSUFFICIENT_OBSERVATION_DATA
+    def test_20_obstacle_out_of_window_rejected(self):
+        pred_row = {
+            "clip_id": "clip_001",
+            "mode": "cross_scene",
+            "alpha": 0.0,
+            "clean_waypoints": [{"x_m": i * 0.5, "y_m": 0.0} for i in range(40)]
+        }
+        context_row = {
+            "clip_id": "clip_001",
+            "semantic_context": {
+                "obstacle": {
+                    "all_obstacles": [{
+                        "timestamp_micros": 1_200_000_000,
+                        "obstacle": {
+                            "center": {"x": 10.0, "y": 0.0, "z": 0.0},
+                            "size": {"x": 4.0, "y": 2.0, "z": 1.5},
+                            "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+                        }
+                    }]
+                }
+            }
+        }
+        rec = evaluate_single_condition(pred_row, context_row=context_row, gt_row=None, vehicle=self.vehicle)
+        self.assertFalse(rec.valid)
+        self.assertEqual(rec.failure_type, "INSUFFICIENT_OBSERVATION_DATA")
+
+    # 21. Flat and nested obstacle schemas supported without phantom (0, 0)
+    def test_21_obstacle_flat_and_nested_schema_support(self):
+        nested = {
+            "timestamp_micros": 1000,
+            "obstacle": {
+                "center": {"x": 15.0, "y": 5.0, "z": 0.0},
+                "size": {"x": 4.5, "y": 2.1, "z": 1.6},
+                "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+            }
+        }
+        flat = {
+            "timestamp_micros": 1000,
+            "center": {"x": 15.0, "y": 5.0, "z": 0.0},
+            "size": {"x": 4.5, "y": 2.1, "z": 1.6},
+            "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+        }
+        norm_nested = normalize_obstacle_record(nested)
+        norm_flat = normalize_obstacle_record(flat)
+        self.assertIsNotNone(norm_nested)
+        self.assertIsNotNone(norm_flat)
+        self.assertAlmostEqual(norm_nested["center_x"], 15.0)
+        self.assertAlmostEqual(norm_flat["center_x"], 15.0)
+        self.assertAlmostEqual(norm_nested["length_m"], 4.5)
+        self.assertAlmostEqual(norm_flat["length_m"], 4.5)
+
+    # 22. Non-finite map polygon rejected
+    def test_22_non_finite_map_polygon_rejected(self):
+        pred_row = {
+            "clip_id": "clip_001",
+            "mode": "cross_scene",
+            "alpha": 0.0,
+            "clean_waypoints": [{"x_m": i * 0.5, "y_m": 0.0} for i in range(40)]
+        }
+        context_empty = {
+            "clip_id": "clip_001",
+            "semantic_context": {"obstacle": {"all_obstacles": []}}
+        }
+        bad_poly = np.array([[0.0, 0.0], [np.nan, 5.0], [5.0, 5.0]])
+        rec = evaluate_single_condition(
+            pred_row, context_row=context_empty, gt_row=None, vehicle=self.vehicle, lane_polygons=[bad_poly]
+        )
+        self.assertFalse(rec.valid)
+        self.assertEqual(rec.failure_stage, "map_geometry_contract")
+
+    # 23. Ground Truth with insufficient waypoints (< 40) rejected
+    def test_23_ground_truth_insufficient_waypoints_rejected(self):
+        pred_row = {
+            "clip_id": "clip_001",
+            "mode": "cross_scene",
+            "alpha": 0.0,
+            "clean_waypoints": [{"x_m": i * 0.5, "y_m": 0.0} for i in range(40)]
+        }
+        context_empty = {
+            "clip_id": "clip_001",
+            "semantic_context": {"obstacle": {"all_obstacles": []}}
+        }
+        lane_polys = [np.array([[-10.0, -10.0], [50.0, -10.0], [50.0, 10.0], [-10.0, 10.0]])]
+        gt_short = {
+            "clip_id": "clip_001",
+            "expert_future": [{"x": float(i), "y": 0.0} for i in range(15)]
+        }
+        rec = evaluate_single_condition(
+            pred_row, context_row=context_empty, gt_row=gt_short, vehicle=self.vehicle, lane_polygons=lane_polys
+        )
+        self.assertFalse(rec.valid)
+        self.assertEqual(rec.failure_stage, "ground_truth_contract")
+
+    # 24. Clear road serializes minimum_clearance_m = null without allow_nan crash
+    def test_24_clear_road_minimum_clearance_null_serialization(self):
+        pred_row = {
+            "clip_id": "clip_001",
+            "mode": "cross_scene",
+            "alpha": 0.0,
+            "clean_waypoints": [{"x_m": i * 0.5, "y_m": 0.0} for i in range(40)]
+        }
+        context_empty = {
+            "clip_id": "clip_001",
+            "semantic_context": {"obstacle": {"all_obstacles": []}}
+        }
+        lane_polys = [np.array([[-10.0, -10.0], [50.0, -10.0], [50.0, 10.0], [-10.0, 10.0]])]
+        gt_row = {"clip_id": "clip_001", "ego_future_xyz": [[i * 0.5, 0.0, 0.0] for i in range(40)]}
+        rec = evaluate_single_condition(
+            pred_row, context_row=context_empty, gt_row=gt_row, vehicle=self.vehicle, lane_polygons=lane_polys
+        )
+        self.assertTrue(rec.valid)
+        self.assertIsNone(rec.minimum_clearance_m)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_file = Path(tmpdir) / "clear_road.jsonl"
+            writer = AtomicJsonlWriter(out_file)
+            writer.write(rec.to_dict())
+            writer.close()
+            text = out_file.read_text(encoding="utf-8")
+            self.assertIn('"minimum_clearance_m": null', text)
+
+    # 25. Effective fingerprint changes on horizon override or map changes
+    def test_25_effective_fingerprint_changes_on_horizon_and_map(self):
+        cfg = EvaluationConfig({
+            "metric_profile": "nurec_safety_proxy_v1",
+            "horizon_s": 4.0,
+            "frequency_hz": 10.0,
+            "strict_mode": True,
+            "paths": {},
+            "vehicle": {},
+            "proxy": {},
+        })
+        fp_base = cfg.compute_effective_fingerprint({"source": "s1"}, runtime_overrides={"horizon_s": 4.0})
+        fp_h3 = cfg.compute_effective_fingerprint({"source": "s1"}, runtime_overrides={"horizon_s": 3.0})
+        fp_map = cfg.compute_effective_fingerprint(
+            {"source": "s1", "context_filtered_map": "map_hash_123"},
+            runtime_overrides={"horizon_s": 4.0}
+        )
+        self.assertNotEqual(fp_base, fp_h3)
+        self.assertNotEqual(fp_base, fp_map)
+
+    # 26. prepare_file_for_resume recovers .tmp and repairs trailing truncation
+    def test_26_prepare_file_for_resume_tmp_recovery(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "scores.jsonl"
+            tmp = Path(tmpdir) / "scores.jsonl.tmp"
+            tmp.write_text('{"record_key": "c1|m|0", "score": 1.0}\n{"record_key": "c1|m|0.5", "score": 0.8}\n{"record_key": "c1|m|1.0", "score":', encoding="utf-8")
+            AtomicJsonlWriter.prepare_file_for_resume(target)
+            self.assertTrue(target.is_file())
+            self.assertFalse(tmp.is_file())
+            rows = list(iter_jsonl(target))
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[0]["record_key"], "c1|m|0")
+            self.assertEqual(rows[1]["record_key"], "c1|m|0.5")
+
+    # 27. ADE and FDE metrics computed, and ADE-Safety disagreement detected
+    def test_27_ade_fde_computed_and_disagreement_summary(self):
+        gt_waypoints = [[float(i), 0.0, 0.0] for i in range(40)]
+        gt_row = {"clip_id": "c1", "ego_future_xyz": gt_waypoints}
+        context_empty = {"clip_id": "c1", "semantic_context": {"obstacle": {"all_obstacles": []}}}
+        lane_polys = [np.array([[-10.0, -10.0], [50.0, -10.0], [50.0, 10.0], [-10.0, 10.0]])]
+
+        pred_base = {
+            "clip_id": "c1",
+            "mode": "cross_scene",
+            "alpha": 0.0,
+            "clean_waypoints": [{"x_m": float(i), "y_m": 0.0} for i in range(40)],
+        }
+        pred_guided = {
+            "clip_id": "c1",
+            "mode": "cross_scene",
+            "alpha": 0.5,
+            "guided_waypoints": [{"x_m": float(i), "y_m": 2.0} for i in range(40)],
+        }
+
+        rec_base = evaluate_single_condition(pred_base, context_row=context_empty, gt_row=gt_row, vehicle=self.vehicle, lane_polygons=lane_polys)
+        rec_guided = evaluate_single_condition(pred_guided, context_row=context_empty, gt_row=gt_row, vehicle=self.vehicle, lane_polygons=lane_polys)
+
+        self.assertTrue(rec_base.valid)
+        self.assertTrue(rec_guided.valid)
+        self.assertAlmostEqual(rec_base.ade_m, 0.0, places=4)
+        self.assertAlmostEqual(rec_guided.ade_m, 2.0, places=4)
+        self.assertAlmostEqual(rec_base.fde_m, 0.0, places=4)
+        self.assertAlmostEqual(rec_guided.fde_m, 2.0, places=4)
+
+        paired = compute_paired_deltas([rec_base.to_dict(), rec_guided.to_dict()])
+        self.assertEqual(len(paired), 1)
+        self.assertAlmostEqual(paired[0]["delta_ade"], 2.0, places=4)
+
+        disagreement = compute_ade_disagreement_summary(paired)
+        self.assertEqual(len(disagreement), 1)
+        self.assertEqual(disagreement[0]["ade_penalized_cases"], 1)
+        self.assertEqual(disagreement[0]["disagreement_count"], 1)
+        self.assertAlmostEqual(disagreement[0]["disagreement_rate_pct"], 100.0, places=2)
+
+    # 28. Audit trajectory check loop variable isolation (no leak from alpha)
+    def test_28_audit_trajectory_check_order_independence(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            td = Path(tmpdir)
+            pred_file = td / "preds.jsonl"
+            ctx_file = td / "ctx.jsonl"
+            gt_file = td / "gt.jsonl"
+
+            r1 = {
+                "clip_id": "c1", "mode": "cross_scene", "alpha": 0.5,
+                "guided_waypoints": [{"x_m": float(i), "y_m": 0.0} for i in range(40)]
+            }
+            r2 = {
+                "clip_id": "c1", "mode": "cross_scene", "alpha": 0.0,
+                "clean_waypoints": [{"x_m": float(i), "y_m": 0.0} for i in range(40)]
+            }
+            with pred_file.open("w", encoding="utf-8") as f:
+                f.write(json.dumps(r1) + "\n" + json.dumps(r2) + "\n")
+            ctx_file.write_text('{"clip_id": "c1"}\n', encoding="utf-8")
+            gt_file.write_text('{"clip_id": "c1"}\n', encoding="utf-8")
+
+            cfg = EvaluationConfig({
+                "metric_profile": "nurec_safety_proxy_v1",
+                "paths": {
+                    "prediction_jsonl": str(pred_file),
+                    "context_jsonl": str(ctx_file),
+                    "ground_truth_jsonl": str(gt_file),
+                    "context_filtered_dir": str(td / "non_existent"),
+                }
+            })
+            report = audit_data_contracts(cfg)
+            self.assertEqual(report["trajectory_contract_stats"]["total_issues"], 0)
+
+    # 29. Audit readiness blocked if map polygons missing
+    def test_29_audit_readiness_blocked_on_missing_map(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            td = Path(tmpdir)
+            pred_file = td / "preds.jsonl"
+            ctx_file = td / "ctx.jsonl"
+            gt_file = td / "gt.jsonl"
+            row_data = {"clip_id": "c1", "mode": "cross_scene", "alpha": 0.0, "clean_waypoints": [{"x_m": 0.0, "y_m": 0.0} for _ in range(40)]}
+            pred_file.write_text(json.dumps(row_data) + "\n", encoding="utf-8")
+            ctx_file.write_text('{"clip_id": "c1"}\n', encoding="utf-8")
+            gt_file.write_text('{"clip_id": "c1"}\n', encoding="utf-8")
+
+            cfg = EvaluationConfig({
+                "metric_profile": "nurec_safety_proxy_v1",
+                "paths": {
+                    "prediction_jsonl": str(pred_file),
+                    "context_jsonl": str(ctx_file),
+                    "ground_truth_jsonl": str(gt_file),
+                    "context_filtered_dir": str(td / "empty_dir"),
+                }
+            })
+            (td / "empty_dir").mkdir()
+            report = audit_data_contracts(cfg)
+            self.assertEqual(report["readiness"]["nurec_safety_proxy_v1"], "NOT READY")
 
 
 if __name__ == "__main__":
