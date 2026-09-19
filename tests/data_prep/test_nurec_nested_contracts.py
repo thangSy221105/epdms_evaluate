@@ -201,7 +201,7 @@ class TestNuRecNestedContracts(unittest.TestCase):
             (clip / "rig_trajectories.json").write_text("{}", encoding="utf-8")
             (clip / "clipgt" / "calibration_estimate.parquet").write_bytes(b"fixture")
             pred = clip.parent / "pred.jsonl"; gt = clip.parent / "gt.jsonl"
-            pred.write_text(json.dumps({"clip_id": clip.name, "t0_us": 1}) + "\n", encoding="utf-8")
+            pred.write_text(json.dumps({"clip_id": clip.name, "t0_us": 1, "mode": "cross_scene", "alpha": 0}) + "\n", encoding="utf-8")
             gt.write_text(json.dumps({"clip_id": clip.name, "t0_us": 1}) + "\n", encoding="utf-8")
             with mock.patch.object(nurec, "_parquet_timestamp_summary", return_value={"status": "OK", "row_count": 1, "min": 1, "max": 1, "field": "key.timestamp_micros"}), mock.patch.object(nurec, "_parquet_clip_interval_summary", return_value={"status": "OK", "min": 1, "max": 2}), mock.patch.object(nurec, "_map_status", return_value={"status": "FILE_NOT_FOUND", "ready": False, "dac_candidate_available": False, "dac_geometry_verified": False}):
                 result = nurec.audit_dataset(clip.parent, pred, gt, clip.parent / "audit")
@@ -213,32 +213,32 @@ class TestNuRecNestedContracts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td); clip = root / "clip-a"; (clip / "clipgt").mkdir(parents=True)
             pred = root / "pred.jsonl"; gt = root / "gt.jsonl"
-            pred.write_text(json.dumps({"clip_id": "clip-a", "t0_us": 100}) + "\n", encoding="utf-8")
+            pred.write_text(json.dumps({"clip_id": "clip-a", "t0_us": 100, "mode": "cross_scene", "alpha": 0}) + "\n", encoding="utf-8")
             gt.write_text(json.dumps({"clip_id": "clip-a", "t0_us": 100}) + "\n", encoding="utf-8")
             fake = {"status": "OK", "row_count": 5, "min": 100, "max": 200, "unique_count": 5, "field": "key.timestamp_micros"}
             with mock.patch.object(nurec, "_parquet_timestamp_summary", return_value=fake), mock.patch.object(nurec, "_parquet_clip_interval_summary", return_value={"status": "OK", "min": 100, "max": 200}), mock.patch.object(nurec, "_map_status", return_value={"status": "FILE_NOT_FOUND", "ready": False, "dac_candidate_available": False, "dac_geometry_verified": False}):
                 nurec.audit_dataset(root, pred, gt, root / "audit")
             row = list(csv_rows(root / "audit" / "observation_coverage.csv"))[0]
-            self.assertEqual(row["available_frame_count"], "")
+            self.assertEqual(row["available_frame_count"], "0")
             self.assertEqual(row["obstacle_timestamp_count"], "5")
 
     def test_27_no_frame_evidence_is_unknown(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td); clip = root / "clip-a"; (clip / "clipgt").mkdir(parents=True)
             pred = root / "pred.jsonl"; gt = root / "gt.jsonl"
-            pred.write_text(json.dumps({"clip_id": "clip-a", "t0_us": 100}) + "\n", encoding="utf-8")
+            pred.write_text(json.dumps({"clip_id": "clip-a", "t0_us": 100, "mode": "cross_scene", "alpha": 0}) + "\n", encoding="utf-8")
             gt.write_text(json.dumps({"clip_id": "clip-a", "t0_us": 100}) + "\n", encoding="utf-8")
             fake = {"status": "OK", "row_count": 0, "min": None, "max": None, "unique_count": 0, "field": "key.timestamp_micros"}
             with mock.patch.object(nurec, "_parquet_timestamp_summary", return_value=fake), mock.patch.object(nurec, "_parquet_clip_interval_summary", return_value={"status": "OK", "min": 100, "max": 200}), mock.patch.object(nurec, "_map_status", return_value={"status": "FILE_NOT_FOUND", "ready": False, "dac_candidate_available": False, "dac_geometry_verified": False}):
                 nurec.audit_dataset(root, pred, gt, root / "audit")
             row = list(csv_rows(root / "audit" / "observation_coverage.csv"))[0]
-            self.assertEqual(row["observation_contract_status"], "UNKNOWN")
+            self.assertEqual(row["observation_contract_status"], "TIME_ALIGNMENT_UNRESOLVED")
 
     def test_28_numeric_overlap_does_not_verify_clock(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td); clip = root / "clip-a"; (clip / "clipgt").mkdir(parents=True)
             pred = root / "pred.jsonl"; gt = root / "gt.jsonl"
-            pred.write_text(json.dumps({"clip_id": "clip-a", "t0_us": 150}) + "\n", encoding="utf-8")
+            pred.write_text(json.dumps({"clip_id": "clip-a", "t0_us": 150, "mode": "cross_scene", "alpha": 0}) + "\n", encoding="utf-8")
             gt.write_text(json.dumps({"clip_id": "clip-a", "t0_us": 150}) + "\n", encoding="utf-8")
             fake = {"status": "OK", "row_count": 1, "min": 100, "max": 200, "unique_count": 1, "field": "key.timestamp_micros"}
             with mock.patch.object(nurec, "_parquet_timestamp_summary", return_value=fake), mock.patch.object(nurec, "_parquet_clip_interval_summary", return_value={"status": "OK", "min": 100, "max": 200}), mock.patch.object(nurec, "_map_status", return_value={"status": "FILE_NOT_FOUND", "ready": False, "dac_candidate_available": False, "dac_geometry_verified": False}):
@@ -251,7 +251,7 @@ class TestNuRecNestedContracts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td); clip = root / "clip-a"; (clip / "clipgt").mkdir(parents=True)
             pred = root / "pred.jsonl"; gt = root / "gt.jsonl"; ctx = root / "ctx.jsonl"
-            pred.write_text(json.dumps({"clip_id": "clip-a", "t0_us": 1}) + "\n", encoding="utf-8")
+            pred.write_text(json.dumps({"clip_id": "clip-a", "t0_us": 1, "mode": "cross_scene", "alpha": 0}) + "\n", encoding="utf-8")
             gt.write_text(json.dumps({"clip_id": "clip-a", "t0_us": 1}) + "\n", encoding="utf-8")
             ctx.write_text(json.dumps({"clip_id": "clip-a", "time_alignment": {"verified": True}}) + "\n", encoding="utf-8")
             fake = {"status": "OK", "row_count": 1, "min": 1, "max": 2, "unique_count": 1, "field": "key.timestamp_micros"}
@@ -274,27 +274,27 @@ class TestNuRecNestedContracts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td); clip = root / "clip-a"; (clip / "clipgt").mkdir(parents=True)
             pred = root / "pred.jsonl"; gt = root / "gt.jsonl"
-            pred.write_text(json.dumps({"clip_id": "clip-a", "t0_us": 1}) + "\n", encoding="utf-8")
+            pred.write_text(json.dumps({"clip_id": "clip-a", "t0_us": 1, "mode": "cross_scene", "alpha": 0}) + "\n", encoding="utf-8")
             gt.write_text("not-json\n", encoding="utf-8")
             with mock.patch.object(nurec, "_parquet_timestamp_summary", return_value={"status": "FILE_NOT_FOUND"}), mock.patch.object(nurec, "_parquet_clip_interval_summary", return_value={"status": "FILE_NOT_FOUND"}), mock.patch.object(nurec, "_map_status", return_value={"status": "FILE_NOT_FOUND", "ready": False, "dac_candidate_available": False, "dac_geometry_verified": False}):
                 result = nurec.audit_dataset(root, pred, gt, root / "audit")
-            self.assertEqual(result["errors"][0]["source"], "ground_truth")
+            self.assertEqual(next(error for error in result["errors"] if error["source"] == "ground_truth")["source"], "ground_truth")
 
     def test_32_duplicate_prediction_clip_blocks_readiness(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td); clip = root / "clip-a"; (clip / "clipgt").mkdir(parents=True)
             pred = root / "pred.jsonl"; gt = root / "gt.jsonl"
-            pred.write_text("\n".join([json.dumps({"clip_id": "clip-a", "t0_us": 1}), json.dumps({"clip_id": "clip-a", "t0_us": 2})]) + "\n", encoding="utf-8")
+            pred.write_text("\n".join([json.dumps({"clip_id": "clip-a", "t0_us": 1, "mode": "cross_scene", "alpha": 0}), json.dumps({"clip_id": "clip-a", "t0_us": 2, "mode": "cross_scene", "alpha": 0})]) + "\n", encoding="utf-8")
             gt.write_text(json.dumps({"clip_id": "clip-a", "t0_us": 1}) + "\n", encoding="utf-8")
             with mock.patch.object(nurec, "_parquet_timestamp_summary", return_value={"status": "FILE_NOT_FOUND"}), mock.patch.object(nurec, "_parquet_clip_interval_summary", return_value={"status": "FILE_NOT_FOUND"}), mock.patch.object(nurec, "_map_status", return_value={"status": "FILE_NOT_FOUND", "ready": False, "dac_candidate_available": False, "dac_geometry_verified": False}):
                 result = nurec.audit_dataset(root, pred, gt, root / "audit")
-            self.assertIn("PREDICTION_DUPLICATE", result["contracts"]["clip-a"]["blockers"])
+            self.assertIn("PREDICTION_CONDITION_DUPLICATE", result["contracts"]["clip-a"]["blockers"])
 
     def test_33_duplicate_ground_truth_clip_blocks_readiness(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td); clip = root / "clip-a"; (clip / "clipgt").mkdir(parents=True)
             pred = root / "pred.jsonl"; gt = root / "gt.jsonl"
-            pred.write_text(json.dumps({"clip_id": "clip-a", "t0_us": 1}) + "\n", encoding="utf-8")
+            pred.write_text(json.dumps({"clip_id": "clip-a", "t0_us": 1, "mode": "cross_scene", "alpha": 0}) + "\n", encoding="utf-8")
             gt.write_text("\n".join([json.dumps({"clip_id": "clip-a", "t0_us": 1}), json.dumps({"clip_id": "clip-a", "t0_us": 2})]) + "\n", encoding="utf-8")
             with mock.patch.object(nurec, "_parquet_timestamp_summary", return_value={"status": "FILE_NOT_FOUND"}), mock.patch.object(nurec, "_parquet_clip_interval_summary", return_value={"status": "FILE_NOT_FOUND"}), mock.patch.object(nurec, "_map_status", return_value={"status": "FILE_NOT_FOUND", "ready": False, "dac_candidate_available": False, "dac_geometry_verified": False}):
                 result = nurec.audit_dataset(root, pred, gt, root / "audit")

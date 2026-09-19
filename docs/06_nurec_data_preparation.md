@@ -152,11 +152,16 @@ With `pyarrow 25.0.1`, the real nested parquet schema is now readable:
 - intersection/road-boundary geometry: `*.location` point lists.
 
 The nested-field audit fix is covered by the data-preparation tests. The
-latest reports are:
+historical Round-1 reports are:
 
 - `D:\300_clip_nurec\hf_probe\schema_v3\schema_report.md`
 - `D:\300_clip_nurec\hf_probe\audit_v5\dataset_readiness_summary.md`
 - `D:\300_clip_nurec\hf_probe\prepared_v5\00040136-e651-4abd-991d-0655ccda9430\contract.json`
+
+The subsequent hardening reports are `schema_v4`, `audit_v6`, and
+`prepared_v6`. The current condition/coverage pass uses `schema_v5`,
+`audit_v7`, and `prepared_v7`; none of these reports overwrite the historical
+outputs.
 
 Observed for this clip:
 

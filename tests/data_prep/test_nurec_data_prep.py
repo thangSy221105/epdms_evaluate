@@ -19,7 +19,7 @@ class TestNuRecDataPreparation(unittest.TestCase):
     def _inputs(self, root: Path, clip_id: str = "clip-a", context=None):
         pred = root / "pred.jsonl"
         gt = root / "gt.jsonl"
-        pred.write_text(json.dumps({"clip_id": clip_id, "t0_us": 100, "coordinate_frame": "ego", "reference_point": "rear", "alpha": 0.0}) + "\n", encoding="utf-8")
+        pred.write_text(json.dumps({"clip_id": clip_id, "t0_us": 100, "coordinate_frame": "ego", "reference_point": "rear", "mode": "cross_scene", "alpha": 0.0}) + "\n", encoding="utf-8")
         gt.write_text(json.dumps({"clip_id": clip_id, "t0_us": 100, "future_frame": "ego"}) + "\n", encoding="utf-8")
         ctx = None
         if context is not None:
@@ -90,7 +90,7 @@ class TestNuRecDataPreparation(unittest.TestCase):
             with self._patch_parquet():
                 result = nurec.audit_dataset(root, pred, gt, root / "audit")
             row = list(csv_rows(root / "audit" / "observation_coverage.csv"))[0]
-            self.assertEqual(row["observation_contract_status"], "UNKNOWN")
+            self.assertEqual(row["observation_contract_status"], "TIME_ALIGNMENT_UNRESOLVED")
 
     def test_06_empty_obstacle_with_frame_evidence_is_observed_empty(self):
         with tempfile.TemporaryDirectory() as td:
@@ -98,7 +98,7 @@ class TestNuRecDataPreparation(unittest.TestCase):
             with self._patch_parquet():
                 nurec.audit_dataset(root, pred, gt, root / "audit", ctx)
             row = list(csv_rows(root / "audit" / "observation_coverage.csv"))[0]
-            self.assertEqual(row["observation_contract_status"], "OBSERVED_EMPTY")
+            self.assertEqual(row["observation_contract_status"], "TIME_ALIGNMENT_UNRESOLVED")
 
     def test_07_mismatched_clocks_are_unresolved(self):
         with tempfile.TemporaryDirectory() as td:

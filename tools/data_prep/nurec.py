@@ -15,6 +15,9 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
+from tools.epdms.condition_identity import parse_condition_identity
+from tools.epdms.observation_contract import build_ttc_projection_timestamps
+
 
 REQUIRED_CLIP_FILES = [
     "clipgt/clip.parquet",
@@ -388,6 +391,14 @@ def discover_clip_dirs(dataset_root: Path) -> Tuple[Dict[str, Path], List[str]]:
     return dict(sorted(found.items())), sorted(set(duplicates))
 
 
+def _strict_clip_id(row: Mapping[str, Any]) -> Optional[str]:
+    value = row.get("clip_id")
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
 def _jsonl_index(path: Optional[Path]) -> Dict[str, Dict[str, Any]]:
     return _jsonl_index_with_errors(path, "jsonl")[0]
 
@@ -410,16 +421,69 @@ def _jsonl_index_with_errors(path: Optional[Path], source: str) -> Tuple[Dict[st
             if not isinstance(row, dict):
                 errors.append({"source": source, "line_number": line_number, "failure_type": "INVALID_JSON_ROW", "failure_reason": "JSONL row is not an object"})
                 continue
-            clip_id = str(row.get("clip_id", ""))
-            if not clip_id:
+            clip_id = _strict_clip_id(row)
+            if clip_id is None:
                 errors.append({"source": source, "line_number": line_number, "failure_type": "MISSING_CLIP_ID", "failure_reason": "clip_id is missing or empty"})
                 continue
             if clip_id in result:
                 duplicates.append(clip_id)
                 errors.append({"source": source, "line_number": line_number, "failure_type": "DUPLICATE_CLIP_ID", "failure_reason": clip_id})
                 continue
-            result[clip_id] = row
+            result[clip_id] = {**row, "clip_id": clip_id}
     return result, errors, sorted(set(duplicates))
+
+
+def _load_prediction_conditions(path: Optional[Path]) -> Tuple[Dict[str, List[Dict[str, Any]]], List[Dict[str, Any]], List[str], Dict[str, List[Dict[str, Any]]]]:
+    """Load all prediction conditions; uniqueness is clip|mode|alpha."""
+    predictions: Dict[str, List[Dict[str, Any]]] = {}
+    errors: List[Dict[str, Any]] = []
+    duplicate_keys: List[str] = []
+    identity_errors: Dict[str, List[Dict[str, Any]]] = {}
+    seen_keys: set[str] = set()
+    if path is None or not path.is_file():
+        return predictions, errors, duplicate_keys, identity_errors
+    with path.open("r", encoding="utf-8-sig") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except Exception as exc:
+                errors.append({"source": "prediction", "line_number": line_number, "failure_type": "MALFORMED_JSON", "failure_reason": str(exc)})
+                continue
+            if not isinstance(row, dict):
+                errors.append({"source": "prediction", "line_number": line_number, "failure_type": "INVALID_JSON_ROW", "failure_reason": "JSONL row is not an object"})
+                continue
+            clip_id = _strict_clip_id(row)
+            if clip_id is None:
+                errors.append({"source": "prediction", "line_number": line_number, "failure_type": "PREDICTION_IDENTITY_INVALID", "failure_reason": "MISSING_CLIP_ID: clip_id is missing, null, or blank"})
+                continue
+            normalized = {**row, "clip_id": clip_id}
+            mode_value = normalized.get("mode")
+            if mode_value is None or not str(mode_value).strip():
+                error = {"source": "prediction", "line_number": line_number, "clip_id": clip_id, "failure_type": "PREDICTION_IDENTITY_INVALID", "failure_reason": "MISSING_MODE: mode is missing or blank"}
+                errors.append(error)
+                identity_errors.setdefault(clip_id, []).append(error)
+                continue
+            normalized["mode"] = str(mode_value).strip()
+            if "alpha" not in normalized:
+                error = {"source": "prediction", "line_number": line_number, "clip_id": clip_id, "failure_type": "PREDICTION_IDENTITY_INVALID", "failure_reason": "MISSING_ALPHA: alpha is missing"}
+                errors.append(error)
+                identity_errors.setdefault(clip_id, []).append(error)
+                continue
+            identity = parse_condition_identity(normalized, row_index=line_number - 1)
+            if not identity.valid:
+                error = {"source": "prediction", "line_number": line_number, "clip_id": clip_id, "failure_type": "PREDICTION_IDENTITY_INVALID", "failure_reason": f"INVALID_ALPHA: {identity.failure_reason}"}
+                errors.append(error)
+                identity_errors.setdefault(clip_id, []).append(error)
+                continue
+            normalized["alpha"] = identity.alpha
+            predictions.setdefault(clip_id, []).append(normalized)
+            if identity.record_key in seen_keys:
+                duplicate_keys.append(identity.record_key)
+                errors.append({"source": "prediction", "line_number": line_number, "clip_id": clip_id, "failure_type": "PREDICTION_CONDITION_DUPLICATE", "failure_reason": identity.record_key})
+            seen_keys.add(identity.record_key)
+    return predictions, errors, sorted(set(duplicate_keys)), identity_errors
 
 
 def _first(row: Mapping[str, Any], keys: Sequence[str]) -> Optional[str]:
@@ -445,6 +509,102 @@ def _row_t0(row: Optional[Mapping[str, Any]]) -> Optional[int]:
         return int(round(value)) if math.isfinite(value) else None
     except (TypeError, ValueError):
         return None
+
+
+def _condition_values(rows: Sequence[Mapping[str, Any]], key: str) -> List[Any]:
+    values: List[Any] = []
+    for row in rows:
+        value = row.get(key)
+        if value is not None:
+            values.append(value)
+    return values
+
+
+def _common_condition_value(rows: Sequence[Mapping[str, Any]], key: str) -> Tuple[Any, List[Any], bool]:
+    raw_values = _condition_values(rows, key)
+    values = list(dict.fromkeys(str(value) if isinstance(value, str) else value for value in raw_values))
+    return (values[0] if len(values) == 1 else None, values, len(values) <= 1)
+
+
+def _condition_first_values(rows: Sequence[Mapping[str, Any]], keys: Sequence[str]) -> List[str]:
+    values: List[str] = []
+    for row in rows:
+        value = _first(row, keys)
+        if value is not None:
+            values.append(value.strip())
+    return list(dict.fromkeys(values))
+
+
+def _canonical_query_timestamps(t0_us: int) -> Tuple[List[int], List[int]]:
+    """Build the current 10 Hz/4 s CF grid and scorer TTC projection grid."""
+    try:
+        import numpy as np
+        from tools.epdms.config import EvaluationConfig
+
+        config = EvaluationConfig({})
+        cf = [int(t0_us) + int(round(index * 1_000_000 / config.frequency_hz)) for index in range(config.future_poses + 1)]
+        ttc = build_ttc_projection_timestamps(np.asarray(cf, dtype=np.int64), config.ttc_horizon_s)
+        return cf, [int(value) for value in ttc.tolist()]
+    except Exception:
+        cf = [int(t0_us) + index * 100_000 for index in range(41)]
+        return cf, [int(t0_us) + index * 100_000 for index in range(51)]
+
+
+def _parquet_timestamp_values(path: Path) -> set[int]:
+    info = inspect_parquet(path, sample_rows=0)
+    selected = info.get("selected_timestamp_field")
+    if info.get("status") != "OK" or not selected:
+        return set()
+    try:
+        import pandas as pd
+        frame = pd.read_parquet(path, engine=parquet_engine()["engines"][0])
+        return {int(float(value)) for value in _frame_path_values(frame, selected) if _timestamp_value_valid(value)}
+    except Exception:
+        return set()
+
+
+def _matched_evidence(query_values: Sequence[int], evidence_values: set[int], tolerance_us: int) -> set[int]:
+    matched: set[int] = set()
+    if not evidence_values:
+        return matched
+    ordered = sorted(evidence_values)
+    for query in query_values:
+        nearest = min(ordered, key=lambda value: abs(value - query))
+        if abs(nearest - query) <= tolerance_us:
+            matched.add(int(query))
+    return matched
+
+
+def _normalize_frame_evidence(context: Mapping[str, Any]) -> set[int]:
+    for key in ("observation_frames", "frame_timestamps_us", "sensor_timestamps_us"):
+        if key not in context or context.get(key) is None:
+            continue
+        raw_values = context.get(key)
+        if not isinstance(raw_values, list):
+            return set()
+        normalized: set[int] = set()
+        for item in raw_values:
+            value = item
+            if isinstance(item, Mapping):
+                value = next((item.get(name) for name in ("timestamp_micros", "timestamp_us", "t_us", "timestamp") if item.get(name) is not None), None)
+            if _timestamp_value_valid(value):
+                normalized.add(int(float(value)))
+        return normalized
+    return set()
+
+
+def _coverage_counts(required: Sequence[int], evidence: set[int], obstacles: set[int], complete: bool, tolerance_us: int) -> Dict[str, Any]:
+    matched = _matched_evidence(required, evidence, tolerance_us)
+    object_queries = _matched_evidence(required, obstacles, tolerance_us)
+    observed = len(matched & object_queries)
+    if complete:
+        empty = len(matched - object_queries)
+        unknown = 0
+    else:
+        empty = 0
+        unknown = len(matched - object_queries)
+    missing = len(set(required) - matched)
+    return {"required": len(required), "observed": observed, "empty": empty, "unknown": unknown, "missing": missing, "matched": len(matched)}
 
 
 def _parquet_timestamp_summary(path: Path) -> Dict[str, Any]:
@@ -671,7 +831,7 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
 
 def audit_dataset(dataset_root: Path, prediction_jsonl: Path, ground_truth_jsonl: Path, output_dir: Path, context_jsonl: Optional[Path] = None) -> Dict[str, Any]:
     clips, duplicate_ids = discover_clip_dirs(dataset_root)
-    predictions, prediction_errors, prediction_duplicates = _jsonl_index_with_errors(prediction_jsonl, "prediction")
+    predictions_by_clip, prediction_errors, prediction_condition_duplicates, prediction_identity_errors = _load_prediction_conditions(prediction_jsonl)
     ground_truth, ground_truth_errors, ground_truth_duplicates = _jsonl_index_with_errors(ground_truth_jsonl, "ground_truth")
     contexts, context_errors, context_duplicates = _jsonl_index_with_errors(context_jsonl, "context")
     engine = parquet_engine()
@@ -688,12 +848,25 @@ def audit_dataset(dataset_root: Path, prediction_jsonl: Path, ground_truth_jsonl
 
     for clip_id, clip_dir in clips.items():
         try:
-            pred = predictions.get(clip_id, {})
+            pred_rows = predictions_by_clip.get(clip_id, [])
+            pred = pred_rows[0] if pred_rows else {}
             gt = ground_truth.get(clip_id, {})
             context = contexts.get(clip_id, {})
+            raw_prediction_t0_values = [_row_t0(row) for row in pred_rows]
+            prediction_t0_values = sorted({value for value in raw_prediction_t0_values if value is not None})
+            prediction_t0_consistent = bool(pred_rows) and len(raw_prediction_t0_values) == len(pred_rows) and len(prediction_t0_values) == 1
+            common_pred_t0 = prediction_t0_values[0] if prediction_t0_consistent else None
+            prediction_frame_values = _condition_first_values(pred_rows, ("coordinate_frame", "frame", "prediction_frame"))
+            prediction_anchor_values = _condition_first_values(pred_rows, ("reference_point", "anchor", "prediction_anchor"))
+            prediction_frame_present = sum(_first(row, ("coordinate_frame", "frame", "prediction_frame")) is not None for row in pred_rows)
+            prediction_anchor_present = sum(_first(row, ("reference_point", "anchor", "prediction_anchor")) is not None for row in pred_rows)
+            prediction_frame_consistent = len(prediction_frame_values) <= 1 and prediction_frame_present in {0, len(pred_rows)}
+            prediction_anchor_consistent = len(prediction_anchor_values) <= 1 and prediction_anchor_present in {0, len(pred_rows)}
             present = {_inventory_field(name): (clip_dir / name).is_file() for name in REQUIRED_CLIP_FILES}
-            inventory.append({"clip_id": clip_id, "prediction_exists": bool(pred), "ground_truth_exists": bool(gt), **present, "duplicate_clip_id": clip_id in duplicate_ids, "prediction_duplicate": clip_id in prediction_duplicates, "ground_truth_duplicate": clip_id in ground_truth_duplicates, "context_duplicate": clip_id in context_duplicates})
-            pred_t0, gt_t0 = _row_t0(pred), _row_t0(gt)
+            prediction_modes = sorted({str(row.get("mode")) for row in pred_rows})
+            prediction_alphas = sorted({float(row.get("alpha")) for row in pred_rows})
+            inventory.append({"clip_id": clip_id, "prediction_exists": bool(pred_rows), "ground_truth_exists": bool(gt), "prediction_condition_count": len(pred_rows), "prediction_unique_condition_count": len({f"{clip_id}|{row.get('mode')}|{float(row.get('alpha')):g}" for row in pred_rows}), "prediction_modes": prediction_modes, "prediction_alphas": prediction_alphas, "prediction_t0_values": prediction_t0_values, "prediction_frame_values": prediction_frame_values, "prediction_anchor_values": prediction_anchor_values, **present, "duplicate_clip_id": clip_id in duplicate_ids, "prediction_condition_duplicate": clip_id in {key.split("|", 1)[0] for key in prediction_condition_duplicates}, "ground_truth_duplicate": clip_id in ground_truth_duplicates, "context_duplicate": clip_id in context_duplicates})
+            pred_t0, gt_t0 = common_pred_t0, _row_t0(gt)
             obstacle_summary = _parquet_timestamp_summary(clip_dir / "clipgt/obstacle.parquet")
             obstacle_details = _obstacle_inventory(clip_dir / "clipgt/obstacle.parquet") if (clip_dir / "clipgt/obstacle.parquet").is_file() and obstacle_summary.get("status") == "OK" else {}
             if obstacle_details:
@@ -712,18 +885,18 @@ def audit_dataset(dataset_root: Path, prediction_jsonl: Path, ground_truth_jsonl
             if explicit_mapping:
                 status = mapping.get("status") if mapping.get("status") in {"ALIGNED_DIRECT", "ALIGNED_BY_EXPLICIT_METADATA"} else "ALIGNED_BY_EXPLICIT_METADATA"
             numeric_overlap = bool(pred_t0 is not None and obstacle_min is not None and obstacle_max is not None and obstacle_min <= pred_t0 <= obstacle_max)
-            time_rows.append({"clip_id": clip_id, "prediction_t0_us": pred_t0, "gt_t0_us": gt_t0, "clip_start_timestamp": clip_summary.get("min"), "clip_end_timestamp": clip_summary.get("max"), "obstacle_min_timestamp": obstacle_min, "obstacle_max_timestamp": obstacle_max, "egomotion_min_timestamp": ego_summary.get("min"), "egomotion_max_timestamp": ego_summary.get("max"), "sensor_min_timestamp": None, "sensor_max_timestamp": None, "pose_min_timestamp": pose_summary.get("min"), "pose_max_timestamp": pose_summary.get("max"), "clock_domains_detected": json.dumps([x for x in ("prediction_t0" if pred_t0 is not None else None, "ground_truth_t0" if gt_t0 is not None else None, obstacle_summary.get("selected_timestamp_field"), ego_summary.get("selected_timestamp_field")) if x]), "possible_explicit_mapping_found": explicit_mapping, "mapping_source": mapping_source, "candidate_prediction_obstacle_delta_us": candidate_delta, "numeric_range_overlap": numeric_overlap, "time_alignment_status": status})
+            time_rows.append({"clip_id": clip_id, "prediction_t0_us": pred_t0, "prediction_t0_values": prediction_t0_values, "prediction_condition_count": len(pred_rows), "gt_t0_us": gt_t0, "clip_start_timestamp": clip_summary.get("min"), "clip_end_timestamp": clip_summary.get("max"), "obstacle_min_timestamp": obstacle_min, "obstacle_max_timestamp": obstacle_max, "egomotion_min_timestamp": ego_summary.get("min"), "egomotion_max_timestamp": ego_summary.get("max"), "sensor_min_timestamp": None, "sensor_max_timestamp": None, "pose_min_timestamp": pose_summary.get("min"), "pose_max_timestamp": pose_summary.get("max"), "clock_domains_detected": json.dumps([x for x in ("prediction_t0" if pred_t0 is not None else None, "ground_truth_t0" if gt_t0 is not None else None, obstacle_summary.get("selected_timestamp_field"), ego_summary.get("selected_timestamp_field")) if x]), "possible_explicit_mapping_found": explicit_mapping, "mapping_source": mapping_source, "candidate_prediction_obstacle_delta_us": candidate_delta, "numeric_range_overlap": numeric_overlap, "time_alignment_status": "PREDICTION_T0_CONFLICT" if len(prediction_t0_values) > 1 else status})
 
-            pframe = _first(pred, ("coordinate_frame", "frame", "prediction_frame"))
+            pframe = prediction_frame_values[0] if prediction_frame_consistent and prediction_frame_values else None
             gframe = _first(gt, ("coordinate_frame", "future_frame", "frame", "gt_frame"))
             cframe = _first(context, ("coordinate_frame", "frame", "obstacle_frame"))
             mframe = _first(context, ("map_frame",))
-            panchor = _first(pred, ("reference_point", "anchor", "prediction_anchor"))
+            panchor = prediction_anchor_values[0] if prediction_anchor_consistent and prediction_anchor_values else None
             ganchor = _first(gt, ("reference_point", "anchor", "gt_anchor"))
             oanchor = _first(context, ("obstacle_anchor", "reference_point", "anchor"))
             manchor = _first(context, ("map_anchor", "reference_point", "anchor"))
             coord_verified = bool(pframe and gframe and cframe and mframe and panchor and ganchor and oanchor and manchor and len({pframe, gframe, cframe, mframe}) == 1 and len({panchor, ganchor, oanchor, manchor}) == 1)
-            coord_status = "ALIGNED_DIRECT" if coord_verified else "MISSING_FRAME_METADATA" if not any((pframe, gframe, cframe, mframe, panchor, ganchor, oanchor, manchor)) else "CONFLICTING_FRAMES" if len({x for x in (pframe, gframe, cframe, mframe) if x}) > 1 or len({x for x in (panchor, ganchor, oanchor, manchor) if x}) > 1 else "UNRESOLVED"
+            coord_status = "ALIGNED_DIRECT" if coord_verified else "MISSING_FRAME_METADATA" if not any((pframe, gframe, cframe, mframe, panchor, ganchor, oanchor, manchor)) else "CONFLICTING_FRAMES" if not prediction_frame_consistent or not prediction_anchor_consistent or len({x for x in (pframe, gframe, cframe, mframe) if x}) > 1 or len({x for x in (panchor, ganchor, oanchor, manchor) if x}) > 1 else "UNRESOLVED"
             metadata_transform_available = all((clip_dir / relative).is_file() for relative in ("rig_trajectories.json", "clipgt/calibration_estimate.parquet"))
             transform_available = bool(context.get("transform_chain_available") is True or context.get("transform_source") or metadata_transform_available)
             transform_source = context.get("transform_source") if context.get("transform_source") else "rig_trajectories.json + calibration_estimate.parquet" if metadata_transform_available else None
@@ -733,20 +906,27 @@ def audit_dataset(dataset_root: Path, prediction_jsonl: Path, ground_truth_jsonl
 
             obstacle_ready = obstacle_summary.get("status") == "OK" and obstacle_summary.get("field") is not None
             obstacle_rows.append({"clip_id": clip_id, "obstacle_row_count": obstacle_summary.get("row_count"), "valid_row_count": obstacle_summary.get("valid_row_count"), "invalid_row_count": obstacle_summary.get("invalid_row_count"), "unique_timestamp_count": obstacle_summary.get("unique_timestamp_count", obstacle_summary.get("unique_count")), "min_timestamp": obstacle_summary.get("min_timestamp", obstacle_min), "max_timestamp": obstacle_summary.get("max_timestamp", obstacle_max), "selected_timestamp_field": obstacle_summary.get("selected_timestamp_field"), "unique_track_count": obstacle_summary.get("unique_track_count"), "categories": obstacle_summary.get("categories"), "missing_timestamp_count": obstacle_summary.get("missing_timestamp_count"), "invalid_track_id_count": obstacle_summary.get("invalid_track_id_count"), "invalid_category_count": obstacle_summary.get("invalid_category_count"), "invalid_center_count": obstacle_summary.get("invalid_center_count"), "invalid_size_count": obstacle_summary.get("invalid_size_count"), "invalid_orientation_count": obstacle_summary.get("invalid_orientation_count"), "status": obstacle_summary.get("status")})
-            cf_start = pred_t0
-            cf_end = pred_t0 + 4_000_000 if pred_t0 is not None else None
-            ttc_end = pred_t0 + 5_000_000 if pred_t0 is not None else None
-            frame_evidence = context.get("observation_frames") or context.get("frame_timestamps_us") or context.get("sensor_timestamps_us")
+            time_verified = status in {"ALIGNED_DIRECT", "ALIGNED_BY_EXPLICIT_METADATA"} and prediction_t0_consistent
+            cf_required, ttc_required = _canonical_query_timestamps(pred_t0) if time_verified and pred_t0 is not None else ([], [])
+            frame_evidence = _normalize_frame_evidence(context)
             completeness_verified = bool(context.get("obstacle_table_complete") is True or context.get("observation_completeness_verified") is True or isinstance(context.get("observation_contract"), dict) and context["observation_contract"].get("complete") is True)
-            evidence_values = frame_evidence if isinstance(frame_evidence, list) else []
-            evidence_timestamps = [item if isinstance(item, (int, float)) and not isinstance(item, bool) else item.get("timestamp_micros") if isinstance(item, dict) else None for item in evidence_values]
-            evidence_timestamps = [int(value) for value in evidence_timestamps if _timestamp_value_valid(value)]
-            available_frame_count = len(evidence_timestamps) if evidence_timestamps else None
-            empty_possible = bool(evidence_timestamps) and completeness_verified and obstacle_ready and obstacle_summary.get("row_count") == 0
-            observation_status = "OBSERVED_EMPTY" if empty_possible else "UNKNOWN" if not evidence_timestamps or not obstacle_ready else "UNRESOLVED"
-            observed_cf = context.get("cf_observed_frames") if isinstance(context.get("cf_observed_frames"), int) else None
-            observed_ttc = context.get("ttc_observed_queries") if isinstance(context.get("ttc_observed_queries"), int) else None
-            coverage_rows.append({"clip_id": clip_id, "required_cf_start": cf_start, "required_cf_end": cf_end, "required_ttc_end": ttc_end, "available_frame_count": available_frame_count, "available_frame_min_ts": min(evidence_timestamps) if evidence_timestamps else None, "available_frame_max_ts": max(evidence_timestamps) if evidence_timestamps else None, "obstacle_timestamp_count": obstacle_summary.get("unique_timestamp_count", obstacle_summary.get("unique_count")), "confirmed_observed_empty_possible": empty_possible, "cf_required_frames": 41 if pred_t0 is not None else None, "cf_observed_frames": observed_cf, "cf_empty_frames": 41 if empty_possible else 0, "cf_missing_frames": 0 if observed_cf == 41 or empty_possible else None, "ttc_required_queries": 51 if pred_t0 is not None else None, "ttc_observed_queries": observed_ttc, "ttc_empty_queries": 51 if empty_possible else 0, "ttc_missing_queries": 0 if observed_ttc == 51 or empty_possible else None, "observation_contract_status": observation_status})
+            obstacle_timestamp_values = _parquet_timestamp_values(clip_dir / "clipgt/obstacle.parquet") if obstacle_ready else set()
+            cf_counts = _coverage_counts(cf_required, frame_evidence, obstacle_timestamp_values, completeness_verified and obstacle_ready, 50_000) if time_verified else {"required": None, "observed": None, "empty": None, "unknown": None, "missing": None, "matched": None}
+            ttc_counts = _coverage_counts(ttc_required, frame_evidence, obstacle_timestamp_values, completeness_verified and obstacle_ready, 100_000) if time_verified else {"required": None, "observed": None, "empty": None, "unknown": None, "missing": None, "matched": None}
+            cf_ready = bool(time_verified and completeness_verified and obstacle_ready and cf_counts["missing"] == 0 and cf_counts["unknown"] == 0)
+            ttc_ready = bool(time_verified and completeness_verified and obstacle_ready and ttc_counts["missing"] == 0 and ttc_counts["unknown"] == 0)
+            if not time_verified:
+                observation_status = "TIME_ALIGNMENT_UNRESOLVED"
+            elif not frame_evidence:
+                observation_status = "UNKNOWN"
+            elif not completeness_verified:
+                observation_status = "OBSERVATION_COMPLETENESS_UNVERIFIED"
+            elif cf_ready and ttc_ready:
+                observation_status = "COMPLETE"
+            else:
+                observation_status = "INCOMPLETE"
+            empty_possible = bool((cf_counts["empty"] or 0) or (ttc_counts["empty"] or 0))
+            coverage_rows.append({"clip_id": clip_id, "required_cf_start": cf_required[0] if cf_required else None, "required_cf_end": cf_required[-1] if cf_required else None, "required_ttc_end": ttc_required[-1] if ttc_required else None, "available_frame_count": len(frame_evidence) if frame_evidence else 0, "available_frame_min_ts": min(frame_evidence) if frame_evidence else None, "available_frame_max_ts": max(frame_evidence) if frame_evidence else None, "obstacle_timestamp_count": obstacle_summary.get("unique_timestamp_count", obstacle_summary.get("unique_count")), "confirmed_observed_empty_possible": empty_possible, "cf_required_frames": cf_counts["required"], "cf_observed_frames": cf_counts["observed"], "cf_empty_frames": cf_counts["empty"], "cf_unknown_frames": cf_counts["unknown"], "cf_missing_frames": cf_counts["missing"], "cf_ready": cf_ready, "ttc_required_queries": ttc_counts["required"], "ttc_observed_queries": ttc_counts["observed"], "ttc_empty_queries": ttc_counts["empty"], "ttc_unknown_queries": ttc_counts["unknown"], "ttc_missing_queries": ttc_counts["missing"], "ttc_ready": ttc_ready, "observation_contract_status": observation_status})
             map_summary = _map_status(clip_dir, engine["status"])
             map_rows.append({"clip_id": clip_id, **map_summary})
             official_rows.append({"clip_id": clip_id, **{f"{key}_available": (clip_dir / relative).is_file() for key, relative in OFFICIAL_FILES.items()}, "lane_direction_available": "lane.lane_direction" in inspect_parquet(clip_dir / "clipgt/lane.parquet", sample_rows=0).get("nested_field_paths", []), "lane_geometry_available": (clip_dir / "clipgt/lane.parquet").is_file()})
@@ -756,13 +936,16 @@ def audit_dataset(dataset_root: Path, prediction_jsonl: Path, ground_truth_jsonl
             blockers: List[str] = []
             if not pred: blockers.append("PREDICTION_MISSING")
             if not gt: blockers.append("GT_MISSING")
-            if clip_id in prediction_duplicates: blockers.append("PREDICTION_DUPLICATE")
+            if clip_id in prediction_identity_errors: blockers.append("PREDICTION_IDENTITY_INVALID")
+            if clip_id in {key.split("|", 1)[0] for key in prediction_condition_duplicates}: blockers.append("PREDICTION_CONDITION_DUPLICATE")
+            if len(prediction_t0_values) > 1: blockers.append("PREDICTION_T0_CONFLICT")
+            if not prediction_frame_consistent or not prediction_anchor_consistent: blockers.append("PREDICTION_COORDINATE_METADATA_CONFLICT")
             if clip_id in ground_truth_duplicates: blockers.append("GT_DUPLICATE")
             if clip_id in context_duplicates: blockers.append("CONTEXT_DUPLICATE")
             if status not in {"ALIGNED_DIRECT", "ALIGNED_BY_EXPLICIT_METADATA"}: blockers.append("TIME_ALIGNMENT_UNRESOLVED")
             if not coord_verified: blockers.append("COORDINATE_UNRESOLVED")
             if not obstacle_ready: blockers.append("OBSTACLE_SCHEMA_INVALID")
-            blockers.append("OBSERVATION_COVERAGE_INCOMPLETE")
+            if not cf_ready or not ttc_ready: blockers.append("OBSERVATION_COVERAGE_INCOMPLETE")
             if not map_summary.get("dac_geometry_verified", False):
                 if map_summary.get("status") == "FILE_NOT_FOUND":
                     blockers.append("MAP_MISSING")
@@ -779,7 +962,7 @@ def audit_dataset(dataset_root: Path, prediction_jsonl: Path, ground_truth_jsonl
                     blockers.append("PARQUET_ENGINE_UNAVAILABLE")
                 else:
                     blockers.append("MAP_INVALID")
-            contracts[clip_id] = {"clip_id": clip_id, "time": {"t0_us": pred_t0, "source": "prediction_jsonl", "verified": status in {"ALIGNED_DIRECT", "ALIGNED_BY_EXPLICIT_METADATA"}}, "coordinate": {"prediction_frame": pframe, "gt_frame": gframe, "obstacle_frame": cframe, "map_frame": mframe, "prediction_anchor": panchor, "gt_anchor": ganchor, "obstacle_anchor": oanchor, "map_anchor": manchor, "transform_required": not coord_verified, "transform_source": transform_source, "transform_metadata_available": transform_available, "transform_chain_verified": False, "verified": coord_verified}, "observation": {"cf_ready": False, "ttc_ready": False, "coverage_source": None}, "map": {"ready": bool(map_summary.get("dac_geometry_verified", False)), "source": "clipgt", "status": map_summary["status"], "geometry_available": map_summary.get("geometry_available"), "dac_candidate_available": map_summary.get("dac_candidate_available"), "dac_geometry_verified": map_summary.get("dac_geometry_verified"), "recommended_dac_source": map_summary.get("recommended_dac_source")}, "ready_for_proxy": False, "blockers": sorted(set(blockers))}
+            contracts[clip_id] = {"clip_id": clip_id, "prediction": {"condition_count": len(pred_rows), "unique_condition_count": len({f"{clip_id}|{row.get('mode')}|{float(row.get('alpha')):g}" for row in pred_rows}), "modes": prediction_modes, "alphas": prediction_alphas, "t0_values": prediction_t0_values}, "time": {"t0_us": pred_t0, "source": "prediction_jsonl", "verified": time_verified}, "coordinate": {"prediction_frame": pframe, "prediction_frame_values": prediction_frame_values, "prediction_anchor": panchor, "prediction_anchor_values": prediction_anchor_values, "gt_frame": gframe, "gt_anchor": ganchor, "obstacle_frame": cframe, "obstacle_anchor": oanchor, "map_frame": mframe, "map_anchor": manchor, "transform_required": not coord_verified, "transform_source": transform_source, "transform_metadata_available": transform_available, "transform_chain_verified": False, "verified": coord_verified}, "observation": {"cf_ready": cf_ready, "ttc_ready": ttc_ready, "coverage_source": "independent_frame_evidence" if frame_evidence else None, "status": observation_status, "cf_counts": cf_counts, "ttc_counts": ttc_counts}, "map": {"ready": bool(map_summary.get("dac_geometry_verified", False)), "source": "clipgt", "status": map_summary["status"], "geometry_available": map_summary.get("geometry_available"), "dac_candidate_available": map_summary.get("dac_candidate_available"), "dac_geometry_verified": map_summary.get("dac_geometry_verified"), "recommended_dac_source": map_summary.get("recommended_dac_source")}, "ready_for_proxy": bool(pred_rows and gt and time_verified and coord_verified and obstacle_ready and cf_ready and ttc_ready and map_summary.get("dac_geometry_verified", False) and not blockers), "blockers": sorted(set(blockers))}
         except Exception as exc:
             errors.append({"clip_id": clip_id, "failure_stage": "audit_clip", "failure_type": type(exc).__name__, "failure_reason": str(exc)})
 
@@ -797,7 +980,7 @@ def audit_dataset(dataset_root: Path, prediction_jsonl: Path, ground_truth_jsonl
         _safe_json_dump(output_dir / "contracts" / f"{clip_id}.json", contract)
     eligible = sorted(clip_id for clip_id, contract in contracts.items() if contract["ready_for_proxy"])
     blocked = sorted(clip_id for clip_id in contracts if clip_id not in eligible)
-    summary = {"total_clips": len(clips), "prediction_ready": sum(bool(predictions.get(cid)) and cid not in prediction_duplicates for cid in clips), "gt_ready": sum(bool(ground_truth.get(cid)) and cid not in ground_truth_duplicates for cid in clips), "time_ready": sum(c["time"]["verified"] for c in contracts.values()), "coordinate_ready": sum(c["coordinate"]["verified"] for c in contracts.values()), "observation_cf_ready": sum(c["observation"]["cf_ready"] for c in contracts.values()), "observation_ttc_ready": sum(c["observation"]["ttc_ready"] for c in contracts.values()), "map_ready": sum(c["map"]["ready"] for c in contracts.values()), "proxy_ready_clip_count": len(eligible), "eligible_clips": eligible, "blocked_clips": blocked, "duplicate_clip_ids": duplicate_ids, "prediction_duplicate_clip_ids": prediction_duplicates, "ground_truth_duplicate_clip_ids": ground_truth_duplicates, "context_duplicate_clip_ids": context_duplicates, "audit_error_count": len(errors), "parquet_engine": engine, "status": "DATASET_READY" if not blocked and not errors else "DATASET_NOT_READY"}
+    summary = {"total_clips": len(clips), "prediction_ready": sum(bool(predictions_by_clip.get(cid)) and cid not in prediction_identity_errors and cid not in {key.split("|", 1)[0] for key in prediction_condition_duplicates} for cid in clips), "gt_ready": sum(bool(ground_truth.get(cid)) and cid not in ground_truth_duplicates for cid in clips), "time_ready": sum(c["time"]["verified"] for c in contracts.values()), "coordinate_ready": sum(c["coordinate"]["verified"] for c in contracts.values()), "observation_cf_ready": sum(c["observation"]["cf_ready"] for c in contracts.values()), "observation_ttc_ready": sum(c["observation"]["ttc_ready"] for c in contracts.values()), "map_ready": sum(c["map"]["ready"] for c in contracts.values()), "proxy_ready_clip_count": len(eligible), "eligible_clips": eligible, "blocked_clips": blocked, "duplicate_clip_ids": duplicate_ids, "prediction_condition_duplicate_keys": prediction_condition_duplicates, "ground_truth_duplicate_clip_ids": ground_truth_duplicates, "context_duplicate_clip_ids": context_duplicates, "audit_error_count": len(errors), "parquet_engine": engine, "status": "DATASET_READY" if not blocked and not errors else "DATASET_NOT_READY"}
     _safe_json_dump(output_dir / "dataset_readiness_summary.json", summary)
     (output_dir / "eligible_clips.txt").write_text("\n".join(eligible) + ("\n" if eligible else ""), encoding="utf-8")
     (output_dir / "blocked_clips.txt").write_text("\n".join(blocked) + ("\n" if blocked else ""), encoding="utf-8")
