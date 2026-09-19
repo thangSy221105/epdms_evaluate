@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import subprocess
 import time
 from pathlib import Path
@@ -21,7 +22,36 @@ class AmbiguousCheckpointError(RunIdentityError):
     pass
 
 
-METRIC_IMPLEMENTATION_VERSION = "2.3.0-r5"
+class AmbiguousRetryStateError(RunIdentityError):
+    """Raised when one run has conflicting states at the same retry attempt."""
+
+    pass
+
+
+METRIC_IMPLEMENTATION_VERSION = "2.4.0-r7"
+
+
+def generate_run_id() -> str:
+    """Return a fresh execution identity; unlike the fingerprint it is never deterministic."""
+    return f"run-{time.strftime('%Y%m%dT%H%M%S')}-{time.time_ns()}-{secrets.token_hex(6)}"
+
+
+def assert_fresh_score_dir_safe(score_dir: Path, overwrite_new_run: bool = False) -> None:
+    """Refuse a fresh run that could silently mix with existing checkpoint state."""
+    names = {
+        "epdms_scores_300.jsonl",
+        "epdms_scores_300.jsonl.tmp",
+        "epdms_errors_300.jsonl",
+        "epdms_errors_300.jsonl.tmp",
+    }
+    paths = [score_dir / name for name in names]
+    paths.extend(score_dir.glob("epdms_errors_300_attempt_*.jsonl*"))
+    nonempty = sorted(path.name for path in paths if path.is_file() and path.stat().st_size > 0)
+    if nonempty and not overwrite_new_run:
+        raise RunIdentityError(
+            "Fresh --no-resume run refused in non-empty score_dir; use --overwrite-new-run or a new directory. "
+            f"Existing artifacts: {nonempty}"
+        )
 
 
 def _safe_git_commit_sha() -> str:
@@ -99,6 +129,8 @@ def verify_resume_safety_before_recovery(
     expected_fingerprint: str,
     manifest_filename: str = "run_manifest.json",
     artifact_names: Optional[List[str]] = None,
+    expected_run_id: Optional[str] = None,
+    strict_identity: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Verifies that existing artifacts in score_dir can safely be resumed BEFORE any recovery.
     
@@ -116,6 +148,13 @@ def verify_resume_safety_before_recovery(
             "epdms_errors_300.jsonl.tmp",
         ]
         artifact_names.extend(p.name for p in score_dir.glob("epdms_errors_300_attempt_*.jsonl*"))
+    else:
+        # Callers may provide legacy canonical names, but retry files must
+        # never be omitted from verification.
+        artifact_names = list(artifact_names)
+        artifact_names.extend(
+            p.name for p in score_dir.glob("epdms_errors_300_attempt_*.jsonl*") if p.name not in artifact_names
+        )
 
     manifest_path = score_dir / manifest_filename
 
@@ -152,8 +191,16 @@ def verify_resume_safety_before_recovery(
             f"Existing artifacts ({existing_artifacts}) belong to a different run configuration."
         )
 
+    prev_run_id = prev_manifest.get("run_id")
+    if strict_identity and not prev_run_id:
+        raise RunIdentityError("Resume rejected: manifest is missing required run_id")
+    if expected_run_id is not None and prev_run_id != expected_run_id:
+        raise RunIdentityError(
+            f"Resume rejected: run_id mismatch (existing={prev_run_id}, expected={expected_run_id})"
+        )
+
     # Reject internal duplicates and target/.tmp overlap before recovery.
-    def _keys(path: Path) -> Set[str]:
+    def _inspect(path: Path) -> Set[str]:
         found: Set[str] = set()
         try:
             with path.open("r", encoding="utf-8") as handle:
@@ -163,7 +210,18 @@ def verify_resume_safety_before_recovery(
                     row = json.loads(line)
                     key = row.get("record_key")
                     if not key:
-                        continue
+                        raise RunIdentityError(f"{path.name} contains a row without record_key")
+                    if strict_identity or expected_run_id is not None:
+                        if not row.get("run_id"):
+                            raise RunIdentityError(f"{path.name} contains a row without run_id")
+                        if expected_run_id is not None and row.get("run_id") != expected_run_id:
+                            raise RunIdentityError(
+                                f"{path.name} contains stale/wrong-run artifact row {row.get('run_id')!r}"
+                            )
+                        if row.get("effective_fingerprint") != expected_fingerprint:
+                            raise RunIdentityError(
+                                f"{path.name} contains a row with mismatched effective_fingerprint"
+                            )
                     key = str(key)
                     if key in found:
                         raise AmbiguousCheckpointError(
@@ -179,18 +237,30 @@ def verify_resume_safety_before_recovery(
     for target_name in ("epdms_scores_300.jsonl", "epdms_errors_300.jsonl"):
         target = score_dir / target_name
         temp = score_dir / f"{target_name}.tmp"
-        target_keys = _keys(target) if target.is_file() and target.stat().st_size > 0 else set()
-        temp_keys = _keys(temp) if temp.is_file() and temp.stat().st_size > 0 else set()
+        target_keys = _inspect(target) if target.is_file() and target.stat().st_size > 0 else set()
+        temp_keys = _inspect(temp) if temp.is_file() and temp.stat().st_size > 0 else set()
         overlap = target_keys & temp_keys
         if overlap:
             raise AmbiguousCheckpointError(
                 f"AMBIGUOUS_CHECKPOINT: {target.name} and {temp.name} overlap on record keys {sorted(overlap)[:5]}"
             )
 
+    # Inspect every canonical, retry, and temporary artifact before any
+    # recovery. This intentionally includes attempt .tmp files.
+    for name in artifact_names:
+        path = score_dir / name
+        if path.is_file() and path.stat().st_size > 0:
+            _inspect(path)
+
     return prev_manifest
 
 
-def load_latest_checkpoint_states(score_dir: Path, expected_run_id: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+def load_latest_checkpoint_states(
+    score_dir: Path,
+    expected_run_id: Optional[str] = None,
+    expected_fingerprint: Optional[str] = None,
+    strict_identity: Optional[bool] = None,
+) -> Dict[str, Dict[str, Any]]:
     """Load one latest state per record key while preserving retry history."""
     paths: List[Path] = []
     for name in ("epdms_scores_300.jsonl", "epdms_errors_300.jsonl"):
@@ -198,6 +268,8 @@ def load_latest_checkpoint_states(score_dir: Path, expected_run_id: Optional[str
         if path.is_file():
             paths.append(path)
     paths.extend(sorted(score_dir.glob("epdms_errors_300_attempt_*.jsonl")))
+    if strict_identity is None:
+        strict_identity = expected_run_id is not None
     states: Dict[str, Dict[str, Any]] = {}
     for path in paths:
         with path.open("r", encoding="utf-8") as handle:
@@ -205,10 +277,19 @@ def load_latest_checkpoint_states(score_dir: Path, expected_run_id: Optional[str
                 if not line.strip():
                     continue
                 row = json.loads(line)
-                if expected_run_id is not None and row.get("run_id") not in (None, expected_run_id):
+                if strict_identity:
+                    if not row.get("run_id"):
+                        raise RunIdentityError(f"{path.name} contains a row without run_id")
+                    if expected_run_id is not None and row.get("run_id") != expected_run_id:
+                        raise RunIdentityError(f"{path.name} contains stale/wrong-run artifact")
+                    if expected_fingerprint is not None and row.get("effective_fingerprint") != expected_fingerprint:
+                        raise RunIdentityError(f"{path.name} contains a row with mismatched effective_fingerprint")
+                elif expected_run_id is not None and row.get("run_id") not in (None, expected_run_id):
                     continue
                 key = row.get("record_key")
                 if not key:
+                    if strict_identity:
+                        raise RunIdentityError(f"{path.name} contains a row without record_key")
                     continue
                 key = str(key)
                 current = states.get(key)
@@ -217,7 +298,15 @@ def load_latest_checkpoint_states(score_dir: Path, expected_run_id: Optional[str
                 except (TypeError, ValueError):
                     attempt = 1
                 previous_attempt = int(current.get("attempt_number", 1)) if current else -1
-                if current is None or attempt >= previous_attempt:
+                if current is not None and attempt == previous_attempt:
+                    old = json.dumps(current, sort_keys=True, separators=(",", ":"))
+                    new = json.dumps(row, sort_keys=True, separators=(",", ":"))
+                    if old != new:
+                        raise AmbiguousRetryStateError(
+                            f"AMBIGUOUS_RETRY_STATE: conflicting states for {key} at attempt {attempt}"
+                        )
+                    continue
+                if current is None or attempt > previous_attempt:
                     states[key] = dict(row)
                     states[key]["record_key"] = key
                     states[key]["attempt_number"] = attempt

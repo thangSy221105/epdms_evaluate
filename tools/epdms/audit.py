@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Set
 import numpy as np
 
 from .config import EvaluationConfig
+from .condition_identity import parse_condition_identity, record_key_from_prediction
 from .io_jsonl import compute_file_sha256, iter_jsonl, read_jsonl_indexed
 from .map_loader import inspect_clip_map_status, load_lane_polygons_for_clip
 from .observation_contract import (
@@ -94,7 +95,11 @@ def audit_environment() -> Dict[str, Any]:
 def _trajectory_for_row(row: Dict[str, Any], alpha: Optional[float] = None) -> Any:
     if not isinstance(row, dict):
         return None
-    if alpha is not None and float(alpha) != 0.0 and row.get("guided_waypoints") is not None:
+    try:
+        alpha_value = float(alpha) if alpha is not None else 0.0
+    except (TypeError, ValueError):
+        alpha_value = 0.0
+    if alpha_value != 0.0 and row.get("guided_waypoints") is not None:
         return row.get("guided_waypoints")
     if row.get("clean_waypoints") is not None:
         return row.get("clean_waypoints")
@@ -110,7 +115,12 @@ def _normalized_window(row: Dict[str, Any], raw: Any, t0_us: int, config: Evalua
     if raw is None:
         raise TimeContractError(f"{role} trajectory is missing")
     items = raw.tolist() if hasattr(raw, "tolist") and not isinstance(raw, list) else list(raw)
-    window = prepare_trajectory_window(items, t0_us, config.future_poses, role=role)
+    identity_kwargs = {}
+    if row.get("trajectory_origin_policy") is not None:
+        identity_kwargs["origin_policy"] = str(row["trajectory_origin_policy"])
+    if row.get("source_includes_t0") is not None:
+        identity_kwargs["source_includes_t0"] = bool(row["source_includes_t0"])
+    window = prepare_trajectory_window(items, t0_us, config.future_poses, role=role, **identity_kwargs)
     return normalize_trajectory_timeline(
         window,
         t0_us=t0_us,
@@ -118,6 +128,8 @@ def _normalized_window(row: Dict[str, Any], raw: Any, t0_us: int, config: Evalua
         expected_horizon_s=config.horizon_s,
         role=role,
         strict_grid=config.strict_mode,
+        origin_policy=identity_kwargs.get("origin_policy"),
+        origin_policy_source="source_record" if identity_kwargs else None,
     )
 
 
@@ -129,7 +141,7 @@ def _future_and_full_timestamps(timeline: Any, t0_us: int) -> Any:
 
 def audit_time_alignment(config: EvaluationConfig, max_rows: Optional[int] = None) -> Dict[str, Any]:
     """Audit clock domains using the same normalized timeline as scoring."""
-    pred_map = read_jsonl_indexed(config.prediction_jsonl, lambda r: f"{r.get('clip_id')}|{r.get('mode')}|{float(r.get('alpha', 0.0))}") if config.prediction_jsonl.is_file() else {}
+    pred_map = read_jsonl_indexed(config.prediction_jsonl, record_key_from_prediction) if config.prediction_jsonl.is_file() else {}
     ctx_map = read_jsonl_indexed(config.context_jsonl, lambda r: str(r.get("clip_id", ""))) if config.context_jsonl.is_file() else {}
     gt_map = read_jsonl_indexed(config.ground_truth_jsonl, lambda r: str(r.get("clip_id", ""))) if config.ground_truth_jsonl.is_file() else {}
     rows: List[Dict[str, Any]] = []
@@ -219,7 +231,7 @@ def audit_time_alignment(config: EvaluationConfig, max_rows: Optional[int] = Non
 
 def audit_coordinate_alignment(config: EvaluationConfig, max_rows: Optional[int] = None) -> Dict[str, Any]:
     """Audit frame and reference-point declarations without guessing transforms."""
-    pred_map = read_jsonl_indexed(config.prediction_jsonl, lambda r: f"{r.get('clip_id')}|{r.get('mode')}|{float(r.get('alpha', 0.0))}") if config.prediction_jsonl.is_file() else {}
+    pred_map = read_jsonl_indexed(config.prediction_jsonl, record_key_from_prediction) if config.prediction_jsonl.is_file() else {}
     ctx_map = read_jsonl_indexed(config.context_jsonl, lambda r: str(r.get("clip_id", ""))) if config.context_jsonl.is_file() else {}
     gt_map = read_jsonl_indexed(config.ground_truth_jsonl, lambda r: str(r.get("clip_id", ""))) if config.ground_truth_jsonl.is_file() else {}
     rows: List[Dict[str, Any]] = []
@@ -291,15 +303,17 @@ def audit_data_contracts(config: EvaluationConfig) -> Dict[str, Any]:
             total_pred_records += 1
             cid = str(row.get("clip_id", ""))
             mode = str(row.get("mode", ""))
-            alpha = float(row.get("alpha", 0.0))
-            key = f"{cid}|{mode}|{alpha}"
+            identity = parse_condition_identity(row, row_index=total_pred_records - 1)
+            alpha = identity.alpha
+            key = identity.record_key
             if key in pred_conditions:
                 pred_dup_count += 1
                 report["duplicate_records"].append({"file": "prediction", "key": key})
             pred_conditions.add(key)
             pred_clips.add(cid)
             pred_modes.add(mode)
-            pred_alphas.add(alpha)
+            if alpha is not None:
+                pred_alphas.add(alpha)
 
     report["prediction_stats"] = {
         "total_rows": total_pred_records,
@@ -391,15 +405,17 @@ def audit_data_contracts(config: EvaluationConfig) -> Dict[str, Any]:
             cid = str(row.get("clip_id", ""))
             mode = str(row.get("mode", ""))
             raw_alpha = row.get("alpha", 0.0)
-            try:
-                alpha = float(raw_alpha)
-            except (TypeError, ValueError):
+            identity = parse_condition_identity(row, row_index=checked_pred_count - 1)
+            if not identity.valid:
                 if len(trajectory_validation_issues) < 20:
                     trajectory_validation_issues.append({
                         "clip_id": cid, "mode": mode, "alpha": raw_alpha,
-                        "issue": f"Non-numeric alpha value: {raw_alpha}"
+                        "issue": identity.failure_reason,
+                        "failure_type": identity.failure_type,
                     })
+                trajectory_validation_issue_count += 1
                 continue
+            alpha = float(identity.alpha)
 
             try:
                 cid_ctx = ctx_map.get(cid, {})

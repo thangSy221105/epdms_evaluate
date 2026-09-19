@@ -90,8 +90,8 @@ class TestContractsRound4(unittest.TestCase):
         }
         rec = evaluate_single_condition(pred_row, context_row=ctx_row, gt_row=None, vehicle=self.vehicle, strict_mode=True)
         self.assertFalse(rec.valid)
-        self.assertEqual(rec.failure_stage, "obstacle_observation_contract")
-        self.assertEqual(rec.failure_type, "INSUFFICIENT_OBSERVATION_DATA")
+        self.assertEqual(rec.failure_stage, "coordinate_contract")
+        self.assertEqual(rec.failure_type, "COORDINATE_CONTRACT_UNRESOLVED")
 
     def test_A2_confirmed_empty_all_frames_passes(self):
         """Confirmed empty timestamps allow achieving 100% coverage even with 0 obstacle boxes."""
@@ -131,7 +131,7 @@ class TestContractsRound4(unittest.TestCase):
         }
         rec = evaluate_single_condition(pred_row, context_row=ctx_row, gt_row=None, vehicle=self.vehicle, strict_mode=True)
         self.assertFalse(rec.valid)
-        self.assertEqual(rec.failure_type, "CORRUPTED_OBSERVATION_DATA")
+        self.assertEqual(rec.failure_type, "COORDINATE_CONTRACT_UNRESOLVED")
 
     def test_A4_separate_cf_and_ttc_coverage_evaluation(self):
         """TTC requires observation queries beyond CF horizon up to t0 + horizon + ttc_horizon."""

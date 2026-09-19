@@ -22,14 +22,18 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
 
 from tools.epdms.audit import audit_data_contracts, audit_environment
+from tools.epdms.condition_identity import parse_condition_identity, record_key_from_prediction
 from tools.epdms.config import EvaluationConfig
 from tools.epdms.io_jsonl import AtomicJsonlWriter, compute_file_sha256, iter_jsonl, read_jsonl_indexed
 from tools.epdms.map_loader import inspect_clip_map_status, load_lane_polygons_for_clip
 from tools.epdms.reporting import export_table_to_csv
 from tools.epdms.run_identity import (
     METRIC_IMPLEMENTATION_VERSION,
+    assert_fresh_score_dir_safe,
     compute_map_directory_content_sha256,
+    generate_run_id,
     load_latest_checkpoint_states,
+    RunIdentityError,
     verify_resume_safety_before_recovery,
     write_manifest_atomic,
 )
@@ -38,10 +42,7 @@ from tools.epdms.score_record import evaluate_single_condition
 
 
 def _record_key_from_prediction(row: Dict[str, Any]) -> str:
-    clip_id = str(row.get("clip_id", "unknown"))
-    mode = str(row.get("mode", "unknown"))
-    alpha = float(row.get("alpha", 0.0))
-    return f"{clip_id}|{mode}|{alpha:.3f}".rstrip("0").rstrip(".") if alpha != 0 else f"{clip_id}|{mode}|0"
+    return record_key_from_prediction(row)
 
 
 def derive_scoring_status(n_expected: int, n_valid: int, n_invalid: int, n_unprocessed: int) -> str:
@@ -85,6 +86,7 @@ def main() -> None:
     parser.add_argument("--retry-invalid", action="store_true", help="Re-evaluate keys found in the previous errors JSONL.")
     parser.add_argument("--score-dir", type=Path, default=None, help="Output directory for scores.")
     parser.add_argument("--max-clips", type=int, default=None, help="Limit number of clips to evaluate.")
+    parser.add_argument("--overwrite-new-run", action="store_true", help="Allow a fresh --no-resume run to replace canonical output in a non-empty score directory.")
     args = parser.parse_args()
 
     print(f"[*] Loading config from: {args.config}")
@@ -142,28 +144,42 @@ def main() -> None:
     score_csv = score_dir / "epdms_scores_300.csv"
     error_jsonl = score_dir / "epdms_errors_300.jsonl"
     error_output_jsonl = error_jsonl
+
+    # Resolve execution identity independently from the deterministic
+    # effective fingerprint. A fresh execution always gets a new run_id;
+    # resume reuses the manifest's run_id.
+    previous_manifest: Optional[Dict[str, Any]] = None
+    if resume:
+        previous_manifest = verify_resume_safety_before_recovery(
+            score_dir=score_dir,
+            expected_fingerprint=current_effective_fingerprint,
+            strict_identity=True,
+        )
+        run_id = str(previous_manifest.get("run_id")) if previous_manifest and previous_manifest.get("run_id") else generate_run_id()
+        if previous_manifest:
+            verify_resume_safety_before_recovery(
+                score_dir=score_dir,
+                expected_fingerprint=current_effective_fingerprint,
+                expected_run_id=run_id,
+                strict_identity=True,
+            )
+    else:
+        assert_fresh_score_dir_safe(score_dir, overwrite_new_run=args.overwrite_new_run)
+        run_id = generate_run_id()
+
     if args.retry_invalid and resume and error_jsonl.is_file():
         # Keep retry attempts append-safe and auditable instead of creating
         # duplicate latest-state rows in the canonical errors file.
-        error_output_jsonl = score_dir / f"epdms_errors_300_attempt_{time.strftime('%Y%m%d%H%M%S')}_{time.time_ns()}.jsonl"
+        error_output_jsonl = score_dir / f"epdms_errors_300_attempt_{run_id}_{time.time_ns()}.jsonl"
     manifest_json = score_dir / "run_manifest.json"
 
     # 1. Validate identity on resume BEFORE any recovery or file modification
     if resume:
-        verify_resume_safety_before_recovery(
-            score_dir=score_dir,
-            expected_fingerprint=current_effective_fingerprint,
-            artifact_names=[
-                score_jsonl.name,
-                f"{score_jsonl.name}.tmp",
-                error_jsonl.name,
-                f"{error_jsonl.name}.tmp",
-            ],
-        )
-
         # 2. Recover .tmp and repair truncated lines AFTER verifying safety
         AtomicJsonlWriter.prepare_file_for_resume(score_jsonl)
         AtomicJsonlWriter.prepare_file_for_resume(error_jsonl)
+        for attempt_path in sorted(score_dir.glob("epdms_errors_300_attempt_*.jsonl")):
+            AtomicJsonlWriter.prepare_file_for_resume(attempt_path)
 
     # 3. Open writers
     score_writer = AtomicJsonlWriter(score_jsonl, append_if_exists=resume)
@@ -172,7 +188,12 @@ def main() -> None:
     # 4. Read the latest state per key across canonical and retry attempt
     # files. Historical errors remain available for audit but do not affect
     # current-state counts.
-    states = load_latest_checkpoint_states(score_dir, expected_run_id=current_effective_fingerprint) if resume else {}
+    states = load_latest_checkpoint_states(
+        score_dir,
+        expected_run_id=run_id,
+        expected_fingerprint=current_effective_fingerprint,
+        strict_identity=True,
+    ) if resume else {}
     valid_keys = {key for key, row in states.items() if row.get("valid") is True}
     invalid_keys = {key for key, row in states.items() if row.get("valid") is not True}
     previous_invalid_types: Dict[str, str] = {
@@ -195,7 +216,7 @@ def main() -> None:
     if rule_group_file.is_file():
         print(f"[*] Loading rule groups mapping from: {rule_group_file.name}")
         for r in iter_jsonl(rule_group_file):
-            k = f"{r.get('clip_id')}|{r.get('mode')}|{float(r.get('alpha', 0.0)):.3f}".rstrip("0").rstrip(".") if float(r.get("alpha", 0.0)) != 0 else f"{r.get('clip_id')}|{r.get('mode')}|0"
+            k = parse_condition_identity(r).record_key
             rule_group_map[k] = r.get("group")
 
     total_conditions = len(all_pred_rows)
@@ -209,7 +230,8 @@ def main() -> None:
     skipped_valid_count = 0
     skipped_invalid_count = 0
     retried_invalid_count = 0
-    expected_keys = {_record_key_from_prediction(row) for row in all_pred_rows}
+    identities = [parse_condition_identity(row, row_index=idx) for idx, row in enumerate(all_pred_rows)]
+    expected_keys = {identity.record_key for identity in identities}
 
     try:
         phase0_report = audit_data_contracts(config)
@@ -243,6 +265,7 @@ def main() -> None:
         "total_runtime_s": 0.0,
         "config_sha256": config.sha256,
         "effective_fingerprint": current_effective_fingerprint,
+        "run_id": run_id,
         "implementation_version": METRIC_IMPLEMENTATION_VERSION,
         "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -251,15 +274,14 @@ def main() -> None:
 
     execution_error: Optional[BaseException] = None
     try:
-        for idx, pred_row in enumerate(all_pred_rows, start=1):
+        for idx, (pred_row, identity) in enumerate(zip(all_pred_rows, identities), start=1):
             eval_record: Optional[EvaluationScoreRecord] = None
             record_key: Optional[str] = None
             try:
-                raw_alpha = pred_row.get("alpha")
-                alpha = float(raw_alpha) if raw_alpha is not None else 0.0
-                clip_id = str(pred_row.get("clip_id", "unknown"))
-                mode = str(pred_row.get("mode", "unknown"))
-                record_key = _record_key_from_prediction(pred_row)
+                alpha = identity.alpha if identity.alpha is not None else 0.0
+                clip_id = identity.clip_id
+                mode = identity.mode
+                record_key = identity.record_key
 
                 if record_key in valid_keys:
                     skipped_count += 1
@@ -271,6 +293,19 @@ def main() -> None:
                     continue
                 if args.retry_invalid and record_key in invalid_keys:
                     retried_invalid_count += 1
+
+                if not identity.valid:
+                    eval_record = EvaluationScoreRecord(
+                        record_key=record_key,
+                        clip_id=clip_id,
+                        mode=mode,
+                        alpha=0.0,
+                        valid=False,
+                        failure_stage="condition_identity",
+                        failure_type=identity.failure_type or "InvalidAlphaError",
+                        failure_reason=identity.failure_reason or "Invalid condition identity",
+                    )
+                    raise StopIteration
 
                 ctx_row = context_map.get(clip_id)
                 gt_row = gt_map.get(clip_id)
@@ -299,6 +334,8 @@ def main() -> None:
                     strict_mode=config.strict_mode,
                     metric_profile=profile,
                 )
+            except StopIteration:
+                pass
             except Exception as exc:
                 cid = str(pred_row.get("clip_id", "unknown")) if isinstance(pred_row, dict) else "unknown"
                 m = str(pred_row.get("mode", "unknown")) if isinstance(pred_row, dict) else "unknown"
@@ -322,7 +359,8 @@ def main() -> None:
                 rec_dict["previous_failure_type"] = previous_invalid_types[record_key]
             else:
                 rec_dict["attempt_number"] = 1
-            rec_dict["run_id"] = current_effective_fingerprint
+            rec_dict["run_id"] = run_id
+            rec_dict["effective_fingerprint"] = current_effective_fingerprint
             rec_dict["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
 
             if eval_record.valid:

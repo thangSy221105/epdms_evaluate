@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from .coordinates import derive_heading_from_xy
+from .condition_identity import parse_condition_identity
 from .kinematics_numpy import compute_kinematics
 from .observation_contract import CorruptedObservationDataError
 from .proxy_metrics import (
@@ -102,6 +103,7 @@ def _prediction_waypoints(
     alpha: float,
     target_future_poses: Optional[int] = None,
     t0_us: Optional[int] = None,
+    origin_policy: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Select the prediction trajectory without changing its timestamp fields."""
     if alpha == 0.0:
@@ -121,7 +123,24 @@ def _prediction_waypoints(
     window_t0_us = pred_row.get("t0_us") if t0_us is None else t0_us
     if window_t0_us is None:
         raise MissingTimeOriginError("Prediction trajectory window requires t0_us")
-    return prepare_trajectory_window(raw, int(window_t0_us), target_future_poses, role="prediction")
+    return prepare_trajectory_window(
+        raw,
+        int(window_t0_us),
+        target_future_poses,
+        role="prediction",
+        origin_policy=origin_policy,
+        source_includes_t0=pred_row.get("source_includes_t0"),
+    )
+
+
+def _trajectory_origin_kwargs(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    row = row if isinstance(row, dict) else {}
+    kwargs: Dict[str, Any] = {}
+    if row.get("trajectory_origin_policy") is not None:
+        kwargs["origin_policy"] = str(row["trajectory_origin_policy"])
+    if row.get("source_includes_t0") is not None:
+        kwargs["source_includes_t0"] = bool(row["source_includes_t0"])
+    return kwargs
 
 
 def _observation_attestation(context_row: Dict[str, Any]) -> Tuple[bool, Optional[set[int]]]:
@@ -235,22 +254,26 @@ def evaluate_single_condition(
         if not isinstance(pred_row, dict):
             raise TypeError(f"pred_row must be dict, got {type(pred_row)}")
 
-        clip_id = str(pred_row.get("clip_id", ""))
-        if not clip_id:
+        identity = parse_condition_identity(pred_row)
+        clip_id = identity.clip_id
+        if not clip_id or clip_id == "unknown":
             raise ValueError("Missing 'clip_id' in prediction record")
 
-        mode = str(pred_row.get("mode", ""))
-        if not mode:
+        mode = identity.mode
+        if not mode or mode == "unknown":
             raise ValueError("Missing 'mode' in prediction record")
-
-        raw_alpha = pred_row.get("alpha")
-        if raw_alpha is None:
-            raise ValueError("Missing 'alpha' in prediction record")
-        alpha = float(raw_alpha)
-        if not np.isfinite(alpha):
-            raise ValueError(f"Invalid non-finite alpha value: {raw_alpha}")
-
-        record_key = f"{clip_id}|{mode}|{alpha:.3f}".rstrip("0").rstrip(".") if alpha != 0 else f"{clip_id}|{mode}|0"
+        if not identity.valid:
+            rec.record_key = identity.record_key
+            rec.clip_id = clip_id
+            rec.mode = mode
+            rec.valid = False
+            rec.failure_stage = "condition_identity"
+            rec.failure_type = identity.failure_type or "InvalidAlphaError"
+            rec.failure_reason = identity.failure_reason or "Invalid condition identity"
+            rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
+            return rec
+        alpha = float(identity.alpha)
+        record_key = identity.record_key
         rec.record_key = record_key
         rec.clip_id = clip_id
         rec.mode = mode
@@ -294,9 +317,14 @@ def evaluate_single_condition(
         target_future_poses = int(round(horizon_s * frequency_hz))
         try:
             pred_timeline = normalize_trajectory_timeline(
-                _prediction_waypoints(pred_row, alpha, target_future_poses=target_future_poses, t0_us=t0_us), t0_us=t0_us,
+                _prediction_waypoints(
+                    pred_row, alpha, target_future_poses=target_future_poses, t0_us=t0_us,
+                    origin_policy=_trajectory_origin_kwargs(pred_row).get("origin_policy"),
+                ), t0_us=t0_us,
                 expected_frequency_hz=frequency_hz, expected_horizon_s=horizon_s,
                 role="prediction", strict_grid=strict_mode,
+                origin_policy=_trajectory_origin_kwargs(pred_row).get("origin_policy"),
+                origin_policy_source="prediction_record",
             )
         except TimeContractError as t_err:
             rec.valid = False
@@ -368,9 +396,10 @@ def evaluate_single_condition(
                 raw_gt_pre_items = raw_gt_pre.tolist() if isinstance(raw_gt_pre, np.ndarray) else list(raw_gt_pre)
                 raw_gt_pre_items = prepare_trajectory_window(
                     raw_gt_pre_items, t0_us=t0_us,
-                    target_future_poses=int(round(horizon_s * frequency_hz)), role="ground_truth"
+                    target_future_poses=int(round(horizon_s * frequency_hz)), role="ground_truth",
+                    **_trajectory_origin_kwargs(gt_row)
                 )
-                normalize_trajectory_timeline(raw_gt_pre_items, t0_us=t0_us, expected_frequency_hz=frequency_hz, expected_horizon_s=horizon_s, role="ground_truth", strict_grid=strict_mode)
+                normalize_trajectory_timeline(raw_gt_pre_items, t0_us=t0_us, expected_frequency_hz=frequency_hz, expected_horizon_s=horizon_s, role="ground_truth", strict_grid=strict_mode, origin_policy=_trajectory_origin_kwargs(gt_row).get("origin_policy"), origin_policy_source="ground_truth_record")
             except TimeContractError as gt_pre_err:
                 rec.valid = False
                 rec.failure_stage = "ground_truth_contract"
@@ -382,6 +411,15 @@ def evaluate_single_condition(
         coord_info = _coordinate_contract(pred_row, context_row or {}, gt_row or {}, map_status)
         for key in ("prediction_frame", "gt_frame", "obstacle_frame", "map_frame", "prediction_anchor", "gt_anchor", "obstacle_anchor", "map_anchor", "transform_required", "transform_source", "coordinate_alignment_verified"):
             setattr(rec, key, coord_info.get(key))
+        # Coordinate alignment is a prerequisite for all geometry-based
+        # proxies. Stop here before observation, CF, TTC, or DAC evaluation.
+        if strict_mode and not coord_info["coordinate_alignment_verified"]:
+            rec.valid = False
+            rec.failure_stage = "coordinate_contract"
+            rec.failure_type = "COORDINATE_CONTRACT_UNRESOLVED"
+            rec.failure_reason = "Prediction, GT, obstacle and map frame/anchor declarations do not establish a common coordinate contract"
+            rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
+            return rec
         # 5. Context validation (Obstacles)
         if context_row is None:
             raise ValueError("missing_context: Context record missing for clip")
@@ -475,17 +513,6 @@ def evaluate_single_condition(
         rec.ttc_failure_time_s = ttc_fail_t
         rec.ttc_track_id = ttc_tr
 
-        # Coordinate validation is strict, but runs after observation
-        # integrity so malformed legacy fixtures still report their primary
-        # observation failure rather than being masked by missing metadata.
-        if strict_mode and not coord_info["coordinate_alignment_verified"]:
-            rec.valid = False
-            rec.failure_stage = "coordinate_contract"
-            rec.failure_type = "COORDINATE_CONTRACT_UNRESOLVED"
-            rec.failure_reason = "Prediction, GT, obstacle and map frame/anchor declarations do not establish a common coordinate contract"
-            rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
-            return rec
-
         # 6. Drivable Area Compliance (DAC)
         if lane_polygons is not None and len(lane_polygons) > 0:
             for p in lane_polygons:
@@ -527,11 +554,14 @@ def evaluate_single_condition(
         try:
             gt_items = raw_gt.tolist() if isinstance(raw_gt, np.ndarray) else list(raw_gt)
             gt_items = prepare_trajectory_window(
-                gt_items, t0_us=t0_us, target_future_poses=target_future_poses, role="ground_truth"
+                gt_items, t0_us=t0_us, target_future_poses=target_future_poses, role="ground_truth",
+                **_trajectory_origin_kwargs(gt_row)
             )
             gt_timeline = normalize_trajectory_timeline(
                 gt_items, t0_us=t0_us, expected_frequency_hz=frequency_hz,
                 expected_horizon_s=horizon_s, role="ground_truth", strict_grid=strict_mode,
+                origin_policy=_trajectory_origin_kwargs(gt_row).get("origin_policy"),
+                origin_policy_source="ground_truth_record",
             )
             pred_future_ts = timestamps_us[1:]
             pred_future_xy = np.column_stack([x_arr[1:], y_arr[1:]])

@@ -40,6 +40,12 @@ class MissingGroundTruthCoordinatesError(TimeContractError):
     """Raised when ground-truth waypoints lack required coordinates."""
 
 
+class AmbiguousTrajectoryOriginError(TimeContractError):
+    """Raised when a long timestamp-less source cannot identify its t0 convention."""
+
+    code = "TIMELINE_ORIGIN_AMBIGUOUS"
+
+
 def _waypoint_includes_t0(waypoints: Sequence[Dict[str, Any]], t0_us: int) -> bool:
     """Determine t0 inclusion from explicit timestamp metadata only.
 
@@ -61,6 +67,8 @@ def prepare_trajectory_window(
     t0_us: int,
     target_future_poses: int,
     role: str = "trajectory",
+    origin_policy: Optional[str] = None,
+    source_includes_t0: Optional[bool] = None,
 ) -> List[Dict[str, Any]]:
     """Return one canonical prefix for the configured evaluation horizon.
 
@@ -78,29 +86,48 @@ def prepare_trajectory_window(
             f"{role} has {len(raw)} waypoints; expected at least {target_future_poses} future poses"
         )
     t0 = _coerce_t0(t0_us, "trajectory_window")
-    parsed = [_extract_timestamp_metadata(wp) for wp in raw]
+    # Inspect only the first waypoint before choosing the crop. This prevents
+    # malformed timestamps outside the evaluation horizon from invalidating a
+    # score, while still resolving timestamped origin from actual metadata.
+    first_value, first_kind, _ = _extract_timestamp_metadata(raw[0])
+    explicit_policy = origin_policy
+    if source_includes_t0 is not None:
+        explicit_policy = "includes_t0" if bool(source_includes_t0) else "future_only"
+    if explicit_policy not in (None, "future_only", "includes_t0"):
+        raise ValueError(f"Unsupported trajectory origin policy: {explicit_policy!r}")
+    if first_value is not None:
+        includes_t0 = _waypoint_includes_t0(raw, t0)
+        origin_policy = "includes_t0" if includes_t0 else "future_only"
+        if len(raw) == target_future_poses + 1 and not includes_t0:
+            raise TimelineOriginMismatchError(
+                f"{role} has {target_future_poses + 1} poses but its first timestamp does not identify t0"
+            )
+    else:
+        if len(raw) >= target_future_poses + 1 and explicit_policy is None:
+            raise AmbiguousTrajectoryOriginError(
+                f"{role} has a long timestamp-less source; pass source_includes_t0 or trajectory_origin_policy"
+            )
+        origin_policy = explicit_policy or "future_only"
+        includes_t0 = origin_policy == "includes_t0"
+        if includes_t0 and len(raw) < target_future_poses + 1:
+            raise TimelineHorizonMismatchError(f"{role} cannot include t0 with only {len(raw)} waypoints")
+    if len(raw) > target_future_poses + 1:
+        window_len = target_future_poses + 1 if includes_t0 else target_future_poses
+    elif len(raw) == target_future_poses + 1:
+        window_len = target_future_poses + 1 if includes_t0 else target_future_poses
+    else:
+        window_len = len(raw)
+    window = raw[:window_len]
+    # Only the retained horizon is now parsed for timestamp consistency.
+    parsed = [_extract_timestamp_metadata(wp) for wp in window]
     present = [item[0] is not None for item in parsed]
     if any(present) and not all(present):
         raise InconsistentWaypointTimelineError(f"{role} waypoints have partial timestamps")
     kinds = {item[1] for item in parsed if item[1] is not None}
     if len(kinds) > 1:
         raise InconsistentWaypointTimelineError(f"{role} mixes relative and absolute timestamp fields")
-
-    includes_t0 = _waypoint_includes_t0(raw, t0) if all(present) else False
-    if len(raw) == target_future_poses + 1 and not includes_t0:
-        raise TimelineOriginMismatchError(
-            f"{role} has {target_future_poses + 1} poses but its first timestamp does not identify t0"
-        )
-    if len(raw) in (target_future_poses, target_future_poses + 1):
-        window_len = len(raw)
-    elif len(raw) > target_future_poses + 1:
-        # Long NuRec sources are cropped only after explicit t0 detection.  A
-        # timestamp-less long source is treated as future-only by contract;
-        # it cannot claim an included t0 without metadata.
-        window_len = target_future_poses + 1 if includes_t0 else target_future_poses
-    else:
-        window_len = len(raw)
-    window = raw[:window_len]
+    if all(present) and present and _waypoint_includes_t0(window, t0) != includes_t0:
+        raise TimelineOriginMismatchError(f"{role} first timestamp disagrees with declared trajectory origin policy")
     # Validate coordinates here so audit and scoring reject the same malformed
     # input before the normalizer reports a later timeline error.
     for idx, wp in enumerate(window):
@@ -125,6 +152,8 @@ class TimelineProvenance:
     timestamp_kind: str = "implicit_relative"
     includes_t0: bool = False
     source_timestamp_fields: List[str] = field(default_factory=list)
+    origin_policy: str = "unknown"
+    origin_policy_source: str = "unknown"
 
 
 @dataclass
@@ -253,7 +282,17 @@ def _as_waypoint_dicts(waypoints: Sequence[Any], role: str) -> List[Dict[str, An
     return result
 
 
-def normalize_trajectory_timeline(waypoints: Sequence[Any], t0_us: int, expected_frequency_hz: float = 10.0, expected_horizon_s: float = 4.0, role: str = "prediction", strict_grid: bool = True) -> NormalizedTrajectoryTimeline:
+def normalize_trajectory_timeline(
+    waypoints: Sequence[Any],
+    t0_us: int,
+    expected_frequency_hz: float = 10.0,
+    expected_horizon_s: float = 4.0,
+    role: str = "prediction",
+    strict_grid: bool = True,
+    origin_policy: Optional[str] = None,
+    origin_policy_source: Optional[str] = None,
+    source_includes_t0: Optional[bool] = None,
+) -> NormalizedTrajectoryTimeline:
     """Normalize prediction or GT onto one explicit clip clock."""
     if not isinstance(waypoints, (list, tuple)):
         raise TypeError(f"Waypoints must be a list/tuple, got {type(waypoints)}")
@@ -264,7 +303,21 @@ def normalize_trajectory_timeline(waypoints: Sequence[Any], t0_us: int, expected
     n_future = int(round(expected_frequency_hz * expected_horizon_s))
     if len(raw) not in (n_future, n_future + 1):
         raise TimelineHorizonMismatchError(f"{role} has {len(raw)} waypoints; expected {n_future} future poses or {n_future + 1} including t0")
-    includes_t0 = len(raw) == n_future + 1
+    if source_includes_t0 is not None:
+        origin_policy = "includes_t0" if bool(source_includes_t0) else "future_only"
+    parsed_first = _extract_timestamp_metadata(raw[0]) if raw else (None, None, None)
+    if parsed_first[0] is not None:
+        includes_t0 = _waypoint_includes_t0(raw, t0)
+        resolved_origin_policy = "includes_t0" if includes_t0 else "future_only"
+        resolved_origin_source = "first_waypoint_timestamp"
+    else:
+        if len(raw) == n_future + 1 and origin_policy != "includes_t0":
+            raise AmbiguousTrajectoryOriginError(
+                f"{role} has {len(raw)} timestamp-less waypoints; origin policy is required"
+            )
+        includes_t0 = origin_policy == "includes_t0"
+        resolved_origin_policy = origin_policy or "future_only"
+        resolved_origin_source = origin_policy_source or "explicit_contract"
     # Coordinates are part of the same parser contract and are checked first
     # so a malformed GT is not hidden by a later timestamp-origin diagnostic.
     xs = np.asarray([_coordinate(wp, "x_m", "x", i, role) for i, wp in enumerate(raw)], dtype=float)
@@ -285,6 +338,10 @@ def normalize_trajectory_timeline(waypoints: Sequence[Any], t0_us: int, expected
         values = np.asarray([p[0] for p in parsed], dtype=float)
         if np.any(np.diff(values) <= 0):
             raise NonMonotonicWaypointTimelineError(f"NonMonotonicWaypointTimelineError: {role} timestamps must be strictly increasing")
+        if includes_t0 and len(raw) == n_future:
+            raise TimelineOriginMismatchError(
+                f"{role} has {n_future} waypoints but starts at t0; an included-t0 source must contain {n_future + 1} waypoints"
+            )
         if kind == "absolute":
             timestamp_kind = "absolute_us"
             rel_s = (values - t0) / 1_000_000.0
@@ -326,7 +383,7 @@ def normalize_trajectory_timeline(waypoints: Sequence[Any], t0_us: int, expected
             z_values.append(zf)
             has_z = True
     zs = np.asarray(z_values, dtype=float) if has_z else None
-    provenance = TimelineProvenance(t0_us=t0, t0_source="resolved", frequency_hz=float(expected_frequency_hz), horizon_s=float(expected_horizon_s), first_waypoint_time_s=float(rel_s[0]), last_waypoint_time_s=float(rel_s[-1]), dt_s=dt_s, is_strict_grid_compliant=True, timestamps_us=timestamps_us.copy(), details={"role": role, "waypoint_count": len(raw)}, role=role, timestamp_kind=timestamp_kind, includes_t0=includes_t0, source_timestamp_fields=sorted(set(source_fields)))
+    provenance = TimelineProvenance(t0_us=t0, t0_source="resolved", frequency_hz=float(expected_frequency_hz), horizon_s=float(expected_horizon_s), first_waypoint_time_s=float(rel_s[0]), last_waypoint_time_s=float(rel_s[-1]), dt_s=dt_s, is_strict_grid_compliant=True, timestamps_us=timestamps_us.copy(), details={"role": role, "waypoint_count": len(raw)}, role=role, timestamp_kind=timestamp_kind, includes_t0=includes_t0, source_timestamp_fields=sorted(set(source_fields)), origin_policy=resolved_origin_policy, origin_policy_source=resolved_origin_source)
     return NormalizedTrajectoryTimeline(xs, ys, zs, timestamps_us, raw, provenance)
 
 

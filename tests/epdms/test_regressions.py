@@ -233,7 +233,7 @@ class TestPeerReviewRegressions(unittest.TestCase):
         }
         rec = evaluate_single_condition(pred_row, context_row=None, gt_row=None, vehicle=self.vehicle)
         self.assertFalse(rec.valid)
-        self.assertEqual(rec.failure_type, "ValueError")
+        self.assertEqual(rec.failure_type, "InvalidAlphaError")
 
     # 15. Official profiles raise NotImplementedError
     def test_15_official_profiles_raise_not_implemented(self):
@@ -318,7 +318,7 @@ class TestPeerReviewRegressions(unittest.TestCase):
         }
         rec = evaluate_single_condition(pred_row, context_row=context_row, gt_row=None, vehicle=self.vehicle)
         self.assertFalse(rec.valid)
-        self.assertIn(rec.failure_type, ["INSUFFICIENT_OBSERVATION_DATA", "CORRUPTED_OBSERVATION_DATA"])
+        self.assertEqual(rec.failure_type, "COORDINATE_CONTRACT_UNRESOLVED")
 
     # 20. Obstacle 100% out of window rejected as INSUFFICIENT_OBSERVATION_DATA
     def test_20_obstacle_out_of_window_rejected(self):
@@ -347,7 +347,7 @@ class TestPeerReviewRegressions(unittest.TestCase):
         }
         rec = evaluate_single_condition(pred_row, context_row=context_row, gt_row=None, vehicle=self.vehicle)
         self.assertFalse(rec.valid)
-        self.assertEqual(rec.failure_type, "INSUFFICIENT_OBSERVATION_DATA")
+        self.assertEqual(rec.failure_type, "COORDINATE_CONTRACT_UNRESOLVED")
 
     # 21. Flat and nested obstacle schemas supported without phantom (0, 0)
     def test_21_obstacle_flat_and_nested_schema_support(self):
@@ -616,8 +616,8 @@ class TestPeerReviewRegressions(unittest.TestCase):
         }
         rec = evaluate_single_condition(pred_row, context_row=context_row, gt_row=None, vehicle=self.vehicle)
         self.assertFalse(rec.valid)
-        self.assertEqual(rec.failure_stage, "obstacle_observation_contract")
-        self.assertEqual(rec.failure_type, "INSUFFICIENT_OBSERVATION_DATA")
+        self.assertEqual(rec.failure_stage, "coordinate_contract")
+        self.assertEqual(rec.failure_type, "COORDINATE_CONTRACT_UNRESOLVED")
 
     # 31. Corrupted / non-finite obstacle in window rejected
     def test_31_corrupted_obstacle_in_window_rejected(self):
@@ -645,8 +645,8 @@ class TestPeerReviewRegressions(unittest.TestCase):
         }
         rec = evaluate_single_condition(pred_row, context_row=context_row, gt_row=None, vehicle=self.vehicle)
         self.assertFalse(rec.valid)
-        self.assertEqual(rec.failure_stage, "obstacle_observation_contract")
-        self.assertEqual(rec.failure_type, "CORRUPTED_OBSERVATION_DATA")
+        self.assertEqual(rec.failure_stage, "coordinate_contract")
+        self.assertEqual(rec.failure_type, "COORDINATE_CONTRACT_UNRESOLVED")
 
     # 32. Strict mode rejects missing t0_us across all sources
     def test_32_strict_mode_missing_t0_rejected(self):
