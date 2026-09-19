@@ -4,6 +4,6 @@ The official Alpamayo loader sets `t0_us=5_100_000` and queries the PhysicalAI e
 
 The official PhysicalAI loader uses timestamp columns in microseconds, but the public code does not declare that zero is the clip origin. The pilot egomotion table contains negative timestamps and starts at `-190795`, so the origin cannot be asserted from field names or magnitude.
 
-The public NCore PAI converter uses the egomotion timestamps to define the sequence interval and filters obstacle `timestamp_us` against that interval. Its implementation preserves the non-negative PAI timestamp values; it does not apply a scale or offset. This establishes same-domain handling inside the PAI→NCore path.
+The public NCore PAI converter uses the egomotion timestamps to define the sequence interval and filters obstacle `timestamp_us` against that interval. `PAI_TO_NCORE_NUMERIC_RETIMING = NONE_FOR_RETAINED_ROWS`; `PAI_TO_NCORE_NEGATIVE_EGO_ROWS = FILTERED`; scale is 1.0 and offset is 0. This establishes same-domain handling inside the PAI→NCore path without claiming that negative rows are retained.
 
 No public NCore→NuRec/NRE export mapping to `clipgt/*.parquet:key.timestamp_micros` was found in the inspected sources. Therefore the PhysicalAI clock is documented, but the cross-domain bridge remains unresolved.

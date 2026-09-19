@@ -17,6 +17,7 @@ import pandas as pd
 
 CLIP_ID = "00040136-e651-4abd-991d-0655ccda9430"
 T0_US = 5_100_000
+PROVENANCE_STATUSES = {"FOUND", "NOT_FOUND_AFTER_INSPECTION", "NOT_INSPECTED"}
 
 
 def _summary(values: list[int]) -> dict[str, Any]:
@@ -49,6 +50,47 @@ def constant_delta_diagnostics(pairs: list[dict[str, int]], semantic_verified: b
     }
 
 
+def t0_query_contract(values: list[int], t0_us: int = T0_US) -> dict[str, Any]:
+    numeric = [int(value) for value in values]
+    in_range = bool(numeric) and min(numeric) <= t0_us <= max(numeric)
+    return {
+        "query_contract_found": True,
+        "exact_row": t0_us in numeric,
+        "interpolatable": in_range,
+        "query_in_range": in_range,
+        "first_timestamp": min(numeric) if numeric else None,
+        "last_timestamp": max(numeric) if numeric else None,
+    }
+
+
+def pai_to_ncore_timestamp_contract(values: list[int]) -> dict[str, Any]:
+    retained = [int(value) for value in values if int(value) >= 0]
+    return {
+        "scale": 1.0,
+        "offset_us": 0,
+        "numeric_retiming": "NONE_FOR_RETAINED_ROWS",
+        "negative_ego_rows": "FILTERED",
+        "input_count": len(values),
+        "retained_count": len(retained),
+        "negative_count": len(values) - len(retained),
+        "retained_values_preserved": True,
+    }
+
+
+def explicit_ncore_nurec_mapping(mapping: dict[str, Any], source_clip_id: str, target_clip_id: str) -> dict[str, Any]:
+    """Accept an offset only when metadata explicitly identifies both clips."""
+    verified = (mapping.get("source_clip_id") == source_clip_id and mapping.get("target_clip_id") == target_clip_id and isinstance(mapping.get("offset_us"), int))
+    return {"verified": verified, "scale": mapping.get("scale", 1.0) if verified else None,
+            "offset_us": mapping.get("offset_us") if verified else None,
+            "status": "VERIFIED" if verified else "UNRESOLVED"}
+
+
+def per_sequence_mapping(mappings: list[dict[str, Any]], sequence_id: str) -> dict[str, Any]:
+    matches = [item for item in mappings if item.get("sequence_id") == sequence_id]
+    return {"sequence_id": sequence_id, "match_count": len(matches), "mapping": matches[0] if len(matches) == 1 else None,
+            "status": "VERIFIED" if len(matches) == 1 else "UNRESOLVED"}
+
+
 def _read_timestamp(path: Path, field: str) -> list[int]:
     frame = pd.read_parquet(path)
     if field in frame.columns:
@@ -59,6 +101,55 @@ def _read_timestamp(path: Path, field: str) -> list[int]:
         for part in parts[1:]:
             series = series.map(lambda value: value.get(part) if isinstance(value, dict) else None)
     return [int(value) for value in series.dropna().tolist()]
+
+
+def _walk_values(value: Any, path: str = ""):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            yield from _walk_values(child, child_path)
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            yield from _walk_values(child, f"{path}[{index}]")
+    else:
+        yield path, value
+
+
+def inspect_nurec_provenance(clip_dir: str | Path | None) -> dict[str, Any]:
+    """Inspect listed NuRec metadata and make no source-identity inference."""
+    if not clip_dir:
+        return {"status": "NOT_INSPECTED", "inspected_files": [], "candidates": []}
+    root = Path(clip_dir)
+    if not root.exists():
+        return {"status": "NOT_INSPECTED", "inspected_files": [], "candidates": [], "reason": "clip directory does not exist"}
+    names = {"data_info.json", "datasource_summary.json", "metadata.yaml", "pose_record.json", "rig_trajectories.json", "sequence_tracks.json", "clip.parquet", "association.parquet"}
+    inspected: list[str] = []
+    candidates: list[dict[str, Any]] = []
+    try:
+        import yaml
+    except ImportError:
+        yaml = None
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or path.name not in names:
+            continue
+        rel = str(path.relative_to(root)).replace("\\", "/")
+        inspected.append(rel)
+        try:
+            if path.suffix.lower() == ".parquet":
+                frame = pd.read_parquet(path)
+                for column in frame.columns:
+                    if any(token in str(column).lower() for token in ("source_clip", "clip_id", "repo_id", "commit_sha", "revision")):
+                        candidates.append({"path": f"{rel}:column:{column}", "value": {"row_count": len(frame)}, "verification_status": "FOUND"})
+                continue
+            raw = json.loads(path.read_text(encoding="utf-8")) if path.suffix.lower() == ".json" else (yaml.safe_load(path.read_text(encoding="utf-8")) if yaml else None)
+            for key_path, value in _walk_values(raw):
+                key = key_path.rsplit(".", 1)[-1].lower().replace("[", "")
+                if any(token in key for token in ("source_clip_id", "source_repo_id", "source_revision", "source_commit_sha")):
+                    candidates.append({"path": f"{rel}:{key_path}", "value": value, "verification_status": "FOUND"})
+        except Exception as exc:
+            candidates.append({"path": rel, "value": None, "verification_status": "NOT_FOUND_AFTER_INSPECTION", "error": f"{type(exc).__name__}: {exc}"})
+    status = "FOUND" if candidates else ("NOT_FOUND_AFTER_INSPECTION" if inspected else "NOT_INSPECTED")
+    return {"status": status, "inspected_files": inspected, "candidates": candidates}
 
 
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -94,6 +185,9 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
     obstacle_windows = {str(window): sorted({int(value) for value in obs_ts[(obs_ts >= window[0]) & (obs_ts <= window[1])].tolist()}) for window in [(4_900_000, 5_300_000), (4_000_000, 6_500_000)]}
     semantic_pairs: list[dict[str, int]] = []
     diagnostics = constant_delta_diagnostics(semantic_pairs, semantic_verified=False)
+    t0_contract = t0_query_contract(pai_ego)
+    pai_ncore_contract = pai_to_ncore_timestamp_contract(pai_ego)
+    nurec_provenance = inspect_nurec_provenance(args.nurec_clip_dir)
     coverage = {
         "cf_required_range_us": [T0_US + 100_000, T0_US + 4_000_000],
         "ttc_required_range_us": [T0_US + 100_000, T0_US + 5_000_000],
@@ -101,15 +195,18 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
         "nurec_obstacle_range_us": [min(nurec_obs), max(nurec_obs)] if nurec_obs else [None, None],
         "cf_time_coverage": "UNRESOLVED",
         "ttc_time_coverage": "UNRESOLVED",
-        "reason": "No verified PhysicalAI-to-NuRec mapping; range comparison is diagnostic only",
+        "reason": "No verified NCore-to-NuRec mapping; range comparison is diagnostic only",
     }
     lineage = {
         "clip_id": args.clip_id,
         "edges": [
             {"source_domain": "PhysicalAI", "target_domain": "Alpamayo", "mapping_type": "explicit_query_contract", "scale": 1.0, "offset_us": 0, "explicit": True, "source_file": "alpamayo/src/alpamayo_r1/load_physical_aiavdataset.py", "source_line": 27, "evidence": "t0_us default 5_100_000; future query grid is t0 + k*100000"},
-            {"source_domain": "PhysicalAI", "target_domain": "NCore", "mapping_type": "timestamp_preserved_in_public_PAI_converter", "scale": 1.0, "offset_us": 0, "explicit": True, "source_file": "ncore/tools/data_converter/pai/converter.py", "source_line": 209, "evidence": "converter reads PAI timestamp and stores T_rig_world_timestamps_us; obstacle rows retain timestamp_us"},
+            {"source_domain": "PhysicalAI", "target_domain": "NCore", "mapping_type": "timestamp_preserved_for_retained_rows", "scale": 1.0, "offset_us": 0, "explicit": True, "source_file": "ncore/tools/data_converter/pai/converter.py", "source_line": 209, "evidence": "PAI_TO_NCORE_NUMERIC_RETIMING=NONE_FOR_RETAINED_ROWS; PAI_TO_NCORE_NEGATIVE_EGO_ROWS=FILTERED"},
             {"source_domain": "NCore", "target_domain": "NuRec/NRE", "mapping_type": "UNRESOLVED", "scale": None, "offset_us": None, "explicit": False, "source_file": None, "source_line": None, "evidence": "No public NCore->NuRec writer mapping to raw clipgt/key.timestamp_micros found in inspected repositories"},
         ],
+        "pai_to_ncore_contract": pai_ncore_contract,
+        "nurec_source_provenance": nurec_provenance,
+        "official_dataset_presence": {"ncore": args.official_ncore_pilot_presence, "nurec": args.official_nurec_pilot_presence},
     }
     bridge = {
         "clip_id": args.clip_id,
@@ -126,7 +223,15 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
         "cf_time_range_valid": None,
         "ttc_time_range_valid": None,
         "status": "UNRESOLVED",
-        "blockers": ["NO_NCORE_TO_NUREC_PROVENANCE", "NO_SEMANTIC_CROSS_DOMAIN_PAIRS", "PAI_T0_NOT_AN_EGOMOTION_ROW"],
+        "blockers": ["NCORE_TO_NUREC_TIME_TRANSFORM_NOT_PUBLICLY_PROVEN", "NO_SEMANTIC_CROSS_DOMAIN_PAIRS"],
+        "physicalai_t0_query_contract_found": t0_contract["query_contract_found"],
+        "physicalai_egomotion_exact_t0_row": t0_contract["exact_row"],
+        "physicalai_t0_interpolatable": t0_contract["interpolatable"],
+        "physicalai_t0_query_in_range": t0_contract["query_in_range"],
+        "physicalai_first_egomotion_timestamp": t0_contract["first_timestamp"],
+        "physicalai_timestamp_zero_reference": "UNRESOLVED",
+        "physicalai_clip_start_is_zero": "unknown",
+        "physicalai_spatial_origin_at_timestamp_zero": "UNRESOLVED",
         "physicalai_egomotion_contains_5100000": T0_US in pai_ego,
         "physicalai_egomotion_nearest_rows": nearest_rows,
         "physicalai_obstacle_windows": obstacle_windows,
@@ -134,6 +239,7 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
         "coverage": coverage,
     }
     (output / "time_lineage.json").write_text(json.dumps(lineage, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    (output / "physicalai_ncore_nurec_time_lineage.json").write_text(json.dumps(lineage, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     (output / "physicalai_to_nurec_time_bridge.json").write_text(json.dumps(bridge, indent=2, ensure_ascii=False, default=str) + "\n", encoding="utf-8")
     (output / "physicalai_clock_contract.json").write_text(json.dumps({
         "unit": "microseconds",
@@ -148,8 +254,25 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
         "note": "The public code establishes microsecond timestamp usage and same-sequence filtering, but does not declare that zero is the PhysicalAI clip origin.",
     }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     (output / "alpamayo_time_contract.md").write_text("""# Alpamayo PhysicalAI time contract\n\n- `src/alpamayo_r1/load_physical_aiavdataset.py:27`: `t0_us: int = 5_100_000`.\n- Lines 33, 45-50: 64 future steps at 10 Hz, `time_step=0.1`.\n- Lines 107-120: future query grid is `t0_us + 100000, ..., t0_us + 6400000`.\n- Lines 122-129: queries the PhysicalAI egomotion interpolator at those timestamps and obtains `ego_future_xyz`.\n- Lines 142-157: transforms world poses to local coordinates at the t0 pose.\n- Line 220: returns the supplied `t0_us` unchanged.\n\nThis proves the Alpamayo sampling convention. It does not prove that raw NuRec `key.timestamp_micros` uses the same origin.\n""", encoding="utf-8")
-    (output / "pai_to_ncore_time_trace.md").write_text("""# PhysicalAI -> NCore timestamp trace\n\n- `ncore/tools/data_converter/pai/utils.py:207-233` reads the PAI `timestamp` column and returns non-negative values as `uint64`; the implementation filters negative rows and does not subtract a minimum or apply a scale.\n- `ncore/tools/data_converter/pai/converter.py:209-237` uses those timestamps as the sequence interval and stores them at lines 298-304.\n- `ncore/tools/data_converter/pai/converter.py:376-410` reads obstacle `timestamp_us` and stores it unchanged after interval filtering.\n- `ncore/tools/data_converter/pai/converter.py:271-279` records source clip/repository/revision/commit metadata when the provider supplies it.\n\nConclusion: `DOES_NCORE_CONVERTER_PRESERVE_PHYSICALAI_TIMESTAMP = PRESERVED_EXACTLY` for the public PAI converter path, subject to its removal of negative egomotion rows. This is not evidence for NCore -> NuRec.\n""", encoding="utf-8")
-    (output / "nurec_source_provenance.json").write_text(json.dumps({"clip_id": args.clip_id, "source_clip_id": None, "source_repo_id": None, "source_revision": None, "source_commit_sha": None, "status": "NOT_FOUND_IN_NUREC_PILOT_METADATA", "searched": ["data_info.json", "datasource_summary.json", "metadata.yaml", "pose_record.json", "rig_trajectories.json", "sequence_tracks.json", "clipgt/clip.parquet"]}, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    (output / "pai_to_ncore_time_trace.md").write_text("""# PhysicalAI -> NCore timestamp trace
+
+- `PAI_TO_NCORE_NUMERIC_RETIMING = NONE_FOR_RETAINED_ROWS`
+- `PAI_TO_NCORE_NEGATIVE_EGO_ROWS = FILTERED`
+- scale `1.0`, offset `0`
+
+This is not evidence for NCore -> NuRec.
+""", encoding="utf-8")
+    (output / "nurec_source_provenance.json").write_text(json.dumps({"clip_id": args.clip_id, **nurec_provenance}, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    (output / "ncore_to_nurec_public_trace.md").write_text("""# NCore to NuRec public trace
+
+| Candidate | Status | Evidence |
+|---|---|---|
+| NCore PAI converter | READ_REFERENCE | PAI timestamps retained for non-negative rows. |
+| NuRec `clipgt/*:key.timestamp_micros` writer | NOT_FOUND_AFTER_INSPECTION | No public writer/manifest mapping found in inspected repositories. |
+| Numeric delta | DIAGNOSTIC_ONLY | Numeric proximity without semantic identity is not a pair. |
+| NCore -> NuRec offset/scale | UNRESOLVED | No public evidence establishes one. |
+""", encoding="utf-8")
+    (output / "official_ncore_timestamp_inventory.csv").write_text("clip_id,dataset,pilot_presence,status\n" + f"{args.clip_id},NCore,{args.official_ncore_pilot_presence},{args.official_ncore_pilot_presence}\n" + f"{args.clip_id},NuRec,{args.official_nurec_pilot_presence},{args.official_nurec_pilot_presence}\n", encoding="utf-8")
     (output / "pai_nurec_sequence_diagnostics.json").write_text(json.dumps({"physicalai_egomotion": _summary(pai_ego), "nurec_egomotion": _summary(nurec_ego), "semantic_pairs": semantic_pairs, "diagnostics": diagnostics}, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     (output / "obstacle_time_windows.json").write_text(json.dumps(obstacle_windows, indent=2) + "\n", encoding="utf-8")
     return bridge
@@ -163,6 +286,9 @@ def main() -> None:
     parser.add_argument("--nurec-egomotion", required=True)
     parser.add_argument("--nurec-obstacle", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--nurec-clip-dir", default=None)
+    parser.add_argument("--official-ncore-pilot-presence", choices=sorted(PROVENANCE_STATUSES), default="NOT_INSPECTED")
+    parser.add_argument("--official-nurec-pilot-presence", choices=sorted(PROVENANCE_STATUSES), default="NOT_INSPECTED")
     parser.add_argument("--pai-egomotion-field", default="timestamp")
     parser.add_argument("--pai-obstacle-field", default="timestamp_us")
     parser.add_argument("--nurec-egomotion-field", default="key.timestamp_micros")
