@@ -2,7 +2,7 @@
 
 BASE_COMMIT: `7776020708cf0492d14b9960c657f786acc8737c`
 BRANCH: `fix/nurec-time-alignment-forensic-hardening`
-NEW_COMMIT: `<filled after commit>`
+NEW_COMMIT: `eba3266` (`fix(data): harden NuRec time-alignment forensics`)
 
 ## Forensic tool capability
 
