@@ -640,6 +640,16 @@ def _coverage_counts(required: Sequence[int], evidence: set[int], obstacles: set
     return {"required": len(required), "observed": observed, "empty": empty, "unknown": unknown, "missing": missing, "matched": observed + empty + unknown}
 
 
+def _coverage_ready(time_verified: bool, obstacle_ready: bool, counts: Mapping[str, Any]) -> bool:
+    """Return strict readiness from final states, independent of completeness."""
+    return bool(
+        time_verified
+        and obstacle_ready
+        and counts.get("missing") == 0
+        and counts.get("unknown") == 0
+    )
+
+
 def _parquet_timestamp_summary(path: Path) -> Dict[str, Any]:
     info = inspect_parquet(path, sample_rows=0)
     result: Dict[str, Any] = {"status": info.get("status"), "min": None, "max": None, "unique_count": None, "row_count": info.get("row_count"), "timestamp_candidates": info.get("timestamp_candidates", {}), "selected_timestamp_field": info.get("selected_timestamp_field"), "timestamp_selection_status": info.get("timestamp_selection_status")}
@@ -956,18 +966,21 @@ def audit_dataset(dataset_root: Path, prediction_jsonl: Path, ground_truth_jsonl
             obstacle_timestamp_values = _parquet_timestamp_values(clip_dir / "clipgt/obstacle.parquet") if obstacle_ready else set()
             cf_counts = _coverage_counts(cf_required, frame_evidence, obstacle_timestamp_values, completeness_verified and obstacle_ready, 50_000) if time_verified else {"required": None, "observed": None, "empty": None, "unknown": None, "missing": None, "matched": None}
             ttc_counts = _coverage_counts(ttc_required, frame_evidence, obstacle_timestamp_values, completeness_verified and obstacle_ready, 100_000) if time_verified else {"required": None, "observed": None, "empty": None, "unknown": None, "missing": None, "matched": None}
-            cf_ready = bool(time_verified and completeness_verified and obstacle_ready and cf_counts["missing"] == 0 and cf_counts["unknown"] == 0)
-            ttc_ready = bool(time_verified and completeness_verified and obstacle_ready and ttc_counts["missing"] == 0 and ttc_counts["unknown"] == 0)
+            # Completeness is only required to turn independent frame evidence
+            # into confirmed-empty states. Object observations are already
+            # authoritative when scorer tolerance covers every query.
+            cf_ready = _coverage_ready(time_verified, obstacle_ready, cf_counts)
+            ttc_ready = _coverage_ready(time_verified, obstacle_ready, ttc_counts)
             if query_grid_error:
                 observation_status = "QUERY_GRID_BUILD_ERROR"
             elif not time_verified:
                 observation_status = "TIME_ALIGNMENT_UNRESOLVED"
-            elif not frame_evidence:
-                observation_status = "UNKNOWN"
-            elif not completeness_verified:
-                observation_status = "OBSERVATION_COMPLETENESS_UNVERIFIED"
             elif cf_ready and ttc_ready:
                 observation_status = "COMPLETE"
+            elif not completeness_verified and frame_evidence:
+                observation_status = "OBSERVATION_COMPLETENESS_UNVERIFIED"
+            elif not frame_evidence:
+                observation_status = "UNKNOWN"
             else:
                 observation_status = "INCOMPLETE"
             empty_possible = bool((cf_counts["empty"] or 0) or (ttc_counts["empty"] or 0))

@@ -298,6 +298,46 @@ class TestNuRecConditionCoverage(unittest.TestCase):
             result = self._run_audit(Path(td), [self._condition()], {"horizon_s": 0, "frequency_hz": 10.0, "future_poses": 0, "ttc_horizon_s": 1.0, "source": "bad.json", "verified": True})
             self.assertIn("QUERY_GRID_CONTRACT_UNRESOLVED", result["contracts"]["clip-a"]["blockers"])
 
+    def test_38_full_object_only_cf_is_ready_without_completeness(self):
+        result = nurec._coverage_counts([100_000] * 41, set(), {100_000}, False, 50_000)
+        self.assertTrue(nurec._coverage_ready(True, True, result))
+        self.assertEqual((result["observed"], result["empty"], result["unknown"], result["missing"]), (41, 0, 0, 0))
+
+    def test_39_full_object_only_ttc_is_ready_without_completeness(self):
+        result = nurec._coverage_counts([100_000] * 51, set(), {100_000}, False, 100_000)
+        self.assertTrue(nurec._coverage_ready(True, True, result))
+        self.assertEqual((result["observed"], result["empty"], result["unknown"], result["missing"]), (51, 0, 0, 0))
+
+    def test_40_partial_object_coverage_is_not_ready(self):
+        result = nurec._coverage_counts([100_000, 200_000], set(), {100_000}, False, 0)
+        self.assertFalse(nurec._coverage_ready(True, True, result))
+        self.assertEqual((result["observed"], result["missing"]), (1, 1))
+
+    def test_41_object_plus_unknown_frame_is_not_ready(self):
+        result = nurec._coverage_counts([100_000, 200_000], {200_000}, {100_000}, False, 0)
+        self.assertFalse(nurec._coverage_ready(True, True, result))
+        self.assertEqual((result["observed"], result["unknown"], result["missing"]), (1, 1, 0))
+
+    def test_42_object_plus_confirmed_empty_is_ready(self):
+        result = nurec._coverage_counts([100_000, 200_000], {200_000}, {100_000}, True, 0)
+        self.assertTrue(nurec._coverage_ready(True, True, result))
+        self.assertEqual((result["observed"], result["empty"], result["unknown"], result["missing"]), (1, 1, 0, 0))
+
+    def test_43_explicit_object_only_parity_case(self):
+        result = nurec._coverage_counts([100_000, 200_000, 300_000], set(), {100_020, 200_000, 299_990}, False, 50_000)
+        self.assertEqual((result["observed"], result["empty"], result["unknown"], result["missing"]), (3, 0, 0, 0))
+        self.assertEqual(sum(result[key] for key in ("observed", "empty", "unknown", "missing")), result["required"])
+
+    def test_44_every_coverage_result_preserves_state_invariant(self):
+        for required, evidence, obstacles, complete, tolerance in (
+            ([1, 2], set(), {1}, False, 0),
+            ([1, 2], {2}, {1}, False, 0),
+            ([1, 2], {2}, {1}, True, 0),
+            ([1, 2], set(), set(), False, 0),
+        ):
+            result = nurec._coverage_counts(required, evidence, obstacles, complete, tolerance)
+            self.assertEqual(sum(result[key] for key in ("observed", "empty", "unknown", "missing")), result["required"])
+
 
 if __name__ == "__main__":
     unittest.main()
