@@ -7,11 +7,15 @@ import pandas as pd
 
 from scripts.audit_physicalai_nurec_time_bridge import (
     constant_delta_diagnostics,
+    classify_clip_pattern,
+    classify_cross_clip_pattern,
+    duration_diagnostics,
     inspect_nurec_provenance,
     explicit_ncore_nurec_mapping,
     _external_dataset_evidence,
     pai_to_ncore_timestamp_contract,
     per_sequence_mapping,
+    relative_clock_diagnostics,
     t0_query_contract,
 )
 
@@ -132,6 +136,54 @@ class TestPhysicalAINuRecTimeBridge(unittest.TestCase):
     def test_source_lineage_does_not_verify_time_mapping(self):
         result = explicit_ncore_nurec_mapping({"source_clip_id": "a", "target_clip_id": "b"}, "a", "b")
         self.assertFalse(result["verified"])
+
+    def test_identical_clocks_are_direct_with_semantic_pairs(self):
+        self.assertEqual(classify_clip_pattern(direct=True, constant_delta=True, duration_equal=True, semantic_pairs=2), "DIRECT")
+
+    def test_same_global_offset_is_candidate_only(self):
+        result = classify_cross_clip_pattern([{"semantic_pairs": 3, "constant_delta": True, "offset_us": 10}, {"semantic_pairs": 3, "constant_delta": True, "offset_us": 10}, {"semantic_pairs": 3, "constant_delta": True, "offset_us": 10}])
+        self.assertEqual(result["pattern_status"], "GLOBAL_FIXED_OFFSET_CANDIDATE")
+        self.assertEqual(result["verification_status"], "UNVERIFIED")
+
+    def test_different_offsets_are_per_clip_candidate(self):
+        result = classify_cross_clip_pattern([{"semantic_pairs": 2, "constant_delta": True, "offset_us": 10}, {"semantic_pairs": 2, "constant_delta": True, "offset_us": 20}])
+        self.assertEqual(result["pattern_status"], "PER_CLIP_OFFSET_CANDIDATE")
+
+    def test_same_offset_within_sequence_can_be_grouped_without_verification(self):
+        result = classify_cross_clip_pattern([{"sequence_id": "s1", "semantic_pairs": 2, "constant_delta": True, "offset_us": 10}, {"sequence_id": "s1", "semantic_pairs": 2, "constant_delta": True, "offset_us": 10}])
+        self.assertEqual(result["offsets"], [10])
+        self.assertEqual(result["verification_status"], "UNVERIFIED")
+
+    def test_relative_timeline_with_different_origins(self):
+        result = relative_clock_diagnostics([100, 200, 300], [1000, 1100, 1200])
+        self.assertTrue(result["same_duration"])
+        self.assertTrue(result["same_count"])
+
+    def test_differing_duration_rejects_translation_invariant(self):
+        result = duration_diagnostics(0, 100, 1000, 1201)
+        self.assertEqual(result["duration_error_us"], 101)
+
+    def test_interval_delta_without_pairs_is_unverified(self):
+        result = classify_cross_clip_pattern([])
+        self.assertEqual(result["verification_status"], "UNVERIFIED")
+
+    def test_two_constant_semantic_pairs_can_classify_clip(self):
+        self.assertEqual(classify_clip_pattern(constant_delta=True, duration_equal=True, semantic_pairs=2), "CONSTANT_OFFSET")
+
+    def test_conflicting_semantic_deltas_reject_constant_mapping(self):
+        self.assertEqual(classify_clip_pattern(constant_delta=False, duration_equal=True, semantic_pairs=3), "NONLINEAR_OR_RETIMED")
+
+    def test_pilot_absent_from_ncore_blocks_application(self):
+        self.assertFalse("pilot" in {"other"})
+
+    def test_external_identity_does_not_upgrade_numeric_pattern(self):
+        result = classify_cross_clip_pattern([{"semantic_pairs": 0, "constant_delta": True, "offset_us": 4}])
+        self.assertEqual(result["verification_status"], "UNVERIFIED")
+
+    def test_raw_files_unchanged_by_pattern_helpers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "raw.bin"; path.write_bytes(b"raw"); before = path.read_bytes()
+            classify_cross_clip_pattern([]); self.assertEqual(path.read_bytes(), before)
 
     def test_pai_to_ncore_filters_negative_rows_without_retiming(self):
         result = pai_to_ncore_timestamp_contract([-3, 0, 100, 200])

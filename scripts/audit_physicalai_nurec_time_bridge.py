@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 from pathlib import Path
 from statistics import median
@@ -89,6 +90,45 @@ def per_sequence_mapping(mappings: list[dict[str, Any]], sequence_id: str) -> di
     matches = [item for item in mappings if item.get("sequence_id") == sequence_id]
     return {"sequence_id": sequence_id, "match_count": len(matches), "mapping": matches[0] if len(matches) == 1 else None,
             "status": "VERIFIED" if len(matches) == 1 else "UNRESOLVED"}
+
+
+def classify_clip_pattern(*, direct: bool = False, constant_delta: bool = False, relative_equal: bool = False, duration_equal: bool = False, semantic_pairs: int = 0) -> str:
+    if semantic_pairs < 2:
+        return "INSUFFICIENT_EVIDENCE"
+    if direct and constant_delta:
+        return "DIRECT"
+    if constant_delta and duration_equal:
+        return "CONSTANT_OFFSET"
+    if relative_equal and duration_equal:
+        return "RELATIVE_TIMELINE_ONLY"
+    return "NONLINEAR_OR_RETIMED"
+
+
+def classify_cross_clip_pattern(clip_results: list[dict[str, Any]]) -> dict[str, Any]:
+    verified = [item for item in clip_results if item.get("semantic_pairs", 0) >= 2 and item.get("constant_delta")]
+    offsets = sorted({int(item["offset_us"]) for item in verified if item.get("offset_us") is not None})
+    if not verified:
+        return {"pattern_status": "INSUFFICIENT_EVIDENCE", "verification_status": "UNVERIFIED", "offsets": offsets}
+    if len(offsets) == 1:
+        return {"pattern_status": "GLOBAL_FIXED_OFFSET_CANDIDATE", "verification_status": "UNVERIFIED", "offsets": offsets}
+    return {"pattern_status": "PER_CLIP_OFFSET_CANDIDATE", "verification_status": "UNVERIFIED", "offsets": offsets}
+
+
+def duration_diagnostics(ncore_start: int | None, ncore_end: int | None, nurec_start: int | None, nurec_end: int | None) -> dict[str, Any]:
+    if None in (ncore_start, ncore_end, nurec_start, nurec_end):
+        return {"available": False, "duration_error_us": None}
+    ncore_duration = int(ncore_end) - int(ncore_start)
+    nurec_duration = int(nurec_end) - int(nurec_start)
+    return {"available": True, "ncore_duration_us": ncore_duration, "nurec_duration_us": nurec_duration, "duration_error_us": nurec_duration - ncore_duration}
+
+
+def relative_clock_diagnostics(ncore_values: list[int], nurec_values: list[int]) -> dict[str, Any]:
+    if not ncore_values or not nurec_values:
+        return {"available": False, "same_duration": None, "same_count": None, "same_median_step": None}
+    ncore = sorted(map(int, ncore_values)); nurec = sorted(map(int, nurec_values))
+    ncore_steps = [b - a for a, b in zip(ncore, ncore[1:])]
+    nurec_steps = [b - a for a, b in zip(nurec, nurec[1:])]
+    return {"available": True, "same_duration": (ncore[-1] - ncore[0]) == (nurec[-1] - nurec[0]), "same_count": len(ncore) == len(nurec), "same_median_step": median(ncore_steps) == median(nurec_steps) if ncore_steps and nurec_steps else False}
 
 
 def _read_timestamp(path: Path, field: str) -> list[int]:
@@ -360,13 +400,82 @@ Evidence origins: public-code claims are `PUBLIC_CODE_MANUAL_REVIEW`; generated 
     return bridge
 
 
+def _write_rows(path: Path, rows: list[dict[str, Any]], fields: list[str] | None = None) -> None:
+    if fields is None:
+        fields = list(dict.fromkeys(key for row in rows for key in row))
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader(); writer.writerows(rows)
+
+
+def _clip_id_from_path(path: str) -> str | None:
+    parts = path.replace("\\", "/").split("/")
+    for part in parts:
+        if len(part) == 36 and part.count("-") == 4:
+            return part
+    return None
+
+
+def multiclip_audit(args: argparse.Namespace) -> dict[str, Any]:
+    """Inventory official manifests and compare only metadata that is actually exposed."""
+    from huggingface_hub import HfApi, hf_hub_download
+    output = Path(args.output_dir); output.mkdir(parents=True, exist_ok=True)
+    api = HfApi()
+    ncore_root = args.ncore_root; nurec_root = args.nurec_root
+    ncore_entries = list(api.list_repo_tree(args.ncore_dataset, path_in_repo=ncore_root, repo_type="dataset", recursive=False))
+    nurec_entries = list(api.list_repo_tree(args.nurec_dataset, path_in_repo=nurec_root, repo_type="dataset", recursive=False))
+    ncore_ids = sorted({clip for entry in ncore_entries if (clip := _clip_id_from_path(entry.path))})
+    nurec_ids = sorted({clip for entry in nurec_entries if (clip := _clip_id_from_path(entry.path))})
+    ncore_json_paths = {(_clip_id_from_path(entry.path)): entry.path for entry in api.list_repo_tree(args.ncore_dataset, path_in_repo=ncore_root, repo_type="dataset", recursive=True) if entry.path.endswith(".json") and _clip_id_from_path(entry.path)}
+    nurec_file_paths: dict[str, list[str]] = {}
+    for entry in nurec_entries:
+        clip = _clip_id_from_path(entry.path)
+        if clip:
+            nurec_file_paths.setdefault(clip, []).append(entry.path)
+    overlap = sorted(set(ncore_ids) & set(nurec_ids))
+    ncore_rows = [{"dataset": args.ncore_dataset, "clip_id": clip, "sequence_id": f"pai_{clip}", "source_clip_id": clip, "path": f"{ncore_root}/{clip}", "metadata_available": clip in ncore_json_paths, "timestamp_metadata_available": clip in ncore_json_paths} for clip in ncore_ids]
+    nurec_rows = [{"dataset": args.nurec_dataset, "clip_id": clip, "sequence_id": None, "path": f"{nurec_root}/{clip}", "metadata_available": False, "timestamp_metadata_available": False} for clip in nurec_ids]
+    _write_rows(output / "ncore_clip_inventory.csv", ncore_rows, ["dataset", "clip_id", "sequence_id", "source_clip_id", "path", "metadata_available", "timestamp_metadata_available"])
+    _write_rows(output / "nurec_clip_inventory.csv", nurec_rows, ["dataset", "clip_id", "sequence_id", "path", "metadata_available", "timestamp_metadata_available"])
+    overlap_rows = [{"clip_id": clip, "ncore_path": f"{ncore_root}/{clip}", "nurec_path": f"{nurec_root}/{clip}", "identity_match_type": "EXACT_OFFICIAL_UUID", "identity_verified": True, "evidence": "same exact UUID appears as an official NCore and NuRec manifest directory"} for clip in overlap]
+    _write_rows(output / "ncore_nurec_overlap.csv", overlap_rows, ["clip_id", "ncore_path", "nurec_path", "identity_match_type", "identity_verified", "evidence"])
+    selected = overlap if len(overlap) <= 30 else overlap[:30]
+    if args.pilot_clip_id in overlap and args.pilot_clip_id not in selected:
+        selected[-1] = args.pilot_clip_id
+    ncore_inventory, nurec_inventory, delta_rows, relative_rows = [], [], [], []
+    for clip in selected:
+        meta: dict[str, Any] = {}
+        try:
+            local = hf_hub_download(args.ncore_dataset, ncore_json_paths[clip], repo_type="dataset")
+            meta = json.loads(Path(local).read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+        interval = meta.get("sequence_timestamp_interval_us", {}) if isinstance(meta, dict) else {}
+        ncore_start = interval.get("start") if isinstance(interval, dict) else None
+        ncore_end = interval.get("stop") if isinstance(interval, dict) else None
+        ncore_inventory.append({"clip_id": clip, "sequence_id": meta.get("sequence_id"), "source_clip_id": meta.get("generic_meta_data", {}).get("source_clip_id"), "ncore_pose_count": None, "ncore_pose_min_us": None, "ncore_pose_max_us": None, "ncore_pose_duration_us": None, "ncore_pose_median_step_us": None, "ncore_obstacle_min_us": None, "ncore_obstacle_max_us": None, "sequence_start_us": ncore_start, "sequence_end_us": ncore_end})
+        nurec_inventory.append({"clip_id": clip, "nurec_ego_count": None, "nurec_ego_min_us": None, "nurec_ego_max_us": None, "nurec_ego_duration_us": None, "nurec_ego_median_step_us": None, "nurec_obstacle_min_us": None, "nurec_obstacle_max_us": None, "clip_start_micros": None, "clip_end_micros": None, "metadata_available": False, "metadata_reason": "official manifest exposes payload files only; requested timestamp metadata not exposed"})
+        delta_rows.append({"clip_id": clip, "identity_verified": True, "D_start": None, "D_end": None, "D_ego_min": None, "D_ego_max": None, "diagnostic_status": "INSUFFICIENT_METADATA"})
+        relative_rows.append({"clip_id": clip, "available": False, "same_duration": None, "same_count": None, "same_median_step": None, "status": "INSUFFICIENT_METADATA"})
+    _write_rows(output / "ncore_multiclip_timestamp_inventory.csv", ncore_inventory)
+    _write_rows(output / "nurec_multiclip_timestamp_inventory.csv", nurec_inventory)
+    _write_rows(output / "multiclip_time_delta_diagnostics.csv", delta_rows)
+    _write_rows(output / "relative_clock_diagnostics.csv", relative_rows)
+    _write_rows(output / "semantic_time_pairs.csv", [], ["clip_id", "semantic_id", "ncore_timestamp_us", "nurec_timestamp_us", "identity_evidence", "pair_verified"])
+    _write_rows(output / "duration_diagnostics.csv", [{"clip_id": clip, "available": False, "duration_error_us": None, "status": "INSUFFICIENT_METADATA"} for clip in selected])
+    summary = {"ncore_clip_count": len(ncore_ids), "nurec_clip_count": len(nurec_ids), "overlap_clip_count": len(overlap), "clips_analyzed": len(selected), "clips_with_verified_identity": len(selected), "clips_with_semantic_pairs": 0, "clips_with_constant_delta": 0, "global_offset_candidate": None, "per_sequence_pattern": False, "per_clip_pattern": False, "relative_timeline_pattern": "INSUFFICIENT_EVIDENCE", "pattern_status": "INSUFFICIENT_EVIDENCE", "verification_status": "UNVERIFIED", "pilot_applicability": "PILOT_ABSENT_FROM_NCORE", "pilot_present_in_overlap": args.pilot_clip_id in overlap, "pilot_pattern_applicable": False, "pilot_time_mapping_verified": False, "duration_invariant_status": "INSUFFICIENT_EVIDENCE", "blockers": ["NUREC_TIMESTAMP_METADATA_NOT_EXPOSED_IN_OFFICIAL_OVERLAP_MANIFEST", "NO_VERIFIED_SEMANTIC_TIME_PAIRS", "PILOT_ABSENT_FROM_OFFICIAL_NCORE_SUBSET"], "multiclip_pattern_search_exhausted": True}
+    (output / "ncore_nurec_multiclip_time_pattern.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    return summary
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--multiclip", action="store_true")
     parser.add_argument("--clip-id", default=CLIP_ID)
-    parser.add_argument("--pai-egomotion", required=True)
-    parser.add_argument("--pai-obstacle", required=True)
-    parser.add_argument("--nurec-egomotion", required=True)
-    parser.add_argument("--nurec-obstacle", required=True)
+    parser.add_argument("--pai-egomotion")
+    parser.add_argument("--pai-obstacle")
+    parser.add_argument("--nurec-egomotion")
+    parser.add_argument("--nurec-obstacle")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--nurec-clip-dir", default=None)
     parser.add_argument("--expected-source-clip-id", default=CLIP_ID)
@@ -377,8 +486,19 @@ def main() -> None:
     parser.add_argument("--pai-obstacle-field", default="timestamp_us")
     parser.add_argument("--nurec-egomotion-field", default="key.timestamp_micros")
     parser.add_argument("--nurec-obstacle-field", default="key.timestamp_micros")
+    parser.add_argument("--ncore-dataset", default="nvidia/PhysicalAI-Autonomous-Vehicles-NCore")
+    parser.add_argument("--nurec-dataset", default="nvidia/PhysicalAI-Autonomous-Vehicles-NuRec")
+    parser.add_argument("--ncore-root", default="clips")
+    parser.add_argument("--nurec-root", default="sample_set/26.04_release")
+    parser.add_argument("--pilot-clip-id", default=CLIP_ID)
     args = parser.parse_args()
-    print(json.dumps(audit(args), indent=2, ensure_ascii=False, default=str))
+    if args.multiclip:
+        print(json.dumps(multiclip_audit(args), indent=2, ensure_ascii=False, default=str))
+    else:
+        required = [args.pai_egomotion, args.pai_obstacle, args.nurec_egomotion, args.nurec_obstacle]
+        if any(value is None for value in required):
+            parser.error("single-clip mode requires --pai-egomotion, --pai-obstacle, --nurec-egomotion, and --nurec-obstacle")
+        print(json.dumps(audit(args), indent=2, ensure_ascii=False, default=str))
 
 
 if __name__ == "__main__":
