@@ -2,7 +2,7 @@
 
 BASE_COMMIT: `13dda6067bd6343746baeadd6d7e754acfd69174`
 NEW_BRANCH: `fix/round6-contract-consistency`
-NEW_COMMIT: `42e9086c6e8cde0db3a395bd1f847f29cdbe7c40`
+NEW_COMMIT: `9d60800b69bc61fc5bf837fb7b23ed658c29195f`
 
 ## Scope
 
