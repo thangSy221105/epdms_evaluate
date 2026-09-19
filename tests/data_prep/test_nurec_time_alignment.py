@@ -2,8 +2,18 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from tools.data_prep.time_alignment import correspondence_status, summarize_values, unit_evidence
+from tools.data_prep.time_alignment import (
+    _camera_records,
+    _load_jsonl_clip,
+    _timeline_reports,
+    audit_time_alignment,
+    correspondence_status,
+    resolve_time_alignment_evidence,
+    summarize_values,
+    unit_evidence,
+)
 
 
 class TestNuRecTimeAlignmentEvidence(unittest.TestCase):
@@ -60,6 +70,99 @@ class TestNuRecTimeAlignmentEvidence(unittest.TestCase):
             raw.write_text(json.dumps({"timestamp_micros": 1}) + "\n", encoding="utf-8")
             before = raw.read_bytes()
             self.assertEqual(raw.read_bytes(), before)
+
+    def _clock_evidence(self):
+        return {"available": True, "unit": "microseconds", "unit_status": "UNIT_EXPLICIT"}
+
+    def test_14_resolver_explicit_shared_clock_is_direct(self):
+        result = resolve_time_alignment_evidence(self._clock_evidence(), self._clock_evidence(), self._clock_evidence(), {"shared_clock_domain": True, "prediction_clock_domain": "clip_relative_us", "nurec_clock_domain": "clip_relative_us", "prediction_origin_id": "clip-1", "nurec_origin_id": "clip-1", "same_unit": True, "source": ["data_info.json:time_alignment"]})
+        self.assertEqual((result["status"], result["verified"]), ("ALIGNED_DIRECT", True))
+
+    def test_15_resolver_explicit_origin_mapping_is_verified(self):
+        result = resolve_time_alignment_evidence(self._clock_evidence(), self._clock_evidence(), self._clock_evidence(), {"mapping_formula": "prediction_relative_us + clip_start_us = nurec_us", "source": ["data_info.json:explicit_time_mapping"], "unit_explicit": True, "origin_explicit": True, "offset_us": 100, "mapping_type": "explicit_origin_mapping"})
+        self.assertEqual((result["status"], result["offset_us"]), ("ALIGNED_BY_EXPLICIT_METADATA", 100))
+
+    def test_16_numeric_coincidence_without_provenance_is_unresolved(self):
+        result = resolve_time_alignment_evidence(self._clock_evidence(), self._clock_evidence(), self._clock_evidence())
+        self.assertEqual(result["status"], "UNRESOLVED")
+
+    def test_17_conflicting_pairs_override_verified(self):
+        result = resolve_time_alignment_evidence(self._clock_evidence(), self._clock_evidence(), self._clock_evidence(), {"semantic_identity": True, "identity_source": "frame_id"}, [{"timestamp_a": 1, "timestamp_b": 101}, {"timestamp_a": 2, "timestamp_b": 103}])
+        self.assertEqual(result["status"], "CONFLICTING_TIME_ORIGIN")
+
+    def test_18_ambiguous_required_unit_fails_closed(self):
+        ambiguous = {"available": True, "unit": None, "unit_status": "UNIT_AMBIGUOUS"}
+        self.assertEqual(resolve_time_alignment_evidence(ambiguous, self._clock_evidence(), self._clock_evidence())["status"], "UNIT_AMBIGUOUS")
+
+    def test_19_missing_required_time_data_is_missing_metadata(self):
+        missing = {"available": False, "unit_status": "UNIT_EXPLICIT"}
+        self.assertEqual(resolve_time_alignment_evidence(missing, self._clock_evidence(), self._clock_evidence())["status"], "MISSING_TIME_METADATA")
+
+    def test_20_relative_prediction_timeline_is_found(self):
+        reports = _timeline_reports({"clean_waypoints": [{"t_s": 0.0}, {"t_s": 0.1}]})
+        self.assertEqual((reports[0]["timestamp_kind"], reports[0]["timestamp_count"]), ("relative", 2))
+
+    def test_21_absolute_prediction_timeline_is_found(self):
+        reports = _timeline_reports({"guided_waypoints": [{"timestamp_micros": 10}, {"timestamp_micros": 20}]})
+        self.assertEqual(reports[0]["timestamp_kind"], "absolute")
+
+    def test_22_gt_timeline_is_found(self):
+        reports = _timeline_reports({"future_waypoints": [{"timestamp_us": 10}, {"timestamp_us": 20}]})
+        self.assertEqual(reports[0]["timestamp_field"], "timestamp_us")
+
+    def test_23_timestamp_less_xyz_is_not_timestamped(self):
+        reports = _timeline_reports({"ego_future_xyz": [[1, 2, 3], [4, 5, 6]]})
+        self.assertEqual(reports[0]["unit_status"], "TIMESTAMP_IMPLICIT_BY_PIPELINE")
+
+    def test_24_camera_filename_unit_is_ambiguous(self):
+        with tempfile.TemporaryDirectory() as td:
+            sensor = Path(td) / "frames" / "camera_front"
+            sensor.mkdir(parents=True)
+            (sensor / "123456.jpeg").write_bytes(b"not-read")
+            record = _camera_records(Path(td))[0]
+            self.assertEqual((record["unit_declared"], record["unit_status"]), (None, "UNIT_AMBIGUOUS"))
+
+    def test_25_malformed_jsonl_is_reported(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "pred.jsonl"
+            path.write_text('{"clip_id":"clip"}\nnot-json\n', encoding="utf-8")
+            rows, errors = _load_jsonl_clip(path, "clip", "prediction")
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(errors[0]["failure_type"], "MALFORMED_JSON")
+
+    def test_26_integration_explicit_shared_clock_resolves(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            clip = root / "clip"
+            (clip / "clipgt").mkdir(parents=True)
+            (clip / "data_info.json").write_text(json.dumps({"time_alignment": {"shared_clock_domain": True, "prediction_clock_domain": "clip_relative_us", "nurec_clock_domain": "clip_relative_us", "prediction_origin_id": "x", "nurec_origin_id": "x", "same_unit": True}}), encoding="utf-8")
+            pred = root / "pred.jsonl"; pred.write_text(json.dumps({"clip_id": "clip", "t0_us": 0}) + "\n", encoding="utf-8")
+            gt = root / "gt.jsonl"; gt.write_text(json.dumps({"clip_id": "clip", "t0_us": 0}) + "\n", encoding="utf-8")
+            parquet_record = [{"source": "obstacle", "field": "key.timestamp_micros", "unit_declared": "microseconds", "unit_status": "UNIT_EXPLICIT", "unit_basis": "field_name", "clock_domain_declared": None, "count": 1, "valid_count": 1, "invalid_count": 0, "min": 0, "max": 0, "unique_count": 1, "median_step": None, "first_5": [0], "last_5": [0], "source_path": "obstacle.parquet", "evidence_type": "test"}]
+            with mock.patch("tools.data_prep.time_alignment._parquet_records", return_value=(parquet_record, {"status": "OK", "fields": ["key.timestamp_micros"]})):
+                result = audit_time_alignment(clip, "clip", pred, gt, root / "out")
+            self.assertEqual((result["evidence"]["mapping"]["status"], result["evidence"]["mapping"]["verified"]), ("ALIGNED_DIRECT", True))
+
+    def test_27_integration_malformed_input_cannot_verify(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); clip = root / "clip"; (clip / "clipgt").mkdir(parents=True)
+            pred = root / "pred.jsonl"; pred.write_text('not-json\n', encoding="utf-8")
+            gt = root / "gt.jsonl"; gt.write_text(json.dumps({"clip_id": "clip", "t0_us": 0}) + "\n", encoding="utf-8")
+            with mock.patch("tools.data_prep.time_alignment._parquet_records", return_value=([], {"status": "NOT_FOUND", "fields": []})):
+                result = audit_time_alignment(clip, "clip", pred, gt, root / "out")
+            self.assertFalse(result["evidence"]["mapping"]["verified"])
+            self.assertGreater(result["evidence"]["input_integrity"]["prediction_jsonl_error_count"], 0)
+
+    def test_28_integration_explicit_origin_mapping_resolves(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); clip = root / "clip"; (clip / "clipgt").mkdir(parents=True)
+            (clip / "data_info.json").write_text(json.dumps({"explicit_time_mapping": {"mapping_formula": "prediction_relative_us + clip_start_us = nurec_us", "source_field": "clip_start_us", "offset_us": 100, "unit_explicit": True, "origin_explicit": True}}), encoding="utf-8")
+            pred = root / "pred.jsonl"; pred.write_text(json.dumps({"clip_id": "clip", "t0_us": 0}) + "\n", encoding="utf-8")
+            gt = root / "gt.jsonl"; gt.write_text(json.dumps({"clip_id": "clip", "t0_us": 0}) + "\n", encoding="utf-8")
+            parquet_record = [{"source": "obstacle", "field": "key.timestamp_micros", "unit_declared": "microseconds", "unit_status": "UNIT_EXPLICIT", "unit_basis": "field_name", "clock_domain_declared": None, "count": 1, "valid_count": 1, "invalid_count": 0, "min": 100, "max": 100, "unique_count": 1, "median_step": None, "first_5": [100], "last_5": [100], "source_path": "obstacle.parquet", "evidence_type": "test"}]
+            with mock.patch("tools.data_prep.time_alignment._parquet_records", return_value=(parquet_record, {"status": "OK", "fields": ["key.timestamp_micros"]})):
+                result = audit_time_alignment(clip, "clip", pred, gt, root / "out")
+            self.assertEqual(result["evidence"]["mapping"]["status"], "ALIGNED_BY_EXPLICIT_METADATA")
 
 
 if __name__ == "__main__":

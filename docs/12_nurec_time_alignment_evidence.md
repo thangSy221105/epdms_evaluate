@@ -4,24 +4,26 @@ Branch: `feat/nurec-time-alignment-evidence`
 Pilot clip: `00040136-e651-4abd-991d-0655ccda9430`
 Output: `D:\300_clip_nurec\hf_probe\time_alignment_v1`
 
-## Final status
+## Pilot v2 scientific status
 
 ```text
 TIME_ALIGNMENT_STATUS = UNRESOLVED
 TIME_ALIGNMENT_VERIFIED = false
 ```
 
-The forensic tool does not infer an offset from numeric ranges, obstacle
-minimums, egomotion minimums, first sensor frames, or curve fitting. No
-verified context patch was created and no raw NuRec file was modified.
+The hardened forensic tool does not infer an offset from numeric ranges,
+obstacle minimums, egomotion minimums, first sensor frames, or curve fitting.
+No verified context patch was created and no raw NuRec file was modified.
 
 ## Answers to the ten required questions
 
-1. Prediction `t0_us` is explicitly a microsecond-valued field by its field
-   name. The prediction record does not declare a relationship between this
-   value and the NuRec clock origin.
-2. GT `t0_us` is explicitly a microsecond-valued field by its field name. The
-   GT record does not contain a waypoint timestamp contract or declared origin.
+1. Prediction has 16 conditions, common `t0_us=5100000`, and actual relative
+   waypoint timelines at `clean_waypoints[*].t_s` and
+   `guided_waypoints[*].t_s`: 64 points, 0.1 to 6.4 seconds, median step 0.1 s.
+   This is relative trajectory evidence, not a NuRec global-origin proof.
+2. GT has `t0_us=5100000` and `ego_future_xyz` with 64 timestamp-less points;
+   no GT waypoint timestamp field is present. The tool reports
+   `TIMESTAMP_IMPLICIT_BY_PIPELINE` and does not infer timestamps from index.
 3. NuRec obstacle time is `clipgt/obstacle.parquet:key.timestamp_micros`, with
    microseconds explicit in the field name.
 4. Egomotion time is
@@ -66,5 +68,6 @@ time_alignment_report.md
 ```
 
 The pilot had 16 prediction conditions, one GT record, zero verified mapping
-pairs, and final status `UNRESOLVED`. Since time alignment was not verified,
-the existing main audit was not rerun into audit_v11/prepared_v11.
+pairs, zero JSONL/parquet read errors, and final status `UNRESOLVED`. Since time
+alignment was not verified, the existing main audit was not rerun into
+audit_v11/prepared_v11.
