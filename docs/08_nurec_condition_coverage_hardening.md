@@ -2,7 +2,7 @@
 
 BASE_COMMIT: `5a6c7535e5fb3e54136ac10f924b72890e1885f6`
 BRANCH: `fix/nurec-data-prep-condition-and-coverage`
-NEW_COMMIT: implementation commit reported after commit
+NEW_COMMIT: `1933267` (`fix(data): handle prediction conditions and exact observation coverage`)
 
 This pass changes only NuRec data preparation, tests, and documentation. It
 does not modify scorer/evaluator logic, `tools/epdms` implementations, proxy
