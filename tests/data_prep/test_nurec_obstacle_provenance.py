@@ -1,6 +1,7 @@
+import math
 import unittest
 from scripts.audit_nurec_obstacle_provenance import _crosscheck, _public_trace
-from scripts.prepare_nurec_obstacles import classify_queries
+from scripts.prepare_nurec_obstacles import classify_queries, _wrap
 
 class ObstacleProvenanceTests(unittest.TestCase):
     def test_public_chain_contains_frame_and_world_steps(self):
@@ -14,5 +15,16 @@ class ObstacleProvenanceTests(unittest.TestCase):
         row=classify_queries([100],[],50)[0]; self.assertNotEqual(row["observation_state"],"EXACT_CONFIRMED_EMPTY")
     def test_sensor_like_timeline_does_not_attest_empty(self):
         rows=classify_queries([100,200],[100],50); self.assertFalse(any(r["attestation_verified"] for r in rows))
+    def test_yaw_wrap_handles_plus_minus_179_degrees(self):
+        delta=abs(_wrap(math.radians(179)-math.radians(-179)))
+        self.assertAlmostEqual(math.degrees(delta),2.0,places=6)
+    def test_yaw_wrap_identical_angles_are_zero(self):
+        self.assertEqual(_wrap(0.0),0.0)
+        self.assertEqual(_wrap(math.pi),math.pi)
+    def test_crosscheck_uses_wrapped_yaw_residual(self):
+        seq={"track_id":"a","timestamp_us":1,"center":[0,0,0],"quaternion":[0,0,math.sin(math.radians(89.5)),math.cos(math.radians(89.5))],"dimensions":[4,2,1]}
+        obs={"track_id":"a","timestamp_us":1,"center":[0,0,0],"quaternion":[0,0,math.sin(math.radians(-89.5)),math.cos(math.radians(-89.5))],"dimensions":[4,2,1]}
+        _,summary=_crosscheck([seq],[obs])
+        self.assertLess(summary["yaw_rmse_deg"],2.0)
 
 if __name__=="__main__": unittest.main()
