@@ -620,14 +620,23 @@ def _coverage_counts(required: Sequence[int], evidence: set[int], obstacles: set
     obstacle_array = np.asarray(sorted(obstacles), dtype=np.int64)
     obstacle_index = {int(value): [{}] for value in obstacles}
     confirmed_empty = set(evidence) if complete else set()
-    _, observed, empty, missing, _ = evaluate_query_coverage(required_array, obstacle_index, obstacle_array, confirmed_empty, half_step_us=tolerance_us)
-    object_queries = _matched_evidence(required, obstacles, tolerance_us) & _matched_evidence(required, evidence, tolerance_us)
-    observed = len(object_queries)
-    missing = max(0, len(required) - observed - empty)
-    exact_evidence = set(required) & set(evidence)
-    unknown = len(exact_evidence - object_queries) if not complete else 0
+    _, observed, empty, scorer_missing, _ = evaluate_query_coverage(
+        required_array, obstacle_index, obstacle_array, confirmed_empty, half_step_us=tolerance_us
+    )
+    # Object evidence is authoritative and does not require frame evidence.
+    # An exact frame attestation without an object is UNKNOWN when the table
+    # completeness is unverified; it is never confirmed empty in that case.
+    unknown = 0
     if not complete:
-        missing = max(0, missing - unknown)
+        states, _, _, _, _ = evaluate_query_coverage(
+            required_array, obstacle_index, obstacle_array, set(), half_step_us=tolerance_us
+        )
+        unknown = sum(
+            1
+            for query, state in zip(required_array.tolist(), states)
+            if int(query) in evidence and state.name != "OBSERVED_WITH_OBJECTS"
+        )
+    missing = max(0, scorer_missing - unknown)
     return {"required": len(required), "observed": observed, "empty": empty, "unknown": unknown, "missing": missing, "matched": observed + empty + unknown}
 
 
@@ -982,6 +991,8 @@ def audit_dataset(dataset_root: Path, prediction_jsonl: Path, ground_truth_jsonl
             if not coord_verified: blockers.append("COORDINATE_UNRESOLVED")
             if not obstacle_ready: blockers.append("OBSTACLE_SCHEMA_INVALID")
             if query_grid_error: blockers.append("QUERY_GRID_CONTRACT_UNRESOLVED")
+            query_grid_verified = bool(query_grid and query_grid.get("verified") is True and not query_grid_error)
+            if not query_grid_error and not query_grid_verified: blockers.append("QUERY_GRID_CONFIG_UNVERIFIED")
             if not cf_ready or not ttc_ready: blockers.append("OBSERVATION_COVERAGE_INCOMPLETE")
             if not map_summary.get("dac_geometry_verified", False):
                 if map_summary.get("status") == "FILE_NOT_FOUND":
@@ -999,7 +1010,7 @@ def audit_dataset(dataset_root: Path, prediction_jsonl: Path, ground_truth_jsonl
                     blockers.append("PARQUET_ENGINE_UNAVAILABLE")
                 else:
                     blockers.append("MAP_INVALID")
-            contracts[clip_id] = {"clip_id": clip_id, "prediction": {"raw_condition_count": condition_stats["raw_condition_count"], "unique_condition_count": condition_stats["unique_condition_count"], "duplicate_condition_count": condition_stats["duplicate_condition_count"], "modes": prediction_modes, "alphas": prediction_alphas, "t0_values": prediction_t0_values}, "time": {"t0_us": pred_t0, "source": "prediction_jsonl", "verified": time_verified}, "query_grid": query_grid or {"source": "UNRESOLVED", "verified": False, "error": query_grid_error}, "coordinate": {"prediction_frame": pframe, "prediction_frame_values": prediction_frame_values, "prediction_anchor": panchor, "prediction_anchor_values": prediction_anchor_values, "gt_frame": gframe, "gt_anchor": ganchor, "obstacle_frame": cframe, "obstacle_anchor": oanchor, "map_frame": mframe, "map_anchor": manchor, "transform_required": not coord_verified, "transform_source": transform_source, "transform_metadata_available": transform_available, "transform_chain_verified": False, "verified": coord_verified}, "observation": {"cf_ready": cf_ready, "ttc_ready": ttc_ready, "coverage_source": "independent_frame_evidence" if frame_evidence else None, "status": observation_status, "cf_counts": cf_counts, "ttc_counts": ttc_counts}, "map": {"ready": bool(map_summary.get("dac_geometry_verified", False)), "source": "clipgt", "status": map_summary["status"], "geometry_available": map_summary.get("geometry_available"), "dac_candidate_available": map_summary.get("dac_candidate_available"), "dac_geometry_verified": map_summary.get("dac_geometry_verified"), "recommended_dac_source": map_summary.get("recommended_dac_source")}, "ready_for_proxy": bool(pred_rows and gt and time_verified and not query_grid_error and coord_verified and obstacle_ready and cf_ready and ttc_ready and map_summary.get("dac_geometry_verified", False) and not blockers), "blockers": sorted(set(blockers))}
+            contracts[clip_id] = {"clip_id": clip_id, "prediction": {"raw_condition_count": condition_stats["raw_condition_count"], "unique_condition_count": condition_stats["unique_condition_count"], "duplicate_condition_count": condition_stats["duplicate_condition_count"], "modes": prediction_modes, "alphas": prediction_alphas, "t0_values": prediction_t0_values}, "time": {"t0_us": pred_t0, "source": "prediction_jsonl", "verified": time_verified}, "query_grid": query_grid or {"source": "UNRESOLVED", "verified": False, "error": query_grid_error}, "coordinate": {"prediction_frame": pframe, "prediction_frame_values": prediction_frame_values, "prediction_anchor": panchor, "prediction_anchor_values": prediction_anchor_values, "gt_frame": gframe, "gt_anchor": ganchor, "obstacle_frame": cframe, "obstacle_anchor": oanchor, "map_frame": mframe, "map_anchor": manchor, "transform_required": not coord_verified, "transform_source": transform_source, "transform_metadata_available": transform_available, "transform_chain_verified": False, "verified": coord_verified}, "observation": {"cf_ready": cf_ready, "ttc_ready": ttc_ready, "coverage_source": "independent_frame_evidence" if frame_evidence else None, "status": observation_status, "cf_counts": cf_counts, "ttc_counts": ttc_counts}, "map": {"ready": bool(map_summary.get("dac_geometry_verified", False)), "source": "clipgt", "status": map_summary["status"], "geometry_available": map_summary.get("geometry_available"), "dac_candidate_available": map_summary.get("dac_candidate_available"), "dac_geometry_verified": map_summary.get("dac_geometry_verified"), "recommended_dac_source": map_summary.get("recommended_dac_source")}, "ready_for_proxy": bool(pred_rows and gt and time_verified and query_grid_verified and coord_verified and obstacle_ready and cf_ready and ttc_ready and map_summary.get("dac_geometry_verified", False) and not blockers), "blockers": sorted(set(blockers))}
         except Exception as exc:
             errors.append({"clip_id": clip_id, "failure_stage": "audit_clip", "failure_type": type(exc).__name__, "failure_reason": str(exc)})
 

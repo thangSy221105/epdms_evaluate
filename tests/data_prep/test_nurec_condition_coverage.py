@@ -147,9 +147,9 @@ class TestNuRecConditionCoverage(unittest.TestCase):
         result = nurec._coverage_counts(required, set(required), set(), True, 0)
         self.assertEqual((result["empty"], result["missing"]), (51, 0))
 
-    def test_19_obstacle_timestamps_without_evidence_are_not_observed(self):
+    def test_19_obstacle_timestamps_without_evidence_are_observed(self):
         result = nurec._coverage_counts([1, 2], set(), {1, 2}, True, 0)
-        self.assertEqual((result["observed"], result["missing"]), (0, 2))
+        self.assertEqual((result["observed"], result["missing"]), (2, 0))
 
     def test_20_unverified_completeness_is_unknown_not_empty(self):
         result = nurec._coverage_counts([1, 2], {1, 2}, set(), False, 0)
@@ -211,8 +211,41 @@ class TestNuRecConditionCoverage(unittest.TestCase):
         self.assertEqual(result["observed"], 1)
 
     def test_28e_ttc_object_over_100ms_is_missing(self):
-        result = nurec._coverage_counts([100_000], set(), {100_101}, True, 100_000)
+        result = nurec._coverage_counts([100_000], set(), {200_001}, True, 100_000)
         self.assertEqual(result["missing"], 1)
+
+    def test_28f_cf_object_uses_tolerance_without_frame_evidence(self):
+        result = nurec._coverage_counts([100_000], set(), {100_040}, True, 50_000)
+        self.assertEqual((result["observed"], result["missing"]), (1, 0))
+
+    def test_28g_cf_object_outside_tolerance_without_frame_evidence_is_missing(self):
+        result = nurec._coverage_counts([100_000], set(), {151_000}, True, 50_000)
+        self.assertEqual((result["observed"], result["missing"]), (0, 1))
+
+    def test_28h_ttc_object_uses_tolerance_without_frame_evidence(self):
+        result = nurec._coverage_counts([100_000], set(), {199_000}, True, 100_000)
+        self.assertEqual((result["observed"], result["missing"]), (1, 0))
+
+    def test_28i_ttc_object_outside_tolerance_without_frame_evidence_is_missing(self):
+        result = nurec._coverage_counts([100_000], set(), {201_000}, True, 100_000)
+        self.assertEqual((result["observed"], result["missing"]), (0, 1))
+
+    def test_28j_exact_empty_is_not_tolerance_matched(self):
+        result = nurec._coverage_counts([100_000], {100_001}, set(), True, 50_000)
+        self.assertEqual((result["empty"], result["missing"]), (0, 1))
+
+    def test_28k_incomplete_object_is_observed(self):
+        result = nurec._coverage_counts([100_000], set(), {100_000}, False, 50_000)
+        self.assertEqual((result["observed"], result["unknown"], result["missing"]), (1, 0, 0))
+
+    def test_28l_incomplete_empty_evidence_is_unknown(self):
+        result = nurec._coverage_counts([100_000], {100_000}, set(), False, 50_000)
+        self.assertEqual((result["empty"], result["unknown"], result["missing"]), (0, 1, 0))
+
+    def test_28m_mixed_coverage_matches_scorer(self):
+        result = nurec._coverage_counts([100_000, 200_000, 300_000], {300_000}, {100_040, 200_000}, True, 50_000)
+        self.assertEqual((result["observed"], result["empty"], result["unknown"], result["missing"]), (2, 1, 0, 0))
+        self.assertEqual(result["observed"] + result["empty"] + result["unknown"] + result["missing"], result["required"])
 
     def test_29_default_query_grid_provenance_is_explicit(self):
         cf, ttc, settings = nurec._canonical_query_timestamps(0)
@@ -244,6 +277,26 @@ class TestNuRecConditionCoverage(unittest.TestCase):
             grid = result["contracts"]["clip-a"]["query_grid"]
             self.assertEqual((grid["horizon_s"], grid["cf_required_frames"], grid["ttc_horizon_s"]), (2.0, 21, 0.5))
             self.assertEqual(grid["source"], "test-config")
+
+    def test_35_no_config_adds_unverified_grid_blocker(self):
+        with tempfile.TemporaryDirectory() as td:
+            result = self._run_audit(Path(td), [self._condition()])
+            contract = result["contracts"]["clip-a"]
+            self.assertFalse(contract["query_grid"]["verified"])
+            self.assertIn("QUERY_GRID_CONFIG_UNVERIFIED", contract["blockers"])
+            self.assertFalse(contract["ready_for_proxy"])
+
+    def test_36_verified_config_has_no_unverified_grid_blocker(self):
+        with tempfile.TemporaryDirectory() as td:
+            result = self._run_audit(Path(td), [self._condition()], {"horizon_s": 4.0, "frequency_hz": 10.0, "future_poses": 40, "ttc_horizon_s": 1.0, "source": "config.json", "verified": True})
+            contract = result["contracts"]["clip-a"]
+            self.assertTrue(contract["query_grid"]["verified"])
+            self.assertNotIn("QUERY_GRID_CONFIG_UNVERIFIED", contract["blockers"])
+
+    def test_37_invalid_config_adds_contract_blocker(self):
+        with tempfile.TemporaryDirectory() as td:
+            result = self._run_audit(Path(td), [self._condition()], {"horizon_s": 0, "frequency_hz": 10.0, "future_poses": 0, "ttc_horizon_s": 1.0, "source": "bad.json", "verified": True})
+            self.assertIn("QUERY_GRID_CONTRACT_UNRESOLVED", result["contracts"]["clip-a"]["blockers"])
 
 
 if __name__ == "__main__":
