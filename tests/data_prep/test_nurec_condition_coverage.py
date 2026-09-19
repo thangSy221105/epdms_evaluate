@@ -4,6 +4,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import numpy as np
+
 from tools.data_prep import nurec
 
 
@@ -11,7 +13,7 @@ class TestNuRecConditionCoverage(unittest.TestCase):
     def _condition(self, clip="clip-a", mode="cross_scene", alpha=0.0, t0=100):
         return {"clip_id": clip, "mode": mode, "alpha": alpha, "t0_us": t0, "coordinate_frame": "ego", "reference_point": "rear"}
 
-    def _run_audit(self, root, prediction_rows):
+    def _run_audit(self, root, prediction_rows, evaluation_config=None):
         clip = root / "clip-a"
         (clip / "clipgt").mkdir(parents=True)
         pred = root / "pred.jsonl"
@@ -19,15 +21,16 @@ class TestNuRecConditionCoverage(unittest.TestCase):
         pred.write_text("\n".join(json.dumps(row) for row in prediction_rows) + "\n", encoding="utf-8")
         gt.write_text(json.dumps({"clip_id": "clip-a", "t0_us": 100, "future_frame": "ego"}) + "\n", encoding="utf-8")
         with mock.patch.object(nurec, "_parquet_timestamp_summary", return_value={"status": "OK", "row_count": 0, "min": 100, "max": 200, "unique_count": 0, "field": "key.timestamp_micros"}), mock.patch.object(nurec, "_parquet_clip_interval_summary", return_value={"status": "OK", "min": 100, "max": 200}), mock.patch.object(nurec, "_parquet_timestamp_values", return_value=set()), mock.patch.object(nurec, "_map_status", return_value={"status": "FILE_NOT_FOUND", "ready": False, "dac_candidate_available": False, "dac_geometry_verified": False}):
-            return nurec.audit_dataset(root, pred, gt, root / "audit")
+            return nurec.audit_dataset(root, pred, gt, root / "audit", evaluation_config=evaluation_config)
 
     def test_01_sixteen_conditions_same_clip_are_kept(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "pred.jsonl"
             rows = [self._condition(alpha=alpha, mode=mode) for mode in ("cross_scene", "noisy", "opposite_action", "no_reasoning") for alpha in (0, 0.5, 1, 2)]
             path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
-            result, errors, duplicates, _ = nurec._load_prediction_conditions(path)
+            result, errors, duplicates, _, stats = nurec._load_prediction_conditions(path)
             self.assertEqual(len(result["clip-a"]), 16)
+            self.assertEqual(stats["clip-a"], {"raw_condition_count": 16, "unique_condition_count": 16, "duplicate_condition_count": 0})
             self.assertEqual(duplicates, [])
             self.assertEqual(errors, [])
 
@@ -35,7 +38,7 @@ class TestNuRecConditionCoverage(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "pred.jsonl"
             path.write_text("\n".join(json.dumps(self._condition(mode=mode)) for mode in ("cross_scene", "noisy")) + "\n", encoding="utf-8")
-            result, _, duplicates, _ = nurec._load_prediction_conditions(path)
+            result, _, duplicates, _, _ = nurec._load_prediction_conditions(path)
             self.assertEqual(len(result["clip-a"]), 2)
             self.assertFalse(duplicates)
 
@@ -43,7 +46,7 @@ class TestNuRecConditionCoverage(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "pred.jsonl"
             path.write_text("\n".join(json.dumps(self._condition(alpha=alpha)) for alpha in (0, 0.5)) + "\n", encoding="utf-8")
-            result, _, duplicates, _ = nurec._load_prediction_conditions(path)
+            result, _, duplicates, _, _ = nurec._load_prediction_conditions(path)
             self.assertEqual(len(result["clip-a"]), 2)
             self.assertFalse(duplicates)
 
@@ -52,16 +55,18 @@ class TestNuRecConditionCoverage(unittest.TestCase):
             path = Path(td) / "pred.jsonl"
             row = self._condition(alpha=0.5)
             path.write_text(json.dumps(row) + "\n" + json.dumps(row) + "\n", encoding="utf-8")
-            result, errors, duplicates, _ = nurec._load_prediction_conditions(path)
-            self.assertEqual(len(result["clip-a"]), 2)
+            result, errors, duplicates, _, stats = nurec._load_prediction_conditions(path)
+            self.assertEqual(len(result["clip-a"]), 1)
             self.assertEqual(duplicates, ["clip-a|cross_scene|0.5"])
             self.assertEqual(errors[-1]["failure_type"], "PREDICTION_CONDITION_DUPLICATE")
+            self.assertEqual(stats["clip-a"]["raw_condition_count"], 2)
+            self.assertEqual(stats["clip-a"]["unique_condition_count"], 1)
 
     def test_05_missing_mode_is_identity_error(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "pred.jsonl"
             path.write_text(json.dumps({"clip_id": "clip-a", "alpha": 0}) + "\n", encoding="utf-8")
-            result, errors, _, identity_errors = nurec._load_prediction_conditions(path)
+            result, errors, _, identity_errors, _ = nurec._load_prediction_conditions(path)
             self.assertFalse(result)
             self.assertEqual(errors[0]["failure_type"], "PREDICTION_IDENTITY_INVALID")
             self.assertIn("MISSING_MODE", errors[0]["failure_reason"])
@@ -71,14 +76,14 @@ class TestNuRecConditionCoverage(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "pred.jsonl"
             path.write_text(json.dumps({"clip_id": "clip-a", "mode": "noisy"}) + "\n", encoding="utf-8")
-            _, errors, _, _ = nurec._load_prediction_conditions(path)
+            _, errors, _, _, _ = nurec._load_prediction_conditions(path)
             self.assertIn("MISSING_ALPHA", errors[0]["failure_reason"])
 
     def test_07_nonfinite_alpha_is_identity_error(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "pred.jsonl"
             path.write_text(json.dumps({"clip_id": "clip-a", "mode": "noisy", "alpha": "NaN"}) + "\n", encoding="utf-8")
-            _, errors, _, _ = nurec._load_prediction_conditions(path)
+            _, errors, _, _, _ = nurec._load_prediction_conditions(path)
             self.assertIn("INVALID_ALPHA", errors[0]["failure_reason"])
 
     def test_08_common_t0_is_returned(self):
@@ -172,13 +177,73 @@ class TestNuRecConditionCoverage(unittest.TestCase):
             _, errors, _ = nurec._jsonl_index_with_errors(path, "ground_truth")
             self.assertEqual(errors[0]["failure_type"], "MISSING_CLIP_ID")
 
-    def test_25_timestamp_matching_uses_tolerance(self):
+    def test_25_empty_evidence_requires_exact_timestamp(self):
         result = nurec._coverage_counts([100_000], {100_040}, set(), True, 50)
-        self.assertEqual(result["matched"], 1)
+        self.assertEqual((result["empty"], result["missing"]), (0, 1))
 
-    def test_26_timestamp_outside_tolerance_is_missing(self):
-        result = nurec._coverage_counts([100_000], {100_051}, set(), True, 50)
+    def test_26_object_timestamp_uses_tolerance(self):
+        result = nurec._coverage_counts([100_000], {100_000}, {100_040}, True, 50_000)
+        self.assertEqual(result["observed"], 1)
+
+    def test_27_object_timestamp_outside_tolerance_is_missing(self):
+        result = nurec._coverage_counts([100_000], set(), {100_051}, True, 50)
         self.assertEqual(result["missing"], 1)
+
+    def test_28_coverage_matches_scorer_exact_empty_semantics(self):
+        from tools.epdms.observation_contract import evaluate_query_coverage
+        query = np.asarray([100_000, 200_000], dtype=np.int64)
+        obs_by_time = {200_049: [{}]}
+        obs_ts = np.asarray([200_049], dtype=np.int64)
+        _, observed, empty, missing, _ = evaluate_query_coverage(query, obs_by_time, obs_ts, {100_040}, half_step_us=50_000)
+        result = nurec._coverage_counts([100_000, 200_000], {100_040, 200_000}, {200_049}, True, 50_000)
+        self.assertEqual((result["observed"], result["empty"], result["missing"]), (observed, empty, missing))
+
+    def test_28b_object_wins_over_empty_when_both_cover_query(self):
+        result = nurec._coverage_counts([100_000], {100_000}, {100_049}, True, 50_000)
+        self.assertEqual((result["observed"], result["empty"]), (1, 0))
+
+    def test_28c_ttc_empty_requires_exact_timestamp(self):
+        result = nurec._coverage_counts([100_000], {100_099}, set(), True, 100_000)
+        self.assertEqual((result["empty"], result["missing"]), (0, 1))
+
+    def test_28d_ttc_object_uses_100ms_tolerance(self):
+        result = nurec._coverage_counts([100_000], {100_000}, {100_099}, True, 100_000)
+        self.assertEqual(result["observed"], 1)
+
+    def test_28e_ttc_object_over_100ms_is_missing(self):
+        result = nurec._coverage_counts([100_000], set(), {100_101}, True, 100_000)
+        self.assertEqual(result["missing"], 1)
+
+    def test_29_default_query_grid_provenance_is_explicit(self):
+        cf, ttc, settings = nurec._canonical_query_timestamps(0)
+        self.assertEqual(len(cf), 41)
+        self.assertEqual(len(ttc), 51)
+        self.assertEqual(settings["source"], "DEFAULT_EVALUATION_CONFIG")
+        self.assertFalse(settings["verified"])
+
+    def test_30_nondefault_horizon_changes_cf_grid(self):
+        cf, _, settings = nurec._canonical_query_timestamps(0, {"horizon_s": 2.0, "frequency_hz": 10.0, "future_poses": 20, "ttc_horizon_s": 1.0, "source": "test", "verified": True})
+        self.assertEqual(len(cf), 21)
+        self.assertEqual(settings["horizon_s"], 2.0)
+
+    def test_31_nondefault_frequency_changes_cf_grid(self):
+        cf, _, _ = nurec._canonical_query_timestamps(0, {"horizon_s": 4.0, "frequency_hz": 5.0, "future_poses": 20, "ttc_horizon_s": 1.0, "source": "test", "verified": True})
+        self.assertEqual(len(cf), 21)
+
+    def test_32_nondefault_ttc_horizon_changes_projection_grid(self):
+        _, ttc, _ = nurec._canonical_query_timestamps(0, {"horizon_s": 4.0, "frequency_hz": 10.0, "future_poses": 40, "ttc_horizon_s": 0.5, "source": "test", "verified": True})
+        self.assertEqual(len(ttc), 45)
+
+    def test_33_invalid_query_settings_fail_closed(self):
+        with self.assertRaises(ValueError):
+            nurec._canonical_query_timestamps(0, {"horizon_s": 0, "frequency_hz": 10, "future_poses": 0, "ttc_horizon_s": 1, "source": "test", "verified": True})
+
+    def test_34_query_grid_provenance_is_written_to_contract(self):
+        with tempfile.TemporaryDirectory() as td:
+            result = self._run_audit(Path(td), [self._condition()], {"horizon_s": 2.0, "frequency_hz": 10.0, "future_poses": 20, "ttc_horizon_s": 0.5, "source": "test-config", "verified": True})
+            grid = result["contracts"]["clip-a"]["query_grid"]
+            self.assertEqual((grid["horizon_s"], grid["cf_required_frames"], grid["ttc_horizon_s"]), (2.0, 21, 0.5))
+            self.assertEqual(grid["source"], "test-config")
 
 
 if __name__ == "__main__":

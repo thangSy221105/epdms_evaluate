@@ -21,10 +21,10 @@ formula, NAVSIM, clocks, coordinate transforms, DAC conversion, or raw data.
   frame/anchor metadata values are included in inventory/contracts. Conflicting
   condition t0 values produce `PREDICTION_T0_CONFLICT`; inconsistent
   frame/anchor metadata produces `PREDICTION_COORDINATE_METADATA_CONFLICT`.
-- Observation coverage is calculated against the current 10 Hz/4 s CF grid
-  and the scorer's `build_ttc_projection_timestamps` grid. Evidence timestamps
-  are normalized to a finite integer set, deduplicated, and matched with the
-  scorer's 50 ms CF / 100 ms TTC tolerances.
+- Observation coverage is calculated against the effective CF grid and the
+  scorer's `build_ttc_projection_timestamps` grid. Object timestamps use the
+  scorer's 50 ms CF / 100 ms TTC tolerances; confirmed-empty evidence requires
+  an exact query timestamp.
 - Coverage is not certified until time alignment is verified. Partial evidence
   reports observed, empty, unknown, and missing counts separately. Obstacle
   timestamps never substitute for independent frame evidence.
@@ -78,3 +78,6 @@ compileall            = passed
 
 No raw NuRec file was edited, and the existing untracked user files were not
 staged.
+
+The final contract-sync pass supersedes the v7 probe with schema_v6/audit_v8/
+prepared_v8 and adds effective-config provenance plus scorer-parity tests.

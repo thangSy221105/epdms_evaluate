@@ -433,15 +433,16 @@ def _jsonl_index_with_errors(path: Optional[Path], source: str) -> Tuple[Dict[st
     return result, errors, sorted(set(duplicates))
 
 
-def _load_prediction_conditions(path: Optional[Path]) -> Tuple[Dict[str, List[Dict[str, Any]]], List[Dict[str, Any]], List[str], Dict[str, List[Dict[str, Any]]]]:
+def _load_prediction_conditions(path: Optional[Path]) -> Tuple[Dict[str, List[Dict[str, Any]]], List[Dict[str, Any]], List[str], Dict[str, List[Dict[str, Any]]], Dict[str, Dict[str, int]]]:
     """Load all prediction conditions; uniqueness is clip|mode|alpha."""
     predictions: Dict[str, List[Dict[str, Any]]] = {}
     errors: List[Dict[str, Any]] = []
     duplicate_keys: List[str] = []
     identity_errors: Dict[str, List[Dict[str, Any]]] = {}
     seen_keys: set[str] = set()
+    stats: Dict[str, Dict[str, int]] = {}
     if path is None or not path.is_file():
-        return predictions, errors, duplicate_keys, identity_errors
+        return predictions, errors, duplicate_keys, identity_errors, stats
     with path.open("r", encoding="utf-8-sig") as handle:
         for line_number, line in enumerate(handle, 1):
             if not line.strip():
@@ -478,12 +479,17 @@ def _load_prediction_conditions(path: Optional[Path]) -> Tuple[Dict[str, List[Di
                 identity_errors.setdefault(clip_id, []).append(error)
                 continue
             normalized["alpha"] = identity.alpha
-            predictions.setdefault(clip_id, []).append(normalized)
+            clip_stats = stats.setdefault(clip_id, {"raw_condition_count": 0, "unique_condition_count": 0, "duplicate_condition_count": 0})
+            clip_stats["raw_condition_count"] += 1
             if identity.record_key in seen_keys:
                 duplicate_keys.append(identity.record_key)
+                clip_stats["duplicate_condition_count"] += 1
                 errors.append({"source": "prediction", "line_number": line_number, "clip_id": clip_id, "failure_type": "PREDICTION_CONDITION_DUPLICATE", "failure_reason": identity.record_key})
+            else:
+                predictions.setdefault(clip_id, []).append(normalized)
+                clip_stats["unique_condition_count"] += 1
             seen_keys.add(identity.record_key)
-    return predictions, errors, sorted(set(duplicate_keys)), identity_errors
+    return predictions, errors, sorted(set(duplicate_keys)), identity_errors, stats
 
 
 def _first(row: Mapping[str, Any], keys: Sequence[str]) -> Optional[str]:
@@ -535,19 +541,31 @@ def _condition_first_values(rows: Sequence[Mapping[str, Any]], keys: Sequence[st
     return list(dict.fromkeys(values))
 
 
-def _canonical_query_timestamps(t0_us: int) -> Tuple[List[int], List[int]]:
-    """Build the current 10 Hz/4 s CF grid and scorer TTC projection grid."""
-    try:
-        import numpy as np
-        from tools.epdms.config import EvaluationConfig
+def _query_grid_settings(evaluation_config: Any = None) -> Dict[str, Any]:
+    if evaluation_config is None:
+        return {"horizon_s": 4.0, "frequency_hz": 10.0, "future_poses": 40, "ttc_horizon_s": 1.0, "source": "DEFAULT_EVALUATION_CONFIG", "verified": False}
+    values = evaluation_config if isinstance(evaluation_config, Mapping) else {name: getattr(evaluation_config, name) for name in ("horizon_s", "frequency_hz", "future_poses", "ttc_horizon_s") if hasattr(evaluation_config, name)}
+    horizon_s = float(values["horizon_s"])
+    frequency_hz = float(values["frequency_hz"])
+    future_poses = int(values.get("future_poses", round(horizon_s * frequency_hz)))
+    ttc_horizon_s = float(values["ttc_horizon_s"])
+    if not math.isfinite(horizon_s) or not math.isfinite(frequency_hz) or not math.isfinite(ttc_horizon_s) or horizon_s <= 0 or frequency_hz <= 0 or ttc_horizon_s < 0 or future_poses < 1:
+        raise ValueError("QUERY_GRID_CONTRACT_UNRESOLVED: invalid effective evaluation settings")
+    source = str(values.get("source") or getattr(evaluation_config, "config_path", None) or "EFFECTIVE_EVALUATION_CONFIG")
+    return {"horizon_s": horizon_s, "frequency_hz": frequency_hz, "future_poses": future_poses, "ttc_horizon_s": ttc_horizon_s, "source": source, "verified": bool(values.get("verified", evaluation_config is not None))}
 
-        config = EvaluationConfig({})
-        cf = [int(t0_us) + int(round(index * 1_000_000 / config.frequency_hz)) for index in range(config.future_poses + 1)]
-        ttc = build_ttc_projection_timestamps(np.asarray(cf, dtype=np.int64), config.ttc_horizon_s)
-        return cf, [int(value) for value in ttc.tolist()]
-    except Exception:
-        cf = [int(t0_us) + index * 100_000 for index in range(41)]
-        return cf, [int(t0_us) + index * 100_000 for index in range(51)]
+
+def _canonical_query_timestamps(t0_us: int, evaluation_config: Any = None) -> Tuple[List[int], List[int], Dict[str, Any]]:
+    """Build CF and scorer TTC grids from one effective, auditable config."""
+    import numpy as np
+
+    settings = _query_grid_settings(evaluation_config)
+    cf = [int(t0_us) + int(round(index * 1_000_000 / settings["frequency_hz"])) for index in range(settings["future_poses"] + 1)]
+    ttc = build_ttc_projection_timestamps(np.asarray(cf, dtype=np.int64), settings["ttc_horizon_s"])
+    settings["cf_required_frames"] = len(cf)
+    settings["ttc_required_queries"] = len(ttc)
+    settings["query_grid_fingerprint"] = json.dumps({key: settings[key] for key in ("horizon_s", "frequency_hz", "future_poses", "ttc_horizon_s")}, sort_keys=True, separators=(",", ":"))
+    return cf, [int(value) for value in ttc.tolist()], settings
 
 
 def _parquet_timestamp_values(path: Path) -> set[int]:
@@ -594,17 +612,23 @@ def _normalize_frame_evidence(context: Mapping[str, Any]) -> set[int]:
 
 
 def _coverage_counts(required: Sequence[int], evidence: set[int], obstacles: set[int], complete: bool, tolerance_us: int) -> Dict[str, Any]:
-    matched = _matched_evidence(required, evidence, tolerance_us)
-    object_queries = _matched_evidence(required, obstacles, tolerance_us)
-    observed = len(matched & object_queries)
-    if complete:
-        empty = len(matched - object_queries)
-        unknown = 0
-    else:
-        empty = 0
-        unknown = len(matched - object_queries)
-    missing = len(set(required) - matched)
-    return {"required": len(required), "observed": observed, "empty": empty, "unknown": unknown, "missing": missing, "matched": len(matched)}
+    """Mirror evaluate_query_coverage: object matching may be tolerant, empty is exact."""
+    import numpy as np
+    from tools.epdms.observation_contract import evaluate_query_coverage
+
+    required_array = np.asarray(list(required), dtype=np.int64)
+    obstacle_array = np.asarray(sorted(obstacles), dtype=np.int64)
+    obstacle_index = {int(value): [{}] for value in obstacles}
+    confirmed_empty = set(evidence) if complete else set()
+    _, observed, empty, missing, _ = evaluate_query_coverage(required_array, obstacle_index, obstacle_array, confirmed_empty, half_step_us=tolerance_us)
+    object_queries = _matched_evidence(required, obstacles, tolerance_us) & _matched_evidence(required, evidence, tolerance_us)
+    observed = len(object_queries)
+    missing = max(0, len(required) - observed - empty)
+    exact_evidence = set(required) & set(evidence)
+    unknown = len(exact_evidence - object_queries) if not complete else 0
+    if not complete:
+        missing = max(0, missing - unknown)
+    return {"required": len(required), "observed": observed, "empty": empty, "unknown": unknown, "missing": missing, "matched": observed + empty + unknown}
 
 
 def _parquet_timestamp_summary(path: Path) -> Dict[str, Any]:
@@ -829,9 +853,9 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
             writer.writerow({key: json.dumps(value, ensure_ascii=False, default=_json_default) if isinstance(value, (list, dict)) else value for key, value in row.items()})
 
 
-def audit_dataset(dataset_root: Path, prediction_jsonl: Path, ground_truth_jsonl: Path, output_dir: Path, context_jsonl: Optional[Path] = None) -> Dict[str, Any]:
+def audit_dataset(dataset_root: Path, prediction_jsonl: Path, ground_truth_jsonl: Path, output_dir: Path, context_jsonl: Optional[Path] = None, evaluation_config: Any = None) -> Dict[str, Any]:
     clips, duplicate_ids = discover_clip_dirs(dataset_root)
-    predictions_by_clip, prediction_errors, prediction_condition_duplicates, prediction_identity_errors = _load_prediction_conditions(prediction_jsonl)
+    predictions_by_clip, prediction_errors, prediction_condition_duplicates, prediction_identity_errors, prediction_condition_stats = _load_prediction_conditions(prediction_jsonl)
     ground_truth, ground_truth_errors, ground_truth_duplicates = _jsonl_index_with_errors(ground_truth_jsonl, "ground_truth")
     contexts, context_errors, context_duplicates = _jsonl_index_with_errors(context_jsonl, "context")
     engine = parquet_engine()
@@ -865,7 +889,8 @@ def audit_dataset(dataset_root: Path, prediction_jsonl: Path, ground_truth_jsonl
             present = {_inventory_field(name): (clip_dir / name).is_file() for name in REQUIRED_CLIP_FILES}
             prediction_modes = sorted({str(row.get("mode")) for row in pred_rows})
             prediction_alphas = sorted({float(row.get("alpha")) for row in pred_rows})
-            inventory.append({"clip_id": clip_id, "prediction_exists": bool(pred_rows), "ground_truth_exists": bool(gt), "prediction_condition_count": len(pred_rows), "prediction_unique_condition_count": len({f"{clip_id}|{row.get('mode')}|{float(row.get('alpha')):g}" for row in pred_rows}), "prediction_modes": prediction_modes, "prediction_alphas": prediction_alphas, "prediction_t0_values": prediction_t0_values, "prediction_frame_values": prediction_frame_values, "prediction_anchor_values": prediction_anchor_values, **present, "duplicate_clip_id": clip_id in duplicate_ids, "prediction_condition_duplicate": clip_id in {key.split("|", 1)[0] for key in prediction_condition_duplicates}, "ground_truth_duplicate": clip_id in ground_truth_duplicates, "context_duplicate": clip_id in context_duplicates})
+            condition_stats = prediction_condition_stats.get(clip_id, {"raw_condition_count": 0, "unique_condition_count": 0, "duplicate_condition_count": 0})
+            inventory.append({"clip_id": clip_id, "prediction_exists": bool(pred_rows), "ground_truth_exists": bool(gt), "prediction_raw_condition_count": condition_stats["raw_condition_count"], "prediction_unique_condition_count": condition_stats["unique_condition_count"], "prediction_duplicate_condition_count": condition_stats["duplicate_condition_count"], "prediction_condition_count": len(pred_rows), "prediction_modes": prediction_modes, "prediction_alphas": prediction_alphas, "prediction_t0_values": prediction_t0_values, "prediction_frame_values": prediction_frame_values, "prediction_anchor_values": prediction_anchor_values, **present, "duplicate_clip_id": clip_id in duplicate_ids, "prediction_condition_duplicate": clip_id in {key.split("|", 1)[0] for key in prediction_condition_duplicates}, "ground_truth_duplicate": clip_id in ground_truth_duplicates, "context_duplicate": clip_id in context_duplicates})
             pred_t0, gt_t0 = common_pred_t0, _row_t0(gt)
             obstacle_summary = _parquet_timestamp_summary(clip_dir / "clipgt/obstacle.parquet")
             obstacle_details = _obstacle_inventory(clip_dir / "clipgt/obstacle.parquet") if (clip_dir / "clipgt/obstacle.parquet").is_file() and obstacle_summary.get("status") == "OK" else {}
@@ -907,7 +932,16 @@ def audit_dataset(dataset_root: Path, prediction_jsonl: Path, ground_truth_jsonl
             obstacle_ready = obstacle_summary.get("status") == "OK" and obstacle_summary.get("field") is not None
             obstacle_rows.append({"clip_id": clip_id, "obstacle_row_count": obstacle_summary.get("row_count"), "valid_row_count": obstacle_summary.get("valid_row_count"), "invalid_row_count": obstacle_summary.get("invalid_row_count"), "unique_timestamp_count": obstacle_summary.get("unique_timestamp_count", obstacle_summary.get("unique_count")), "min_timestamp": obstacle_summary.get("min_timestamp", obstacle_min), "max_timestamp": obstacle_summary.get("max_timestamp", obstacle_max), "selected_timestamp_field": obstacle_summary.get("selected_timestamp_field"), "unique_track_count": obstacle_summary.get("unique_track_count"), "categories": obstacle_summary.get("categories"), "missing_timestamp_count": obstacle_summary.get("missing_timestamp_count"), "invalid_track_id_count": obstacle_summary.get("invalid_track_id_count"), "invalid_category_count": obstacle_summary.get("invalid_category_count"), "invalid_center_count": obstacle_summary.get("invalid_center_count"), "invalid_size_count": obstacle_summary.get("invalid_size_count"), "invalid_orientation_count": obstacle_summary.get("invalid_orientation_count"), "status": obstacle_summary.get("status")})
             time_verified = status in {"ALIGNED_DIRECT", "ALIGNED_BY_EXPLICIT_METADATA"} and prediction_t0_consistent
-            cf_required, ttc_required = _canonical_query_timestamps(pred_t0) if time_verified and pred_t0 is not None else ([], [])
+            query_grid_error = None
+            if pred_t0 is not None:
+                try:
+                    grid_cf, grid_ttc, query_grid = _canonical_query_timestamps(pred_t0, evaluation_config)
+                    cf_required, ttc_required = (grid_cf, grid_ttc) if time_verified else ([], [])
+                except Exception as exc:
+                    cf_required, ttc_required, query_grid = [], [], None
+                    query_grid_error = f"{type(exc).__name__}: {exc}"
+            else:
+                cf_required, ttc_required, query_grid = [], [], None
             frame_evidence = _normalize_frame_evidence(context)
             completeness_verified = bool(context.get("obstacle_table_complete") is True or context.get("observation_completeness_verified") is True or isinstance(context.get("observation_contract"), dict) and context["observation_contract"].get("complete") is True)
             obstacle_timestamp_values = _parquet_timestamp_values(clip_dir / "clipgt/obstacle.parquet") if obstacle_ready else set()
@@ -915,7 +949,9 @@ def audit_dataset(dataset_root: Path, prediction_jsonl: Path, ground_truth_jsonl
             ttc_counts = _coverage_counts(ttc_required, frame_evidence, obstacle_timestamp_values, completeness_verified and obstacle_ready, 100_000) if time_verified else {"required": None, "observed": None, "empty": None, "unknown": None, "missing": None, "matched": None}
             cf_ready = bool(time_verified and completeness_verified and obstacle_ready and cf_counts["missing"] == 0 and cf_counts["unknown"] == 0)
             ttc_ready = bool(time_verified and completeness_verified and obstacle_ready and ttc_counts["missing"] == 0 and ttc_counts["unknown"] == 0)
-            if not time_verified:
+            if query_grid_error:
+                observation_status = "QUERY_GRID_BUILD_ERROR"
+            elif not time_verified:
                 observation_status = "TIME_ALIGNMENT_UNRESOLVED"
             elif not frame_evidence:
                 observation_status = "UNKNOWN"
@@ -945,6 +981,7 @@ def audit_dataset(dataset_root: Path, prediction_jsonl: Path, ground_truth_jsonl
             if status not in {"ALIGNED_DIRECT", "ALIGNED_BY_EXPLICIT_METADATA"}: blockers.append("TIME_ALIGNMENT_UNRESOLVED")
             if not coord_verified: blockers.append("COORDINATE_UNRESOLVED")
             if not obstacle_ready: blockers.append("OBSTACLE_SCHEMA_INVALID")
+            if query_grid_error: blockers.append("QUERY_GRID_CONTRACT_UNRESOLVED")
             if not cf_ready or not ttc_ready: blockers.append("OBSERVATION_COVERAGE_INCOMPLETE")
             if not map_summary.get("dac_geometry_verified", False):
                 if map_summary.get("status") == "FILE_NOT_FOUND":
@@ -962,7 +999,7 @@ def audit_dataset(dataset_root: Path, prediction_jsonl: Path, ground_truth_jsonl
                     blockers.append("PARQUET_ENGINE_UNAVAILABLE")
                 else:
                     blockers.append("MAP_INVALID")
-            contracts[clip_id] = {"clip_id": clip_id, "prediction": {"condition_count": len(pred_rows), "unique_condition_count": len({f"{clip_id}|{row.get('mode')}|{float(row.get('alpha')):g}" for row in pred_rows}), "modes": prediction_modes, "alphas": prediction_alphas, "t0_values": prediction_t0_values}, "time": {"t0_us": pred_t0, "source": "prediction_jsonl", "verified": time_verified}, "coordinate": {"prediction_frame": pframe, "prediction_frame_values": prediction_frame_values, "prediction_anchor": panchor, "prediction_anchor_values": prediction_anchor_values, "gt_frame": gframe, "gt_anchor": ganchor, "obstacle_frame": cframe, "obstacle_anchor": oanchor, "map_frame": mframe, "map_anchor": manchor, "transform_required": not coord_verified, "transform_source": transform_source, "transform_metadata_available": transform_available, "transform_chain_verified": False, "verified": coord_verified}, "observation": {"cf_ready": cf_ready, "ttc_ready": ttc_ready, "coverage_source": "independent_frame_evidence" if frame_evidence else None, "status": observation_status, "cf_counts": cf_counts, "ttc_counts": ttc_counts}, "map": {"ready": bool(map_summary.get("dac_geometry_verified", False)), "source": "clipgt", "status": map_summary["status"], "geometry_available": map_summary.get("geometry_available"), "dac_candidate_available": map_summary.get("dac_candidate_available"), "dac_geometry_verified": map_summary.get("dac_geometry_verified"), "recommended_dac_source": map_summary.get("recommended_dac_source")}, "ready_for_proxy": bool(pred_rows and gt and time_verified and coord_verified and obstacle_ready and cf_ready and ttc_ready and map_summary.get("dac_geometry_verified", False) and not blockers), "blockers": sorted(set(blockers))}
+            contracts[clip_id] = {"clip_id": clip_id, "prediction": {"raw_condition_count": condition_stats["raw_condition_count"], "unique_condition_count": condition_stats["unique_condition_count"], "duplicate_condition_count": condition_stats["duplicate_condition_count"], "modes": prediction_modes, "alphas": prediction_alphas, "t0_values": prediction_t0_values}, "time": {"t0_us": pred_t0, "source": "prediction_jsonl", "verified": time_verified}, "query_grid": query_grid or {"source": "UNRESOLVED", "verified": False, "error": query_grid_error}, "coordinate": {"prediction_frame": pframe, "prediction_frame_values": prediction_frame_values, "prediction_anchor": panchor, "prediction_anchor_values": prediction_anchor_values, "gt_frame": gframe, "gt_anchor": ganchor, "obstacle_frame": cframe, "obstacle_anchor": oanchor, "map_frame": mframe, "map_anchor": manchor, "transform_required": not coord_verified, "transform_source": transform_source, "transform_metadata_available": transform_available, "transform_chain_verified": False, "verified": coord_verified}, "observation": {"cf_ready": cf_ready, "ttc_ready": ttc_ready, "coverage_source": "independent_frame_evidence" if frame_evidence else None, "status": observation_status, "cf_counts": cf_counts, "ttc_counts": ttc_counts}, "map": {"ready": bool(map_summary.get("dac_geometry_verified", False)), "source": "clipgt", "status": map_summary["status"], "geometry_available": map_summary.get("geometry_available"), "dac_candidate_available": map_summary.get("dac_candidate_available"), "dac_geometry_verified": map_summary.get("dac_geometry_verified"), "recommended_dac_source": map_summary.get("recommended_dac_source")}, "ready_for_proxy": bool(pred_rows and gt and time_verified and not query_grid_error and coord_verified and obstacle_ready and cf_ready and ttc_ready and map_summary.get("dac_geometry_verified", False) and not blockers), "blockers": sorted(set(blockers))}
         except Exception as exc:
             errors.append({"clip_id": clip_id, "failure_stage": "audit_clip", "failure_type": type(exc).__name__, "failure_reason": str(exc)})
 
