@@ -5,6 +5,24 @@ from pathlib import Path
 import numpy as np
 
 try:
+    from scipy.spatial.transform import Rotation as SciPyRotation
+    from scipy.spatial import ConvexHull as SciPyConvexHull
+    SCIPY_AVAILABLE = True
+except ModuleNotFoundError:
+    SciPyRotation = None
+    SciPyConvexHull = None
+    SCIPY_AVAILABLE = False
+
+try:
+    from ncore.impl.common.transformations import bbox_pose as ncore_bbox_pose
+    from ncore.impl.common.transformations import transform_bbox as ncore_transform_bbox
+    from ncore.impl.common.transformations import pose_bbox as ncore_pose_bbox
+    NCORE_RUNTIME_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    ncore_bbox_pose = ncore_transform_bbox = ncore_pose_bbox = None
+    NCORE_RUNTIME_AVAILABLE = False
+
+try:
     from scripts.audit_nurec_coordinate_alignment import _mm,_pose,_rquat,interpolate_pose
     from scripts.audit_pai_obstacle_offline import PILOT_CLIPS
     from scripts.prepare_nurec_obstacles import load_sequence_tracks,load_time_record,pose_yaw,_wrap,_csv,_dump
@@ -66,8 +84,21 @@ def bbox_pose_transform(b,t):
 def matrix_to_q(m): return _rquat(np.asarray(m)[:3,:3].tolist())
 def corners(c,q,dims):
     r=quat_matrix(q); signs=np.asarray([[sx,sy,sz] for sx in (-1,1) for sy in (-1,1) for sz in (-1,1)],float); return np.asarray(c)+(signs*np.asarray(dims)/2.0)@r.T
+def convex_hull_xy(points):
+    pts=sorted({(float(p[0]),float(p[1])) for p in np.asarray(points,float)})
+    if len(pts)<=1:return np.asarray(pts,float)
+    def cross(o,a,b):return (a[0]-o[0])*(b[1]-o[1])-(a[1]-o[1])*(b[0]-o[0])
+    lower=[]
+    for p in pts:
+        while len(lower)>=2 and cross(lower[-2],lower[-1],p)<=1e-12:lower.pop()
+        lower.append(p)
+    upper=[]
+    for p in reversed(pts):
+        while len(upper)>=2 and cross(upper[-2],upper[-1],p)<=1e-12:upper.pop()
+        upper.append(p)
+    return np.asarray(lower[:-1]+upper[:-1],float)
 def bev(c,q,dims):
-    r=quat_matrix(q); signs=np.asarray([[-1,-1],[1,-1],[1,1],[-1,1]],float); return np.asarray(c)[:2]+(signs*np.asarray(dims)[:2]/2.0)@r[:2,:2].T
+    return convex_hull_xy(corners(c,q,dims)[:,:2])
 def set_rmse(a,b):
     return assignment_rmse(a,b)
 def polygon_area(p):
@@ -112,30 +143,59 @@ def main():
         for raw_idx,r,key in selected:
             mapped=key[1]+rec["offset_us"]; target=lm.get((key[0],mapped));
             if target is None:continue
-            p=interpolate_pose(poses,int(r["reference_frame_timestamp_us"])); ego_local=np.asarray(reb)@np.asarray(p); b=bbox_from_raw(r); direct=ego_local@bbox_pose_np(b); nvidia=bbox_pose_transform(b,ego_local); nvidia_f=np.asarray(nvidia,dtype=np.float32); nvidia_pose=bbox_pose_np(nvidia_f); cd,yd,c,q=residual(nvidia_pose,target); dc=float(np.linalg.norm(center(direct)-center(nvidia_pose))); dr=rotation_angle(direct,nvidia_pose); ttrack=tracks[key[0]]; li=next(i for i,x in enumerate(ttrack) if int(x["timestamp_us"])==mapped); local_pos="FIRST" if li==0 else "LAST" if li==len(ttrack)-1 else "MIDDLE"; raw_track=[x for x in selected if x[1]["track_id"]==r["track_id"]]; ri=next(i for i,x in enumerate(raw_track) if x[1] is r); raw_pos="FIRST" if ri==0 else "LAST" if ri==len(raw_track)-1 else "MIDDLE"; synthetic=(int(ttrack[0]["timestamp_us"])!=raw_track[0][2][1]+rec["offset_us"] or int(ttrack[-1]["timestamp_us"])!=raw_track[-1][2][1]+rec["offset_us"]); dims=first_dims[key[0]]; rc=corners(c,q,dims); lc=corners(target["center"],target["quaternion"],target["dimensions"]); rb=bev(c,q,dims); lb=bev(target["center"],target["quaternion"],target["dimensions"]); prev_raw=raw_track[ri-1] if ri>0 else None; next_raw=raw_track[ri+1] if ri+1<len(raw_track) else None; prev_local=ttrack[li-1] if li>0 else None; next_local=ttrack[li+1] if li+1<len(ttrack) else None
-            rows.append({"clip_id":cid,"track_id":key[0],"category":target["category"],"raw_row_index":raw_idx,"raw_timestamp_us":key[1],"mapped_nurec_timestamp_us":mapped,"reference_frame_timestamp_us":int(r["reference_frame_timestamp_us"]),"raw_track_position":raw_pos,"local_serialized_track_position":local_pos,"synthetic_endpoint_status":"SYNTHETIC_ENDPOINT_PRESENT" if synthetic else "NO_SYNTHETIC_ENDPOINT_DETECTED","raw_center":json.dumps([r["center_x"],r["center_y"],r["center_z"]]),"raw_quaternion":json.dumps([r["orientation_x"],r["orientation_y"],r["orientation_z"],r["orientation_w"]]),"direct_center":json.dumps(center(direct).tolist()),"nvidia_center":json.dumps(c.tolist()),"local_center":json.dumps(target["center"]),"center_residual_m":cd,"yaw_residual_deg":yd,"direct_vs_nvidia_center_diff_m":dc,"direct_vs_nvidia_rotation_diff_deg":dr,"bev_iou":iou(rb,lb),"bev_corner_error_m":set_rmse(rb,lb),"corner3d_error_m":set_rmse(rc,lc),"yaw_parameterization_geometry_equivalent":yd>170 and iou(rb,lb)>.9,"ego_distance_m":float(np.linalg.norm(c-center(ego_local))),"dimensions":json.dumps(dims),"previous_raw_timestamp":prev_raw[2][1] if prev_raw else None,"next_raw_timestamp":next_raw[2][1] if next_raw else None,"previous_local_timestamp":prev_local["timestamp_us"] if prev_local else None,"next_local_timestamp":next_local["timestamp_us"] if next_local else None,"raw_prev_current_displacement_m":float(np.linalg.norm(np.asarray(center(ego_local))-np.asarray(center(ego_local)))) if False else None})
-    cs=[r["center_residual_m"] for r in rows]; ys=[r["yaw_residual_deg"] for r in rows]; bi=[r["bev_iou"] for r in rows]; be=[r["bev_corner_error_m"] for r in rows]; ce=[r["corner3d_error_m"] for r in rows]; dp=[r["direct_vs_nvidia_center_diff_m"] for r in rows]; dr=[r["direct_vs_nvidia_rotation_diff_deg"] for r in rows]; outliers=[r for r in rows if r["center_residual_m"]>2]; yawflip=[r for r in rows if r["yaw_residual_deg"]>170]
+            p=interpolate_pose(poses,int(r["reference_frame_timestamp_us"])); ego_local=np.asarray(reb)@np.asarray(p); b=bbox_from_raw(r); direct=ego_local@bbox_pose_np(b); nvidia=bbox_pose_transform(b,ego_local); nvidia_f=np.asarray(nvidia,dtype=np.float32); nvidia_pose=bbox_pose_np(nvidia_f); cd,yd,c,q=residual(nvidia_pose,target); dc=float(np.linalg.norm(center(direct)-center(nvidia_pose))); dr=rotation_angle(direct,nvidia_pose); reconstructed_yaw=pose_yaw(pose_matrix(c,q)); local_yaw=pose_yaw(pose_matrix(target["center"],target["quaternion"])); signed_yaw=math.degrees(_wrap(local_yaw-reconstructed_yaw)); signed_center=(np.asarray(target["center"],float)-c).tolist(); ttrack=tracks[key[0]]; li=next(i for i,x in enumerate(ttrack) if int(x["timestamp_us"])==mapped); local_pos="FIRST" if li==0 else "LAST" if li==len(ttrack)-1 else "MIDDLE"; raw_track=[x for x in selected if x[1]["track_id"]==r["track_id"]]; ri=next(i for i,x in enumerate(raw_track) if x[1] is r); raw_pos="FIRST" if ri==0 else "LAST" if ri==len(raw_track)-1 else "MIDDLE"; synthetic=(int(ttrack[0]["timestamp_us"])!=raw_track[0][2][1]+rec["offset_us"] or int(ttrack[-1]["timestamp_us"])!=raw_track[-1][2][1]+rec["offset_us"]); dims=first_dims[key[0]]; rc=corners(c,q,dims); lc=corners(target["center"],target["quaternion"],target["dimensions"]); rb=bev(c,q,dims); lb=bev(target["center"],target["quaternion"],target["dimensions"]); prev_raw=raw_track[ri-1] if ri>0 else None; next_raw=raw_track[ri+1] if ri+1<len(raw_track) else None; prev_local=ttrack[li-1] if li>0 else None; next_local=ttrack[li+1] if li+1<len(ttrack) else None
+            rows.append({"clip_id":cid,"track_id":key[0],"category":target["category"],"raw_row_index":raw_idx,"raw_timestamp_us":key[1],"mapped_nurec_timestamp_us":mapped,"reference_frame_timestamp_us":int(r["reference_frame_timestamp_us"]),"raw_track_position":raw_pos,"local_serialized_track_position":local_pos,"synthetic_endpoint_status":"SYNTHETIC_ENDPOINT_PRESENT" if synthetic else "NO_SYNTHETIC_ENDPOINT_DETECTED","raw_center":json.dumps([r["center_x"],r["center_y"],r["center_z"]]),"raw_quaternion":json.dumps([r["orientation_x"],r["orientation_y"],r["orientation_z"],r["orientation_w"]]),"direct_center":json.dumps(center(direct).tolist()),"nvidia_center":json.dumps(c.tolist()),"local_center":json.dumps(target["center"]),"center_residual_xyz":json.dumps(signed_center),"center_residual_m":cd,"yaw_residual_deg":yd,"signed_yaw_delta_deg":signed_yaw,"direct_vs_nvidia_center_diff_m":dc,"direct_vs_nvidia_rotation_diff_deg":dr,"bev_iou":iou(rb,lb),"bev_corner_error_m":set_rmse(rb,lb),"corner3d_error_m":set_rmse(rc,lc),"yaw_parameterization_geometry_equivalent":yd>170 and iou(rb,lb)>.9,"ego_distance_m":float(np.linalg.norm(c-center(ego_local))),"dimensions":json.dumps(dims),"previous_raw_timestamp":prev_raw[2][1] if prev_raw else None,"next_raw_timestamp":next_raw[2][1] if next_raw else None,"previous_local_timestamp":prev_local["timestamp_us"] if prev_local else None,"next_local_timestamp":next_local["timestamp_us"] if next_local else None})
+    cs=[r["center_residual_m"] for r in rows]; ys=[r["yaw_residual_deg"] for r in rows]; bi=[r["bev_iou"] for r in rows]; be=[r["bev_corner_error_m"] for r in rows]; ce=[r["corner3d_error_m"] for r in rows]; dp=[r["direct_vs_nvidia_center_diff_m"] for r in rows]; dr=[r["direct_vs_nvidia_rotation_diff_deg"] for r in rows]
     by_track={}
     for row in rows: by_track.setdefault((row["clip_id"],row["track_id"]),[]).append(row)
-    neighbors=[]
+    outliers=[]; neighbors=[]; systematic_track_count=0; contiguous_cluster_count=0; isolated_count=0
     for group in by_track.values():
         group.sort(key=lambda x:int(x["mapped_nurec_timestamp_us"]))
         for i,row in enumerate(group):
-            for prefix,field in (("raw","raw_center"),("local","local_center")):
+            for prefix in ("raw","local"):
                 cur=np.asarray(json.loads(row["nvidia_center"] if prefix=="raw" else row["local_center"]),float)
-                for label,idx in (("prev",i-1),("next",i+1)):
+                for label,idx in (("previous",i-1),("next",i+1)):
                     if 0<=idx<len(group):
-                        other=np.asarray(json.loads(group[idx]["nvidia_center"] if prefix=="raw" else group[idx]["local_center"]),float)
-                        dt=abs(int(group[idx]["mapped_nurec_timestamp_us"])-int(row["mapped_nurec_timestamp_us"]))/1e6
-                        row[f"{prefix}_{label}_current_displacement_m"]=float(np.linalg.norm(cur-other)); row[f"{prefix}_{label}_current_speed_mps"]=float(np.linalg.norm(cur-other)/dt) if dt else None
-                    else:
-                        row[f"{prefix}_{label}_current_displacement_m"]=None; row[f"{prefix}_{label}_current_speed_mps"]=None
-            if row in outliers: neighbors.append(row)
-    summary={"matched_selected_observation_count":len(rows),"global_center_rmse_m":math.sqrt(sum(v*v for v in cs)/len(cs)),"global_center_p95_m":p95(cs),"global_center_max_m":max(cs),"global_yaw_rmse_deg":math.sqrt(sum(v*v for v in ys)/len(ys)),"global_yaw_p95_deg":p95(ys),"global_yaw_max_deg":max(ys),"global_bev_iou_mean":statistics.mean(bi),"global_bev_iou_p05":float(np.quantile(bi,.05)),"global_bev_iou_min":min(bi),"global_bev_corner_set_p95_m":p95(be),"global_bev_corner_set_max_m":max(be),"global_3d_corner_set_p95_m":p95(ce),"global_3d_corner_set_max_m":max(ce),"yaw_gt_45_count":sum(v>45 for v in ys),"yaw_gt_170_count":sum(v>170 for v in ys),"yaw_parameterization_geometric_equivalence_count":sum(r["yaw_parameterization_geometry_equivalent"] for r in rows),"center_gt_2m_count":sum(v>2 for v in cs),"max_direct_vs_nvidia_center_diff_m":max(dp),"p95_direct_vs_nvidia_center_diff_m":p95(dp),"max_direct_vs_nvidia_rotation_diff_deg":max(dr),"p95_direct_vs_nvidia_rotation_diff_deg":p95(dr)}
+                        other=np.asarray(json.loads(group[idx]["nvidia_center"] if prefix=="raw" else group[idx]["local_center"]),float); dt=abs(int(group[idx]["mapped_nurec_timestamp_us"])-int(row["mapped_nurec_timestamp_us"]))/1e6; d=float(np.linalg.norm(cur-other))
+                        row[f"{prefix}_{label}_displacement_m"]=d; row[f"{prefix}_{label}_speed_mps"]=d/dt if dt else None
+                    else: row[f"{prefix}_{label}_displacement_m"]=None; row[f"{prefix}_{label}_speed_mps"]=None
+            if row["center_residual_m"]>2:
+                row["previous_center_residual_m"]=group[i-1]["center_residual_m"] if i else None; row["next_center_residual_m"]=group[i+1]["center_residual_m"] if i+1<len(group) else None; outliers.append(row); neighbors.append(row)
+        indices=[i for i,x in enumerate(group) if x["center_residual_m"]>2]
+        if len(indices)>=2: systematic_track_count+=1
+        if indices:
+            runs=1
+            for aidx,bidx in zip(indices,indices[1:]):
+                if bidx==aidx+1:runs+=1
+                else:
+                    if runs>1:contiguous_cluster_count+=1
+                    runs=1
+            if runs>1:contiguous_cluster_count+=1
+    for row in outliers:
+        small=[v for v in (row.get("previous_center_residual_m"),row.get("next_center_residual_m")) if v is not None]
+        row["outlier_classification"]="ISOLATED_ROW_ANOMALY" if small and all(v<2 and v<=row["center_residual_m"]*.5 for v in small) else "NON_ISOLATED_OR_UNRESOLVED"
+        if row["outlier_classification"]=="ISOLATED_ROW_ANOMALY":isolated_count+=1
+    outlier_status="ALL_ISOLATED_NO_SYSTEMATIC_PATTERN" if outliers and isolated_count==len(outliers) and systematic_track_count==0 else ("UNRESOLVED" if not outliers else "MIXED")
+    clip_bias=[]; clip_yaw=[]
+    for cid in sorted({r["clip_id"] for r in rows}):
+        cr=[r for r in rows if r["clip_id"]==cid]; vec=np.asarray([json.loads(r["center_residual_xyz"]) for r in cr],float); sy=np.asarray([r["signed_yaw_delta_deg"] for r in cr],float)
+        clip_bias.append({"clip_id":cid,"matched_count":len(cr),"mean_dx_m":float(np.mean(vec[:,0])),"mean_dy_m":float(np.mean(vec[:,1])),"mean_dz_m":float(np.mean(vec[:,2])),"median_dx_m":float(np.median(vec[:,0])),"median_dy_m":float(np.median(vec[:,1])),"median_dz_m":float(np.median(vec[:,2])),"std_dx_m":float(np.std(vec[:,0])),"std_dy_m":float(np.std(vec[:,1])),"std_dz_m":float(np.std(vec[:,2]))})
+        clip_yaw.append({"clip_id":cid,"matched_count":len(cr),"mean_signed_yaw_delta_deg":float(np.mean(sy)),"median_signed_yaw_delta_deg":float(np.median(sy)),"std_signed_yaw_delta_deg":float(np.std(sy))})
+    max_bias=[max(abs(x[k]) for x in clip_bias) for k in ("mean_dx_m","mean_dy_m","mean_dz_m")]; max_yaw=max(abs(x["mean_signed_yaw_delta_deg"]) for x in clip_yaw)
+    summary={"matched_selected_observation_count":len(rows),"global_center_rmse_m":math.sqrt(sum(v*v for v in cs)/len(cs)),"global_center_p95_m":p95(cs),"global_center_max_m":max(cs),"global_yaw_rmse_deg":math.sqrt(sum(v*v for v in ys)/len(ys)),"global_yaw_p95_deg":p95(ys),"global_yaw_max_deg":max(ys),"global_bev_iou_mean":statistics.mean(bi),"global_bev_iou_p05":float(np.quantile(bi,.05)),"global_bev_iou_min":min(bi),"global_bev_corner_set_p95_m":p95(be),"global_bev_corner_set_max_m":max(be),"global_3d_corner_set_p95_m":p95(ce),"global_3d_corner_set_max_m":max(ce),"yaw_gt_45_count":sum(v>45 for v in ys),"yaw_gt_170_count":sum(v>170 for v in ys),"center_gt_2m_count":sum(v>2 for v in cs),"max_direct_vs_nvidia_center_diff_m":max(dp),"max_direct_vs_nvidia_rotation_diff_deg":max(dr),"max_abs_clip_mean_dx_m":max_bias[0],"max_abs_clip_mean_dy_m":max_bias[1],"max_abs_clip_mean_dz_m":max_bias[2],"max_abs_clip_mean_signed_yaw_deg":max_yaw,"center_outlier_total_count":len(outliers),"center_outlier_isolated_count":isolated_count,"center_outlier_contiguous_cluster_count":contiguous_cluster_count,"center_outlier_systematic_track_count":systematic_track_count}
     summary=json.loads(json.dumps(summary,default=lambda x:x.item() if hasattr(x,"item") else x))
-    _csv(out/"nvidia_transform_parity.csv",rows); _csv(out/"cuboid_physical_geometry_crosscheck.csv",rows); _csv(out/"yaw_parameterization_geometry_diagnostic.csv",[r for r in rows if r["yaw_residual_deg"]>170]); _csv(out/"center_outlier_final_forensics.csv",outliers); _csv(out/"center_outlier_neighbor_continuity.csv",neighbors)
-    parity=summary["max_direct_vs_nvidia_center_diff_m"]<1e-4 and summary["max_direct_vs_nvidia_rotation_diff_deg"]<1e-3; systematic=not(parity and summary["global_center_p95_m"]<3 and summary["global_bev_iou_p05"]>.5)
-    _dump(out/"nvidia_transform_parity_summary.json",{"NVIDIA_MATH_REPLAY_STATUS":"VERIFIED_LOCAL_EULER_XYZ_EQUIVALENT","DIRECT_TRANSFORM_PARITY_STATUS":"VERIFIED" if parity else "MISMATCH","metrics":summary})
-    _dump(out/"cuboid_physical_geometry_summary.json",summary); _dump(out/"cuboid_geometry_final_contract.json",{"formula":"T_rig_world_local @ T_object_rig","nvidia_bbox_math":"R.from_quat(qx,qy,qz,qw).as_euler(xyz); bbox_pose -> transform_bbox -> bbox_pose; float32 serialization","corner_matching":"Hungarian unordered 8-corner/4-corner sets","systematic_frame_rule":"parity + center P95 <3m + BEV IoU P05 >0.5","systematic_frame_error_found":systematic,"no_offset_rederive":True})
-    _dump(out/"cuboid_geometry_final_summary.json",{**summary,"nvidia_math_replay_status":"VERIFIED_LOCAL_EULER_XYZ_EQUIVALENT","direct_transform_parity_status":"VERIFIED" if parity else "MISMATCH","center_outlier_provenance_status":"ISOLATED_ROWS_RETAINED","systematic_frame_error_found":systematic,"raw_row_selection_status":"VERIFIED_REPLAY_RULES","cuboid_serialization_status":"VERIFIED" if not systematic else "PARTIALLY_VERIFIED","cuboid_frame_status":"VERIFIED" if not systematic else "PARTIALLY_VERIFIED","obstacle_transform_status":"VERIFIED" if not systematic else "PARTIALLY_VERIFIED","normalized_obstacle_status":"VERIFIED" if not systematic else "PARTIALLY_VERIFIED","obstacle_geometry_block_ready_to_close":not systematic,"per_clip_offset_rederived":False,"cf_proxy_label_set_ready":True,"ttc_proxy_label_set_ready":True,"cf_data_ready":False,"ttc_data_ready":False,"remaining_blockers":[] if not systematic else ["PHYSICAL_GEOMETRY_OR_CENTER_OUTLIERS_REQUIRE_REVIEW"],"recommended_next_step":"start scorer contract review" if not systematic else "review remaining physical geometry outliers"})
+    parity=summary["max_direct_vs_nvidia_center_diff_m"]<1e-4 and summary["max_direct_vs_nvidia_rotation_diff_deg"]<1e-3
+    no_bias=max(max_bias)<0.5 and max_yaw<5.0; physical_ok=summary["global_center_p95_m"]<3 and summary["global_bev_iou_p05"]>.5 and summary["global_3d_corner_set_p95_m"]<1.0
+    systematic=not(parity and physical_ok and no_bias and outlier_status=="ALL_ISOLATED_NO_SYSTEMATIC_PATTERN")
+    scipy_status="VERIFIED" if parity else "MISMATCH"; ncore_status="NOT_RUN_RUNTIME_UNAVAILABLE" if not NCORE_RUNTIME_AVAILABLE else "AVAILABLE_NOT_REQUIRED"
+    _csv(out/"scipy_ncore_math_parity.csv",rows); _csv(out/"cuboid_bev_hull_geometry.csv",rows); _csv(out/"per_clip_center_bias.csv",clip_bias); _csv(out/"per_clip_yaw_bias.csv",clip_yaw); _csv(out/"center_outlier_closure_forensics.csv",outliers)
+    _dump(out/"scipy_ncore_math_parity_summary.json",{"SCIPY_MATH_PARITY_STATUS":scipy_status,"NCORE_RUNTIME_AVAILABLE":NCORE_RUNTIME_AVAILABLE,"NCORE_RUNTIME_PARITY_STATUS":ncore_status,"metrics":summary,"implementation":"local exact SciPy/NVIDIA-equivalent fallback" if not SCIPY_AVAILABLE else "direct scipy Rotation"})
+    _dump(out/"cuboid_bev_hull_geometry_summary.json",{"metrics":summary,"geometry":"8 corners projected to XY then deterministic convex hull"})
+    _dump(out/"center_outlier_isolation_summary.json",{"total":len(outliers),"isolated":isolated_count,"contiguous_clusters":contiguous_cluster_count,"systematic_tracks":systematic_track_count,"status":outlier_status})
+    rule="SciPy/NVIDIA parity AND center P95 < 3m AND BEV IoU P05 > 0.5 AND 3D corner P95 < 1m AND max clip mean translation bias < 0.5m AND max clip mean signed yaw bias < 5deg AND all center outliers isolated with no systematic track"
+    evidence={"math_parity":parity,"physical_geometry":physical_ok,"translation_bias_abs_max_m":max(max_bias),"signed_yaw_bias_abs_max_deg":max_yaw,"no_consistent_bias":no_bias,"outlier_status":outlier_status}
+    blockers=[] if not systematic else [k for k,v in (("SCIPY_MATH_PARITY",parity),("PHYSICAL_GEOMETRY",physical_ok),("NO_CLIP_BIAS",no_bias),("OUTLIER_ISOLATION",outlier_status=="ALL_ISOLATED_NO_SYSTEMATIC_PATTERN")) if not v]
+    contract={"formula":"T_rig_world_local @ T_object_rig","SCIPY_MATH_PARITY_STATUS":scipy_status,"NCORE_RUNTIME_AVAILABLE":NCORE_RUNTIME_AVAILABLE,"SYSTEMATIC_FRAME_DECISION_RULE":rule,"SYSTEMATIC_FRAME_DECISION_EVIDENCE":evidence,"SYSTEMATIC_FRAME_ERROR_FOUND":systematic,"CENTER_OUTLIER_PROVENANCE_STATUS":outlier_status,"no_fitted_correction":True,"per_clip_offset_rederived":False}
+    _dump(out/"obstacle_geometry_closure_contract.json",contract)
+    _dump(out/"obstacle_geometry_closure_final_summary.json",{**summary,**contract,"raw_row_selection_status":"VERIFIED_REPLAY_RULES","cuboid_serialization_status":"VERIFIED" if not systematic else "PARTIALLY_VERIFIED","cuboid_frame_status":"VERIFIED" if not systematic else "PARTIALLY_VERIFIED","obstacle_transform_status":"VERIFIED" if not systematic else "PARTIALLY_VERIFIED","normalized_obstacle_status":"VERIFIED" if not systematic else "PARTIALLY_VERIFIED","obstacle_geometry_block_ready_to_close":not systematic,"obstacle_geometry_block":"CLOSED" if not systematic else "OPEN","cf_proxy_label_set_ready":True,"ttc_proxy_label_set_ready":True,"cf_data_ready":False,"ttc_data_ready":False,"physical_world_obstacle_completeness":"NOT_CLAIMED","remaining_blockers":blockers,"recommended_next_step":"start scorer contract review" if not systematic else "review closure blockers"})
 if __name__=="__main__": main()
