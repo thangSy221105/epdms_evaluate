@@ -35,9 +35,11 @@ Sample outputs:
 - `D:\300_clip_nurec\05_data_contract\schema\00040136-e651-4abd-991d-0655ccda9430\schema_report.json`
 - `D:\300_clip_nurec\05_data_contract\schema\00040136-e651-4abd-991d-0655ccda9430\schema_report.md`
 
-The current runtime reports `PARQUET_ENGINE_UNAVAILABLE`, so parquet column
-names, dtypes, null counts, and samples are intentionally not guessed. The
-JSON inspection did establish:
+The first Round-1 run was recorded before a parquet engine was available, so
+that historical report did not guess parquet columns. The current runtime has
+`pyarrow 25.0.1`, and the subsequent official Hugging Face probe verified the
+raw nested parquet schema. The original Round-1 JSON inspection had already
+established:
 
 - `pose_record.json` contains `alignment_origin` and `record[].timestamp_microseconds`.
 - `rig_trajectories.json` contains `T_world_base`, `world_to_nre`, camera/lidar frame timestamp arrays, world/rig transforms, and camera/lidar calibration transforms.
@@ -68,7 +70,7 @@ observation_ttc_ready           = 0
 map_ready                       = 0
 proxy_ready_clip_count          = 0
 dataset_status                  = DATASET_NOT_READY
-parquet_engine                  = PARQUET_ENGINE_UNAVAILABLE
+parquet_engine                  = PARQUET_ENGINE_UNAVAILABLE (historical Round-1 run)
 ```
 
 Blocker counts:
@@ -79,7 +81,7 @@ COORDINATE_UNRESOLVED           = 300
 OBSERVATION_COVERAGE_INCOMPLETE = 300
 OBSTACLE_SCHEMA_INVALID         = 300
 MAP_MISSING                     = 156
-PARQUET_ENGINE_UNAVAILABLE      = 144
+PARQUET_ENGINE_UNAVAILABLE      = 144 (historical Round-1 run)
 ```
 
 The audit does not turn `prediction_t0_us - obstacle_min_timestamp` into a
@@ -119,10 +121,10 @@ was converted into a safe DAC result.
 
 ## Next data action
 
-The initial 300-clip run used a runtime without a parquet engine. The current
-runtime now has `pyarrow 25.0.1`; rerun the dataset audit against the original
-300-clip roots only after confirming their raw parquet roots are complete. The
-evaluator should remain unchanged until the audit identifies verified time and
+The initial 300-clip run used a runtime without a parquet engine and is kept as
+historical evidence. The current runtime has `pyarrow 25.0.1`; the official
+Hugging Face probe below is the first raw-parquet validation. The evaluator
+should remain unchanged until the audit identifies verified time and
 coordinate contracts.
 
 ## Follow-up: official Hugging Face real-clip probe

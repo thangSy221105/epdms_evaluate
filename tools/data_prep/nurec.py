@@ -46,7 +46,8 @@ OFFICIAL_FILES = {
 
 PARQUET_FILES = {p for p in REQUIRED_CLIP_FILES if p.endswith(".parquet")}
 TIMESTAMP_RE = re.compile(r"(?:^|[_\.])(timestamp|time|t0|start|end|frame_id|sample_id|token)(?:$|[_\.])", re.I)
-COORDINATE_RE = re.compile(r"(?:^|[_\.])(x|y|z|center|position|translation|geometry|quaternion|yaw|rotation|frame|sensor|track|category)(?:$|[_\.])", re.I)
+COORDINATE_RE = re.compile(r"(?:^|[_\.])(x|y|z|w|center|position|translation|geometry|quaternion|yaw|rotation|frame|sensor|track|category)(?:$|[_\.])", re.I)
+PHYSICAL_TIMESTAMP_TERMS = {"timestamp", "timestamp_us", "timestamp_micros", "timestamp_microseconds", "timestamp_ms", "timestamp_ns", "time_us", "time_micros", "time_microseconds", "time_ms", "time_ns", "start_micros", "end_micros"}
 
 
 def parquet_engine() -> Dict[str, Any]:
@@ -156,22 +157,29 @@ def _nested_frame_paths(frame: Any) -> List[str]:
     for column in frame.columns:
         name = str(column)
         paths.append(name)
-        sample = next((value for value in frame[name].tolist() if value is not None), None)
-        if sample is not None:
+        samples = [value for value in frame[name].tolist() if value is not None][:64]
+        for sample in samples:
             paths.extend(_leaf_paths(sample, name))
     return list(dict.fromkeys(paths))
 
 
 def _path_value(value: Any, path: str) -> Any:
-    current = value
-    for part in path.split("."):
-        if part.endswith("[]"):
-            part = part[:-2]
+    parts = path.split(".") if path else []
+
+    def walk(current: Any, index: int) -> Any:
+        if index >= len(parts):
+            return current
+        part = parts[index]
+        list_marker = part.endswith("[]")
+        key = part[:-2] if list_marker else part
         if isinstance(current, Mapping):
-            current = current.get(part)
-        else:
-            return None
-    return current
+            child = current.get(key)
+            return walk(child, index + 1)
+        if isinstance(current, (list, tuple)):
+            return [walk(child, index) for child in current]
+        return None
+
+    return walk(value, 0)
 
 
 def _frame_path_values(frame: Any, path: str) -> List[Any]:
@@ -196,6 +204,67 @@ def _has_geometry_points(value: Any, minimum: int = 2) -> bool:
         return len(value) >= minimum
     except TypeError:
         return False
+
+
+def _is_finite_number(value: Any) -> bool:
+    if isinstance(value, bool) or isinstance(value, (str, bytes)) or value is None:
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _timestamp_value_valid(value: Any) -> bool:
+    if not _is_finite_number(value):
+        return False
+    try:
+        return float(value).is_integer()
+    except (TypeError, ValueError):
+        return False
+
+
+def _timestamp_summary(values: Sequence[Any]) -> Dict[str, Any]:
+    valid = [int(float(value)) for value in values if _timestamp_value_valid(value)]
+    invalid_count = len(values) - len(valid)
+    unique = sorted(set(valid))
+    diffs = [b - a for a, b in zip(unique, unique[1:]) if b > a]
+    return {
+        "timestamp_total_count": len(values),
+        "timestamp_valid_count": len(valid),
+        "timestamp_invalid_count": invalid_count,
+        "count": len(valid),
+        "min": min(valid) if valid else None,
+        "max": max(valid) if valid else None,
+        "unique_count": len(unique),
+        "spacing_sample": diffs[:10],
+        "median_dt": sorted(diffs)[len(diffs) // 2] if diffs else None,
+    }
+
+
+def _timestamp_field_name(path: str) -> str:
+    return path.rsplit(".", 1)[-1].lower()
+
+
+def _resolve_parquet_timestamp_field(frame: Any, candidates: Sequence[str]) -> Dict[str, Any]:
+    summaries = {field: _timestamp_summary(_frame_path_values(frame, field)) for field in candidates}
+    usable = [field for field in candidates if summaries[field]["timestamp_valid_count"] > 0]
+    canonical = [field for field in usable if field == "key.timestamp_micros"]
+    if canonical:
+        selected = canonical[0]
+        status = "SELECTED_CANONICAL"
+    else:
+        physical = [field for field in usable if _timestamp_field_name(field) in PHYSICAL_TIMESTAMP_TERMS]
+        if len(physical) == 1:
+            selected = physical[0]
+            status = "SELECTED_EXPLICIT"
+        elif len(physical) > 1:
+            selected = None
+            status = "AMBIGUOUS_TIMESTAMP_FIELDS"
+        else:
+            selected = None
+            status = "MISSING_TIME_METADATA"
+    return {"timestamp_candidates": summaries, "selected_timestamp_field": selected, "timestamp_selection_status": status}
 
 
 def inspect_parquet(path: Path, sample_rows: int = 5) -> Dict[str, Any]:
@@ -225,7 +294,8 @@ def inspect_parquet(path: Path, sample_rows: int = 5) -> Dict[str, Any]:
             "sample_rows": _dataframe_records(frame, sample_rows),
         })
         timestamp_columns = [path for path in nested_paths if _looks_like_timestamp(path)]
-        result["timestamp_columns"] = {path: _path_numeric_summary(frame, path) for path in timestamp_columns}
+        result.update(_resolve_parquet_timestamp_field(frame, timestamp_columns))
+        result["timestamp_columns"] = result["timestamp_candidates"]
         result["coordinate_columns"] = [path for path in nested_paths if _looks_like_coordinate(path)]
         result["timestamp_field_candidates"] = timestamp_columns
         result["coordinate_field_candidates"] = result["coordinate_columns"]
@@ -285,9 +355,9 @@ def inspect_clip(clip_dir: Path) -> Dict[str, Any]:
 
 def report_to_markdown(report: Mapping[str, Any]) -> str:
     lines = [f"# NuRec schema report — `{report.get('clip_id')}`", "", f"Clip directory: `{report.get('clip_dir')}`", "", f"Parquet status: `{report.get('parquet_engine', {}).get('status')}`", ""]
-    lines += ["## Parquet files", "", "| File | Status | Rows | Timestamp candidates | Coordinate candidates |", "|---|---|---:|---|---|"]
+    lines += ["## Parquet files", "", "| File | Status | Rows | Selected timestamp | Timestamp selection | Timestamp candidates | Coordinate candidates |", "|---|---|---:|---|---|---|---|"]
     for name, item in report.get("parquet", {}).items():
-        lines.append(f"| `{name}` | `{item.get('status')}` | {item.get('row_count', '')} | `{', '.join(item.get('timestamp_field_candidates', []))}` | `{', '.join(item.get('coordinate_field_candidates', []))}` |")
+        lines.append(f"| `{name}` | `{item.get('status')}` | {item.get('row_count', '')} | `{item.get('selected_timestamp_field') or ''}` | `{item.get('timestamp_selection_status') or ''}` | `{', '.join(item.get('timestamp_field_candidates', []))}` | `{', '.join(item.get('coordinate_field_candidates', []))}` |")
     lines += ["", "## JSON/YAML files", "", "| File | Status | Top-level keys | Timestamp-looking fields | Frame/coordinate-looking fields |", "|---|---|---|---|---|"]
     for name, item in report.get("json_yaml", {}).items():
         lines.append(f"| `{name}` | `{item.get('status')}` | `{', '.join(item.get('top_level_keys', []))}` | `{', '.join(item.get('timestamp_looking_fields', []))}` | `{', '.join(item.get('frame_coordinate_looking_fields', []))}` |")
@@ -319,21 +389,37 @@ def discover_clip_dirs(dataset_root: Path) -> Tuple[Dict[str, Path], List[str]]:
 
 
 def _jsonl_index(path: Optional[Path]) -> Dict[str, Dict[str, Any]]:
+    return _jsonl_index_with_errors(path, "jsonl")[0]
+
+
+def _jsonl_index_with_errors(path: Optional[Path], source: str) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]], List[str]]:
     result: Dict[str, Dict[str, Any]] = {}
+    errors: List[Dict[str, Any]] = []
+    duplicates: List[str] = []
     if path is None or not path.is_file():
-        return result
+        return result, errors, duplicates
     with path.open("r", encoding="utf-8-sig") as handle:
         for line_number, line in enumerate(handle, 1):
             if not line.strip():
                 continue
             try:
                 row = json.loads(line)
-            except Exception:
+            except Exception as exc:
+                errors.append({"source": source, "line_number": line_number, "failure_type": "MALFORMED_JSON", "failure_reason": str(exc)})
+                continue
+            if not isinstance(row, dict):
+                errors.append({"source": source, "line_number": line_number, "failure_type": "INVALID_JSON_ROW", "failure_reason": "JSONL row is not an object"})
                 continue
             clip_id = str(row.get("clip_id", ""))
-            if clip_id and clip_id not in result:
-                result[clip_id] = row
-    return result
+            if not clip_id:
+                errors.append({"source": source, "line_number": line_number, "failure_type": "MISSING_CLIP_ID", "failure_reason": "clip_id is missing or empty"})
+                continue
+            if clip_id in result:
+                duplicates.append(clip_id)
+                errors.append({"source": source, "line_number": line_number, "failure_type": "DUPLICATE_CLIP_ID", "failure_reason": clip_id})
+                continue
+            result[clip_id] = row
+    return result, errors, sorted(set(duplicates))
 
 
 def _first(row: Mapping[str, Any], keys: Sequence[str]) -> Optional[str]:
@@ -363,29 +449,45 @@ def _row_t0(row: Optional[Mapping[str, Any]]) -> Optional[int]:
 
 def _parquet_timestamp_summary(path: Path) -> Dict[str, Any]:
     info = inspect_parquet(path, sample_rows=0)
-    result: Dict[str, Any] = {"status": info.get("status"), "min": None, "max": None, "unique_count": None, "row_count": info.get("row_count")}
+    result: Dict[str, Any] = {"status": info.get("status"), "min": None, "max": None, "unique_count": None, "row_count": info.get("row_count"), "timestamp_candidates": info.get("timestamp_candidates", {}), "selected_timestamp_field": info.get("selected_timestamp_field"), "timestamp_selection_status": info.get("timestamp_selection_status")}
     if info.get("status") != "OK":
         return result
     candidates = info.get("timestamp_field_candidates", [])
-    if not candidates:
-        result["status"] = "MISSING_TIME_METADATA"
+    selected = info.get("selected_timestamp_field")
+    if not candidates or not selected:
+        result["status"] = info.get("timestamp_selection_status") or "MISSING_TIME_METADATA"
         return result
     try:
         import pandas as pd
         frame = pd.read_parquet(path, engine=parquet_engine()["engines"][0])
-        summaries = [(field, _path_numeric_summary(frame, field)) for field in candidates]
-        summaries = [(field, summary) for field, summary in summaries if summary.get("count", 0) > 0]
-        if not summaries:
-            result["status"] = "MISSING_TIME_METADATA"
-            return result
-        result["min"] = min(summary["min"] for _, summary in summaries)
-        result["max"] = max(summary["max"] for _, summary in summaries)
-        result["unique_count"] = max(summary["unique_count"] for _, summary in summaries)
-        result["median_dt"] = next((summary.get("median_dt") for _, summary in summaries if summary.get("median_dt") is not None), None)
-        result["field"] = ";".join(field for field, _ in summaries)
+        summary = _timestamp_summary(_frame_path_values(frame, selected))
+        result.update(summary)
+        result["field"] = selected
+        result["status"] = "OK" if summary["timestamp_valid_count"] > 0 else "MISSING_TIME_METADATA"
     except Exception as exc:
         result.update({"status": "PARQUET_READ_ERROR", "error": str(exc)})
     return result
+
+
+def _parquet_clip_interval_summary(path: Path) -> Dict[str, Any]:
+    """Read clip start/end as an interval, without treating both as one clock field."""
+    info = inspect_parquet(path, sample_rows=0)
+    if info.get("status") != "OK":
+        return {"status": info.get("status"), "min": None, "max": None}
+    start_field = "key.time_range.start_micros"
+    end_field = "key.time_range.end_micros"
+    if start_field not in info.get("nested_field_paths", []) or end_field not in info.get("nested_field_paths", []):
+        return {"status": "MISSING_TIME_METADATA", "min": None, "max": None}
+    try:
+        import pandas as pd
+        frame = pd.read_parquet(path, engine=parquet_engine()["engines"][0])
+        starts = _timestamp_summary(_frame_path_values(frame, start_field))
+        ends = _timestamp_summary(_frame_path_values(frame, end_field))
+        if starts["timestamp_invalid_count"] or ends["timestamp_invalid_count"] or not starts["count"] or not ends["count"]:
+            return {"status": "INVALID_TIME_METADATA", "min": starts["min"], "max": ends["max"], "start_field": start_field, "end_field": end_field}
+        return {"status": "OK", "min": starts["min"], "max": ends["max"], "start_field": start_field, "end_field": end_field}
+    except Exception as exc:
+        return {"status": "PARQUET_READ_ERROR", "min": None, "max": None, "error": str(exc)}
 
 
 def _obstacle_inventory(path: Path) -> Dict[str, Any]:
@@ -422,28 +524,55 @@ def _obstacle_inventory(path: Path) -> Dict[str, Any]:
     sizes = [_frame_path_values(frame, f"obstacle.size.{axis}") for axis in "xyz"]
     orientations = [_frame_path_values(frame, f"obstacle.orientation.{axis}") for axis in "xyzw"]
     def finite(value: Any) -> bool:
-        try:
-            return math.isfinite(float(value))
-        except (TypeError, ValueError):
+        return _is_finite_number(value)
+
+    def valid_text(value: Any) -> bool:
+        if value is None or isinstance(value, bool):
             return False
-    missing_timestamp = sum(not finite(value) for value in timestamps)
+        try:
+            if math.isnan(float(value)):
+                return False
+        except (TypeError, ValueError):
+            pass
+        return bool(str(value).strip())
+
+    missing_timestamp = sum(not _timestamp_value_valid(value) for value in timestamps)
+    invalid_track_id = sum(not valid_text(value) for value in tracks)
+    invalid_category = sum(not valid_text(value) for value in categories)
     invalid_center = sum(not all(finite(axis[index]) for axis in centers) for index in range(len(timestamps)))
     invalid_size = sum(not all(finite(axis[index]) and float(axis[index]) > 0 for axis in sizes) for index in range(len(timestamps)))
     invalid_orientation = 0
+    epsilon = 1e-12
     for index in range(len(timestamps)):
         values = [axis[index] for axis in orientations]
-        invalid_orientation += int(not all(finite(value) for value in values) or math.sqrt(sum(float(value) ** 2 for value in values)) == 0)
-    status = "OK" if not any((missing_timestamp, invalid_center, invalid_size, invalid_orientation)) else "INVALID_ROWS"
-    time_summary = _numeric_summary(timestamps)
+        invalid_orientation += int(not all(finite(value) for value in values) or math.sqrt(sum(float(value) ** 2 for value in values)) <= epsilon)
+    invalid_row_count = 0
+    for index in range(len(timestamps)):
+        row_invalid = (
+            not _timestamp_value_valid(timestamps[index])
+            or not valid_text(tracks[index])
+            or not valid_text(categories[index])
+            or not all(finite(axis[index]) for axis in centers)
+            or not all(finite(axis[index]) and float(axis[index]) > 0 for axis in sizes)
+            or not all(finite(axis[index]) for axis in orientations)
+            or math.sqrt(sum(float(axis[index]) ** 2 for axis in orientations)) <= epsilon
+        )
+        invalid_row_count += int(row_invalid)
+    status = "OK" if invalid_row_count == 0 else "INVALID_ROWS"
+    time_summary = _timestamp_summary(timestamps)
     return {
         "status": status,
         "row_count": len(frame),
+        "valid_row_count": len(frame) - invalid_row_count,
+        "invalid_row_count": invalid_row_count,
         "unique_timestamp_count": time_summary["unique_count"],
         "min_timestamp": time_summary["min"],
         "max_timestamp": time_summary["max"],
-        "unique_track_count": len({str(value) for value in tracks if value is not None}),
-        "categories": sorted({str(value) for value in categories if value is not None}),
+        "unique_track_count": len({str(value).strip() for value in tracks if valid_text(value)}),
+        "categories": sorted({str(value).strip() for value in categories if valid_text(value)}),
         "missing_timestamp_count": missing_timestamp,
+        "invalid_track_id_count": invalid_track_id,
+        "invalid_category_count": invalid_category,
         "invalid_center_count": invalid_center,
         "invalid_size_count": invalid_size,
         "invalid_orientation_count": invalid_orientation,
@@ -458,6 +587,14 @@ def _obstacle_inventory(path: Path) -> Dict[str, Any]:
     }
 
 
+def _finite_point(value: Any) -> bool:
+    return isinstance(value, Mapping) and all(_is_finite_number(value.get(axis)) for axis in ("x", "y", "z"))
+
+
+def _valid_point_sequence(value: Any, minimum: int = 2) -> bool:
+    return _has_geometry_points(value, minimum) and all(_finite_point(point) for point in value)
+
+
 def _map_status(clip_dir: Path, engine_status: str) -> Dict[str, Any]:
     sources: Dict[str, Any] = {}
     for name in ("clipgt/drivable_space.parquet", "clipgt/lane.parquet", "clipgt/intersection_area.parquet", "clipgt/road_boundary.parquet"):
@@ -469,7 +606,7 @@ def _map_status(clip_dir: Path, engine_status: str) -> Dict[str, Any]:
                 field for field in inspected.get("nested_field_paths", [])
                 if any(token in field.lower() for token in ("location", "geometry", "polygon", "left_rail", "right_rail", "shape"))
             ]
-            item.update({"status": inspected.get("status"), "row_count": inspected.get("row_count"), "geometry_fields": geometry_fields, "valid_geometry_count": None, "invalid_geometry_count": None, "valid_polygon_count": None, "invalid_polygon_count": None})
+            item.update({"status": inspected.get("status"), "row_count": inspected.get("row_count"), "geometry_fields": geometry_fields, "structurally_valid_geometry_count": None, "structurally_invalid_geometry_count": None})
             if inspected.get("status") == "OK" and geometry_fields:
                 import pandas as pd
 
@@ -478,14 +615,19 @@ def _map_status(clip_dir: Path, engine_status: str) -> Dict[str, Any]:
                 if source_name == "lane":
                     left = _frame_path_values(frame, "lane.left_rail")
                     right = _frame_path_values(frame, "lane.right_rail")
-                    valid = [_has_geometry_points(a) and _has_geometry_points(b) for a, b in zip(left, right)]
+                    valid = [_valid_point_sequence(a) and _valid_point_sequence(b) for a, b in zip(left, right)]
+                    item["geometry_field"] = "lane.left_rail + lane.right_rail"
                 else:
                     top = source_name
-                    locations = _frame_path_values(frame, f"{top}.location")
-                    valid = [_has_geometry_points(value) for value in locations]
-                item["valid_geometry_count"] = sum(valid)
-                item["invalid_geometry_count"] = len(valid) - sum(valid)
-                if item["valid_geometry_count"] == 0:
+                    geometry_path = next((field for field in geometry_fields if field == f"{top}.location"), None)
+                    if geometry_path is None:
+                        geometry_path = next((field.split("[]", 1)[0] for field in geometry_fields if field.startswith(f"{top}.location[]")), None)
+                    locations = _frame_path_values(frame, geometry_path) if geometry_path else []
+                    valid = [_valid_point_sequence(value) for value in locations]
+                    item["geometry_field"] = geometry_path
+                item["structurally_valid_geometry_count"] = sum(valid)
+                item["structurally_invalid_geometry_count"] = len(valid) - sum(valid)
+                if item["structurally_valid_geometry_count"] == 0:
                     item["status"] = "NO_VALID_GEOMETRY"
         sources[name] = item
     exists = [value["exists"] for value in sources.values()]
@@ -495,11 +637,22 @@ def _map_status(clip_dir: Path, engine_status: str) -> Dict[str, Any]:
         status = "PARQUET_ENGINE_UNAVAILABLE"
     else:
         existing_sources = [value for value in sources.values() if value["exists"]]
-        if any(value.get("status") == "NO_VALID_GEOMETRY" or (value.get("valid_geometry_count") == 0 and value.get("invalid_geometry_count", 0) > 0) for value in existing_sources):
+        if any(value.get("status") == "NO_VALID_GEOMETRY" or (value.get("structurally_valid_geometry_count") == 0 and value.get("structurally_invalid_geometry_count", 0) > 0) for value in existing_sources):
             status = "NO_VALID_GEOMETRY"
         else:
-            status = "OK" if all(value.get("status") == "OK" and value.get("valid_geometry_count", 0) > 0 for value in existing_sources) else "PARTIAL"
-    return {"status": status, "sources": sources, "drivable_space_available": bool((clip_dir / "clipgt/drivable_space.parquet").is_file()), "lane_available": bool((clip_dir / "clipgt/lane.parquet").is_file()), "intersection_available": bool((clip_dir / "clipgt/intersection_area.parquet").is_file()), "recommended_dac_source": "drivable_space" if (clip_dir / "clipgt/drivable_space.parquet").is_file() else "lane_plus_intersection" if (clip_dir / "clipgt/lane.parquet").is_file() and (clip_dir / "clipgt/intersection_area.parquet").is_file() else None}
+            status = "STRUCTURAL_GEOMETRY_AVAILABLE" if all(value.get("status") == "OK" and value.get("structurally_valid_geometry_count", 0) > 0 for value in existing_sources) else "PARTIAL"
+    drivable = sources.get("clipgt/drivable_space.parquet", {})
+    lane = sources.get("clipgt/lane.parquet", {})
+    intersection = sources.get("clipgt/intersection_area.parquet", {})
+    drivable_structural = drivable.get("structurally_valid_geometry_count", 0) > 0
+    candidate_lane = lane.get("structurally_valid_geometry_count", 0) > 0
+    candidate_intersection = intersection.get("structurally_valid_geometry_count", 0) > 0
+    dac_candidate = drivable_structural or (candidate_lane and candidate_intersection)
+    recommended = "drivable_space" if drivable_structural else "lane_plus_intersection" if candidate_lane and candidate_intersection else None
+    dac_verified = False
+    if dac_candidate and status not in {"FILE_NOT_FOUND", "PARQUET_ENGINE_UNAVAILABLE", "NO_VALID_GEOMETRY"}:
+        status = "UNVERIFIED_DAC_GEOMETRY" if drivable_structural else "DAC_CANDIDATE_AVAILABLE"
+    return {"status": status, "ready": dac_verified, "sources": sources, "geometry_available": any(exists), "dac_candidate_available": dac_candidate, "dac_geometry_verified": dac_verified, "drivable_space_available": bool((clip_dir / "clipgt/drivable_space.parquet").is_file()), "lane_available": bool((clip_dir / "clipgt/lane.parquet").is_file()), "intersection_available": bool((clip_dir / "clipgt/intersection_area.parquet").is_file()), "recommended_dac_source": recommended}
 
 
 def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
@@ -518,9 +671,9 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
 
 def audit_dataset(dataset_root: Path, prediction_jsonl: Path, ground_truth_jsonl: Path, output_dir: Path, context_jsonl: Optional[Path] = None) -> Dict[str, Any]:
     clips, duplicate_ids = discover_clip_dirs(dataset_root)
-    predictions = _jsonl_index(prediction_jsonl)
-    ground_truth = _jsonl_index(ground_truth_jsonl)
-    contexts = _jsonl_index(context_jsonl)
+    predictions, prediction_errors, prediction_duplicates = _jsonl_index_with_errors(prediction_jsonl, "prediction")
+    ground_truth, ground_truth_errors, ground_truth_duplicates = _jsonl_index_with_errors(ground_truth_jsonl, "ground_truth")
+    contexts, context_errors, context_duplicates = _jsonl_index_with_errors(context_jsonl, "context")
     engine = parquet_engine()
     inventory: List[Dict[str, Any]] = []
     time_rows: List[Dict[str, Any]] = []
@@ -530,7 +683,7 @@ def audit_dataset(dataset_root: Path, prediction_jsonl: Path, ground_truth_jsonl
     map_rows: List[Dict[str, Any]] = []
     ego_rows: List[Dict[str, Any]] = []
     official_rows: List[Dict[str, Any]] = []
-    errors: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = prediction_errors + ground_truth_errors + context_errors
     contracts: Dict[str, Dict[str, Any]] = {}
 
     for clip_id, clip_dir in clips.items():
@@ -539,7 +692,7 @@ def audit_dataset(dataset_root: Path, prediction_jsonl: Path, ground_truth_jsonl
             gt = ground_truth.get(clip_id, {})
             context = contexts.get(clip_id, {})
             present = {_inventory_field(name): (clip_dir / name).is_file() for name in REQUIRED_CLIP_FILES}
-            inventory.append({"clip_id": clip_id, "prediction_exists": bool(pred), "ground_truth_exists": bool(gt), **present, "duplicate_clip_id": clip_id in duplicate_ids})
+            inventory.append({"clip_id": clip_id, "prediction_exists": bool(pred), "ground_truth_exists": bool(gt), **present, "duplicate_clip_id": clip_id in duplicate_ids, "prediction_duplicate": clip_id in prediction_duplicates, "ground_truth_duplicate": clip_id in ground_truth_duplicates, "context_duplicate": clip_id in context_duplicates})
             pred_t0, gt_t0 = _row_t0(pred), _row_t0(gt)
             obstacle_summary = _parquet_timestamp_summary(clip_dir / "clipgt/obstacle.parquet")
             obstacle_details = _obstacle_inventory(clip_dir / "clipgt/obstacle.parquet") if (clip_dir / "clipgt/obstacle.parquet").is_file() and obstacle_summary.get("status") == "OK" else {}
@@ -547,20 +700,19 @@ def audit_dataset(dataset_root: Path, prediction_jsonl: Path, ground_truth_jsonl
                 obstacle_summary.update({key: value for key, value in obstacle_details.items() if key not in {"status", "row_count"}})
                 obstacle_summary["status"] = obstacle_details.get("status", obstacle_summary.get("status"))
             ego_summary = _parquet_timestamp_summary(clip_dir / "clipgt/egomotion_estimate.parquet")
-            clip_summary = _parquet_timestamp_summary(clip_dir / "clipgt/clip.parquet")
+            clip_summary = _parquet_clip_interval_summary(clip_dir / "clipgt/clip.parquet")
             pose_summary = _parquet_timestamp_summary(clip_dir / "clipgt/pose_record.parquet") if (clip_dir / "clipgt/pose_record.parquet").is_file() else {"status": "FILE_NOT_FOUND"}
             obstacle_min, obstacle_max = obstacle_summary.get("min"), obstacle_summary.get("max")
             obs_range = obstacle_max - obstacle_min if obstacle_min is not None and obstacle_max is not None else None
             candidate_delta = (pred_t0 - obstacle_min) if pred_t0 is not None and obstacle_min is not None else None
             mapping = context.get("time_alignment") if isinstance(context.get("time_alignment"), dict) else context.get("time_mapping") if isinstance(context.get("time_mapping"), dict) else {}
-            explicit_mapping = bool(mapping.get("verified") is True or mapping.get("status") in {"ALIGNED_BY_EXPLICIT_METADATA", "validated"})
             mapping_source = mapping.get("source") or mapping.get("mapping_source")
+            explicit_mapping = bool(mapping.get("verified") is True and bool(mapping_source))
             status = "MISSING_TIME_METADATA" if pred_t0 is None or gt_t0 is None else "CONFLICTING_TIME_ORIGIN" if pred_t0 != gt_t0 else "UNRESOLVED"
             if explicit_mapping:
-                status = "ALIGNED_BY_EXPLICIT_METADATA"
-            if status == "UNRESOLVED" and obstacle_summary.get("status") == "OK" and obs_range is not None and obstacle_min <= pred_t0 <= obstacle_max:
-                status = "ALIGNED_DIRECT"
-            time_rows.append({"clip_id": clip_id, "prediction_t0_us": pred_t0, "gt_t0_us": gt_t0, "clip_start_timestamp": clip_summary.get("min"), "clip_end_timestamp": clip_summary.get("max"), "obstacle_min_timestamp": obstacle_min, "obstacle_max_timestamp": obstacle_max, "egomotion_min_timestamp": ego_summary.get("min"), "egomotion_max_timestamp": ego_summary.get("max"), "sensor_min_timestamp": None, "sensor_max_timestamp": None, "pose_min_timestamp": pose_summary.get("min"), "pose_max_timestamp": pose_summary.get("max"), "clock_domains_detected": json.dumps([x for x in ("prediction_t0" if pred_t0 is not None else None, "ground_truth_t0" if gt_t0 is not None else None, obstacle_summary.get("field"), ego_summary.get("field")) if x]), "possible_explicit_mapping_found": explicit_mapping, "mapping_source": mapping_source, "candidate_prediction_obstacle_delta_us": candidate_delta, "time_alignment_status": status})
+                status = mapping.get("status") if mapping.get("status") in {"ALIGNED_DIRECT", "ALIGNED_BY_EXPLICIT_METADATA"} else "ALIGNED_BY_EXPLICIT_METADATA"
+            numeric_overlap = bool(pred_t0 is not None and obstacle_min is not None and obstacle_max is not None and obstacle_min <= pred_t0 <= obstacle_max)
+            time_rows.append({"clip_id": clip_id, "prediction_t0_us": pred_t0, "gt_t0_us": gt_t0, "clip_start_timestamp": clip_summary.get("min"), "clip_end_timestamp": clip_summary.get("max"), "obstacle_min_timestamp": obstacle_min, "obstacle_max_timestamp": obstacle_max, "egomotion_min_timestamp": ego_summary.get("min"), "egomotion_max_timestamp": ego_summary.get("max"), "sensor_min_timestamp": None, "sensor_max_timestamp": None, "pose_min_timestamp": pose_summary.get("min"), "pose_max_timestamp": pose_summary.get("max"), "clock_domains_detected": json.dumps([x for x in ("prediction_t0" if pred_t0 is not None else None, "ground_truth_t0" if gt_t0 is not None else None, obstacle_summary.get("selected_timestamp_field"), ego_summary.get("selected_timestamp_field")) if x]), "possible_explicit_mapping_found": explicit_mapping, "mapping_source": mapping_source, "candidate_prediction_obstacle_delta_us": candidate_delta, "numeric_range_overlap": numeric_overlap, "time_alignment_status": status})
 
             pframe = _first(pred, ("coordinate_frame", "frame", "prediction_frame"))
             gframe = _first(gt, ("coordinate_frame", "future_frame", "frame", "gt_frame"))
@@ -576,39 +728,58 @@ def audit_dataset(dataset_root: Path, prediction_jsonl: Path, ground_truth_jsonl
             transform_available = bool(context.get("transform_chain_available") is True or context.get("transform_source") or metadata_transform_available)
             transform_source = context.get("transform_source") if context.get("transform_source") else "rig_trajectories.json + calibration_estimate.parquet" if metadata_transform_available else None
             if not coord_verified and transform_available:
-                coord_status = "TRANSFORM_AVAILABLE"
+                coord_status = "TRANSFORM_METADATA_AVAILABLE"
             coordinate_rows.append({"clip_id": clip_id, "prediction_frame": pframe, "prediction_anchor": panchor, "gt_frame": gframe, "gt_anchor": ganchor, "obstacle_frame": cframe, "obstacle_anchor": oanchor, "map_frame": mframe, "map_anchor": manchor, "egomotion_frame": None, "sensor_rig_frame": None, "transform_required": None if coord_verified else True, "transform_source": transform_source, "coordinate_alignment_verified": coord_verified, "status": coord_status})
 
             obstacle_ready = obstacle_summary.get("status") == "OK" and obstacle_summary.get("field") is not None
-            obstacle_rows.append({"clip_id": clip_id, "obstacle_row_count": obstacle_summary.get("row_count"), "unique_timestamp_count": obstacle_summary.get("unique_timestamp_count", obstacle_summary.get("unique_count")), "min_timestamp": obstacle_summary.get("min_timestamp", obstacle_min), "max_timestamp": obstacle_summary.get("max_timestamp", obstacle_max), "unique_track_count": obstacle_summary.get("unique_track_count"), "categories": obstacle_summary.get("categories"), "missing_timestamp_count": obstacle_summary.get("missing_timestamp_count"), "invalid_center_count": obstacle_summary.get("invalid_center_count"), "invalid_size_count": obstacle_summary.get("invalid_size_count"), "invalid_orientation_count": obstacle_summary.get("invalid_orientation_count"), "status": obstacle_summary.get("status")})
+            obstacle_rows.append({"clip_id": clip_id, "obstacle_row_count": obstacle_summary.get("row_count"), "valid_row_count": obstacle_summary.get("valid_row_count"), "invalid_row_count": obstacle_summary.get("invalid_row_count"), "unique_timestamp_count": obstacle_summary.get("unique_timestamp_count", obstacle_summary.get("unique_count")), "min_timestamp": obstacle_summary.get("min_timestamp", obstacle_min), "max_timestamp": obstacle_summary.get("max_timestamp", obstacle_max), "selected_timestamp_field": obstacle_summary.get("selected_timestamp_field"), "unique_track_count": obstacle_summary.get("unique_track_count"), "categories": obstacle_summary.get("categories"), "missing_timestamp_count": obstacle_summary.get("missing_timestamp_count"), "invalid_track_id_count": obstacle_summary.get("invalid_track_id_count"), "invalid_category_count": obstacle_summary.get("invalid_category_count"), "invalid_center_count": obstacle_summary.get("invalid_center_count"), "invalid_size_count": obstacle_summary.get("invalid_size_count"), "invalid_orientation_count": obstacle_summary.get("invalid_orientation_count"), "status": obstacle_summary.get("status")})
             cf_start = pred_t0
             cf_end = pred_t0 + 4_000_000 if pred_t0 is not None else None
             ttc_end = pred_t0 + 5_000_000 if pred_t0 is not None else None
             frame_evidence = context.get("observation_frames") or context.get("frame_timestamps_us") or context.get("sensor_timestamps_us")
-            empty_possible = bool(frame_evidence) and obstacle_ready and obstacle_summary.get("unique_count") == 0
-            observation_status = "OBSERVED_EMPTY" if empty_possible else "UNKNOWN" if not obstacle_ready or obstacle_summary.get("unique_count") == 0 else "UNRESOLVED"
-            coverage_rows.append({"clip_id": clip_id, "required_cf_start": cf_start, "required_cf_end": cf_end, "required_ttc_end": ttc_end, "available_frame_count": obstacle_summary.get("unique_count"), "available_frame_min_ts": obstacle_min, "available_frame_max_ts": obstacle_max, "obstacle_timestamp_count": obstacle_summary.get("unique_count"), "confirmed_observed_empty_possible": empty_possible, "cf_required_frames": 41 if pred_t0 is not None else None, "cf_observed_frames": obstacle_summary.get("unique_count") if obstacle_ready else None, "cf_empty_frames": 41 if empty_possible else 0, "cf_missing_frames": 0 if empty_possible else None, "ttc_required_queries": 51 if pred_t0 is not None else None, "ttc_observed_queries": obstacle_summary.get("unique_count") if obstacle_ready else None, "ttc_empty_queries": 51 if empty_possible else 0, "ttc_missing_queries": 0 if empty_possible else None, "observation_contract_status": observation_status})
+            completeness_verified = bool(context.get("obstacle_table_complete") is True or context.get("observation_completeness_verified") is True or isinstance(context.get("observation_contract"), dict) and context["observation_contract"].get("complete") is True)
+            evidence_values = frame_evidence if isinstance(frame_evidence, list) else []
+            evidence_timestamps = [item if isinstance(item, (int, float)) and not isinstance(item, bool) else item.get("timestamp_micros") if isinstance(item, dict) else None for item in evidence_values]
+            evidence_timestamps = [int(value) for value in evidence_timestamps if _timestamp_value_valid(value)]
+            available_frame_count = len(evidence_timestamps) if evidence_timestamps else None
+            empty_possible = bool(evidence_timestamps) and completeness_verified and obstacle_ready and obstacle_summary.get("row_count") == 0
+            observation_status = "OBSERVED_EMPTY" if empty_possible else "UNKNOWN" if not evidence_timestamps or not obstacle_ready else "UNRESOLVED"
+            observed_cf = context.get("cf_observed_frames") if isinstance(context.get("cf_observed_frames"), int) else None
+            observed_ttc = context.get("ttc_observed_queries") if isinstance(context.get("ttc_observed_queries"), int) else None
+            coverage_rows.append({"clip_id": clip_id, "required_cf_start": cf_start, "required_cf_end": cf_end, "required_ttc_end": ttc_end, "available_frame_count": available_frame_count, "available_frame_min_ts": min(evidence_timestamps) if evidence_timestamps else None, "available_frame_max_ts": max(evidence_timestamps) if evidence_timestamps else None, "obstacle_timestamp_count": obstacle_summary.get("unique_timestamp_count", obstacle_summary.get("unique_count")), "confirmed_observed_empty_possible": empty_possible, "cf_required_frames": 41 if pred_t0 is not None else None, "cf_observed_frames": observed_cf, "cf_empty_frames": 41 if empty_possible else 0, "cf_missing_frames": 0 if observed_cf == 41 or empty_possible else None, "ttc_required_queries": 51 if pred_t0 is not None else None, "ttc_observed_queries": observed_ttc, "ttc_empty_queries": 51 if empty_possible else 0, "ttc_missing_queries": 0 if observed_ttc == 51 or empty_possible else None, "observation_contract_status": observation_status})
             map_summary = _map_status(clip_dir, engine["status"])
             map_rows.append({"clip_id": clip_id, **map_summary})
             official_rows.append({"clip_id": clip_id, **{f"{key}_available": (clip_dir / relative).is_file() for key, relative in OFFICIAL_FILES.items()}, "lane_direction_available": "lane.lane_direction" in inspect_parquet(clip_dir / "clipgt/lane.parquet", sample_rows=0).get("nested_field_paths", []), "lane_geometry_available": (clip_dir / "clipgt/lane.parquet").is_file()})
             ego_info = inspect_parquet(clip_dir / "clipgt/egomotion_estimate.parquet", sample_rows=0)
             transform_candidate = all((clip_dir / relative).is_file() for relative in ("rig_trajectories.json", "clipgt/calibration_estimate.parquet"))
-            ego_rows.append({"clip_id": clip_id, "row_count": ego_summary.get("row_count"), "timestamp_min": ego_summary.get("min"), "timestamp_max": ego_summary.get("max"), "timestamp_spacing": ego_summary.get("median_dt"), "position_fields": [field for field in ego_info.get("nested_field_paths", []) if "location." in field], "rotation_fields": [field for field in ego_info.get("nested_field_paths", []) if "orientation." in field], "frame": None, "parent_frame": None, "child_frame": None, "transform_chain_available": transform_candidate, "status": ego_summary.get("status")})
+            ego_rows.append({"clip_id": clip_id, "row_count": ego_summary.get("row_count"), "timestamp_min": ego_summary.get("min"), "timestamp_max": ego_summary.get("max"), "timestamp_spacing": ego_summary.get("median_dt"), "timestamp_field": ego_summary.get("selected_timestamp_field"), "position_fields": [field for field in ego_info.get("nested_field_paths", []) if "location." in field], "rotation_fields": [field for field in ego_info.get("nested_field_paths", []) if "orientation." in field], "frame": None, "parent_frame": None, "child_frame": None, "transform_metadata_available": transform_candidate, "transform_chain_verified": False, "transform_chain_available": False, "status": ego_summary.get("status")})
             blockers: List[str] = []
             if not pred: blockers.append("PREDICTION_MISSING")
             if not gt: blockers.append("GT_MISSING")
+            if clip_id in prediction_duplicates: blockers.append("PREDICTION_DUPLICATE")
+            if clip_id in ground_truth_duplicates: blockers.append("GT_DUPLICATE")
+            if clip_id in context_duplicates: blockers.append("CONTEXT_DUPLICATE")
             if status not in {"ALIGNED_DIRECT", "ALIGNED_BY_EXPLICIT_METADATA"}: blockers.append("TIME_ALIGNMENT_UNRESOLVED")
             if not coord_verified: blockers.append("COORDINATE_UNRESOLVED")
             if not obstacle_ready: blockers.append("OBSTACLE_SCHEMA_INVALID")
             blockers.append("OBSERVATION_COVERAGE_INCOMPLETE")
-            if map_summary["status"] not in {"OK"}:
+            if not map_summary.get("dac_geometry_verified", False):
+                if map_summary.get("status") == "FILE_NOT_FOUND":
+                    blockers.append("MAP_MISSING")
+                elif map_summary.get("status") == "PARQUET_ENGINE_UNAVAILABLE":
+                    blockers.append("PARQUET_ENGINE_UNAVAILABLE")
+                elif map_summary.get("dac_candidate_available"):
+                    blockers.append("DAC_GEOMETRY_UNVERIFIED")
+                else:
+                    blockers.append("MAP_INVALID")
+            elif map_summary["status"] not in {"OK"}:
                 if map_summary["status"] == "FILE_NOT_FOUND":
                     blockers.append("MAP_MISSING")
                 elif map_summary["status"] == "PARQUET_ENGINE_UNAVAILABLE":
                     blockers.append("PARQUET_ENGINE_UNAVAILABLE")
                 else:
                     blockers.append("MAP_INVALID")
-            contracts[clip_id] = {"clip_id": clip_id, "time": {"t0_us": pred_t0, "source": "prediction_jsonl", "verified": status in {"ALIGNED_DIRECT", "ALIGNED_BY_EXPLICIT_METADATA"}}, "coordinate": {"prediction_frame": pframe, "gt_frame": gframe, "obstacle_frame": cframe, "map_frame": mframe, "prediction_anchor": panchor, "gt_anchor": ganchor, "obstacle_anchor": oanchor, "map_anchor": manchor, "transform_required": not coord_verified, "transform_source": transform_source, "verified": coord_verified}, "observation": {"cf_ready": False, "ttc_ready": False, "coverage_source": None}, "map": {"ready": map_summary["status"] == "OK", "source": "clipgt", "status": map_summary["status"]}, "ready_for_proxy": False, "blockers": sorted(set(blockers))}
+            contracts[clip_id] = {"clip_id": clip_id, "time": {"t0_us": pred_t0, "source": "prediction_jsonl", "verified": status in {"ALIGNED_DIRECT", "ALIGNED_BY_EXPLICIT_METADATA"}}, "coordinate": {"prediction_frame": pframe, "gt_frame": gframe, "obstacle_frame": cframe, "map_frame": mframe, "prediction_anchor": panchor, "gt_anchor": ganchor, "obstacle_anchor": oanchor, "map_anchor": manchor, "transform_required": not coord_verified, "transform_source": transform_source, "transform_metadata_available": transform_available, "transform_chain_verified": False, "verified": coord_verified}, "observation": {"cf_ready": False, "ttc_ready": False, "coverage_source": None}, "map": {"ready": bool(map_summary.get("dac_geometry_verified", False)), "source": "clipgt", "status": map_summary["status"], "geometry_available": map_summary.get("geometry_available"), "dac_candidate_available": map_summary.get("dac_candidate_available"), "dac_geometry_verified": map_summary.get("dac_geometry_verified"), "recommended_dac_source": map_summary.get("recommended_dac_source")}, "ready_for_proxy": False, "blockers": sorted(set(blockers))}
         except Exception as exc:
             errors.append({"clip_id": clip_id, "failure_stage": "audit_clip", "failure_type": type(exc).__name__, "failure_reason": str(exc)})
 
@@ -626,7 +797,7 @@ def audit_dataset(dataset_root: Path, prediction_jsonl: Path, ground_truth_jsonl
         _safe_json_dump(output_dir / "contracts" / f"{clip_id}.json", contract)
     eligible = sorted(clip_id for clip_id, contract in contracts.items() if contract["ready_for_proxy"])
     blocked = sorted(clip_id for clip_id in contracts if clip_id not in eligible)
-    summary = {"total_clips": len(clips), "prediction_ready": sum(bool(predictions.get(cid)) for cid in clips), "gt_ready": sum(bool(ground_truth.get(cid)) for cid in clips), "time_ready": sum(c["time"]["verified"] for c in contracts.values()), "coordinate_ready": sum(c["coordinate"]["verified"] for c in contracts.values()), "observation_cf_ready": sum(c["observation"]["cf_ready"] for c in contracts.values()), "observation_ttc_ready": sum(c["observation"]["ttc_ready"] for c in contracts.values()), "map_ready": sum(c["map"]["ready"] for c in contracts.values()), "proxy_ready_clip_count": len(eligible), "eligible_clips": eligible, "blocked_clips": blocked, "duplicate_clip_ids": duplicate_ids, "audit_error_count": len(errors), "parquet_engine": engine, "status": "DATASET_READY" if not blocked and not errors else "DATASET_NOT_READY"}
+    summary = {"total_clips": len(clips), "prediction_ready": sum(bool(predictions.get(cid)) and cid not in prediction_duplicates for cid in clips), "gt_ready": sum(bool(ground_truth.get(cid)) and cid not in ground_truth_duplicates for cid in clips), "time_ready": sum(c["time"]["verified"] for c in contracts.values()), "coordinate_ready": sum(c["coordinate"]["verified"] for c in contracts.values()), "observation_cf_ready": sum(c["observation"]["cf_ready"] for c in contracts.values()), "observation_ttc_ready": sum(c["observation"]["ttc_ready"] for c in contracts.values()), "map_ready": sum(c["map"]["ready"] for c in contracts.values()), "proxy_ready_clip_count": len(eligible), "eligible_clips": eligible, "blocked_clips": blocked, "duplicate_clip_ids": duplicate_ids, "prediction_duplicate_clip_ids": prediction_duplicates, "ground_truth_duplicate_clip_ids": ground_truth_duplicates, "context_duplicate_clip_ids": context_duplicates, "audit_error_count": len(errors), "parquet_engine": engine, "status": "DATASET_READY" if not blocked and not errors else "DATASET_NOT_READY"}
     _safe_json_dump(output_dir / "dataset_readiness_summary.json", summary)
     (output_dir / "eligible_clips.txt").write_text("\n".join(eligible) + ("\n" if eligible else ""), encoding="utf-8")
     (output_dir / "blocked_clips.txt").write_text("\n".join(blocked) + ("\n" if blocked else ""), encoding="utf-8")

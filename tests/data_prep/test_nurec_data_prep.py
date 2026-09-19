@@ -36,7 +36,7 @@ class TestNuRecDataPreparation(unittest.TestCase):
             if "egomotion" in str(path):
                 return {"status": "OK", "row_count": 10, "min": 100, "max": 200, "unique_count": 10, "field": "timestamp_micros", "median_dt": 10}
             return {"status": "OK", "row_count": 10, "min": 100, "max": 200, "unique_count": 10, "field": "timestamp_micros"}
-        return mock.patch.multiple(nurec, _parquet_timestamp_summary=mock.Mock(side_effect=fake_summary), _map_status=mock.Mock(return_value={"status": "OK", "ready": True, "drivable_space_available": True, "lane_available": True, "intersection_available": True}))
+        return mock.patch.multiple(nurec, _parquet_timestamp_summary=mock.Mock(side_effect=fake_summary), _parquet_clip_interval_summary=mock.Mock(return_value={"status": "OK", "min": 100, "max": 200}), _map_status=mock.Mock(return_value={"status": "DAC_CANDIDATE_AVAILABLE", "ready": False, "geometry_available": True, "dac_candidate_available": True, "dac_geometry_verified": False, "drivable_space_available": True, "lane_available": True, "intersection_available": True}))
 
     def test_01_missing_parquet(self):
         with tempfile.TemporaryDirectory() as td:
@@ -94,7 +94,7 @@ class TestNuRecDataPreparation(unittest.TestCase):
 
     def test_06_empty_obstacle_with_frame_evidence_is_observed_empty(self):
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td); self._clip(root); pred, gt, ctx = self._inputs(root, context={"observation_frames": [100, 110]})
+            root = Path(td); self._clip(root); pred, gt, ctx = self._inputs(root, context={"observation_frames": [100, 110], "obstacle_table_complete": True})
             with self._patch_parquet():
                 nurec.audit_dataset(root, pred, gt, root / "audit", ctx)
             row = list(csv_rows(root / "audit" / "observation_coverage.csv"))[0]
@@ -111,6 +111,7 @@ class TestNuRecDataPreparation(unittest.TestCase):
     def test_08_explicit_clock_mapping_is_reported(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td); self._clip(root); pred, gt, ctx = self._inputs(root, context={"time_alignment": {"status": "ALIGNED_BY_EXPLICIT_METADATA", "source": "clip.parquet.start_timestamp"}})
+            ctx.write_text(json.dumps({"clip_id": "clip-a", "time_alignment": {"verified": True, "status": "ALIGNED_BY_EXPLICIT_METADATA", "source": "clip.parquet.start_timestamp"}}) + "\n", encoding="utf-8")
             with self._patch_parquet(): nurec.audit_dataset(root, pred, gt, root / "audit", ctx)
             row = list(csv_rows(root / "audit" / "time_alignment.csv"))[0]
             self.assertEqual(row["time_alignment_status"], "ALIGNED_BY_EXPLICIT_METADATA")
@@ -127,7 +128,7 @@ class TestNuRecDataPreparation(unittest.TestCase):
             root = Path(td); self._clip(root); pred, gt, ctx = self._inputs(root, context={"transform_chain_available": True, "transform_source": "calibration_estimate.parquet"})
             with self._patch_parquet(): nurec.audit_dataset(root, pred, gt, root / "audit", ctx)
             row = list(csv_rows(root / "audit" / "coordinate_contract.csv"))[0]
-            self.assertEqual(row["status"], "TRANSFORM_AVAILABLE")
+            self.assertEqual(row["status"], "TRANSFORM_METADATA_AVAILABLE")
             self.assertEqual(row["coordinate_alignment_verified"], "False")
 
     def test_11_invalid_polygon_is_not_ready(self):
@@ -137,12 +138,12 @@ class TestNuRecDataPreparation(unittest.TestCase):
                 result = nurec.audit_dataset(root, pred, gt, root / "audit")
             self.assertEqual(result["summary"]["map_ready"], 0)
 
-    def test_12_valid_drivable_polygon_can_be_ready_candidate(self):
+    def test_12_structural_drivable_geometry_is_not_dac_ready(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td); self._clip(root); pred, gt, ctx = self._inputs(root)
             with self._patch_parquet():
                 result = nurec.audit_dataset(root, pred, gt, root / "audit")
-            self.assertEqual(result["summary"]["map_ready"], 1)
+            self.assertEqual(result["summary"]["map_ready"], 0)
 
     def test_13_one_bad_clip_does_not_stop_audit(self):
         with tempfile.TemporaryDirectory() as td:
