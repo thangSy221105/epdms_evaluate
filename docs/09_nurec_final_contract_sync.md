@@ -2,7 +2,7 @@
 
 BASE_COMMIT: `c7597b63c0afbac2187751985c0cd3d0c24814c2`
 BRANCH: `fix/nurec-data-prep-final-contract-sync`
-NEW_COMMIT: implementation commit reported after commit
+NEW_COMMIT: `7c7c85a` (`fix(data): synchronize NuRec coverage with scorer contracts`)
 
 This pass is data-preparation-only. No file under `tools/epdms/`, no scorer,
 metric, evaluator, NAVSIM implementation, clock transform, coordinate
