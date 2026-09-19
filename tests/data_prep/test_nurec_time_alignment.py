@@ -6,10 +6,12 @@ from unittest import mock
 
 from tools.data_prep.time_alignment import (
     _camera_records,
+    _timeline_consistency,
     _load_jsonl_clip,
     _timeline_reports,
     audit_time_alignment,
     correspondence_status,
+    extract_semantic_correspondences,
     resolve_time_alignment_evidence,
     summarize_values,
     unit_evidence,
@@ -17,6 +19,38 @@ from tools.data_prep.time_alignment import (
 
 
 class TestNuRecTimeAlignmentEvidence(unittest.TestCase):
+    def test_00_semantic_shared_frame_id_constant_pairs_verify(self):
+        pred = [{"identity_type": "frame_id", "identity_value": "a", "timestamp_us": 100, "semantic_explicit": True, "source_path": "pred"}, {"identity_type": "frame_id", "identity_value": "b", "timestamp_us": 200, "semantic_explicit": True, "source_path": "pred"}]
+        gt = [{"identity_type": "frame_id", "identity_value": "a", "timestamp_us": 100, "semantic_explicit": True, "source_path": "gt"}, {"identity_type": "frame_id", "identity_value": "b", "timestamp_us": 200, "semantic_explicit": True, "source_path": "gt"}]
+        raw = [{"identity_type": "frame_id", "identity_value": "a", "timestamp_us": 5100, "semantic_explicit": True, "source_path": "raw"}, {"identity_type": "frame_id", "identity_value": "b", "timestamp_us": 5200, "semantic_explicit": True, "source_path": "raw"}]
+        pairs = extract_semantic_correspondences(pred, gt, raw)
+        self.assertEqual(len(pairs), 2)
+        self.assertEqual(correspondence_status(pairs, True)["status"], "MAPPING_EXPLICIT")
+
+    def test_00b_semantic_conflicting_offsets_rejected(self):
+        pred = [{"identity_type": "frame_id", "identity_value": str(i), "timestamp_us": i * 100, "semantic_explicit": True} for i in (1, 2)]
+        gt = list(pred)
+        raw = [{"identity_type": "frame_id", "identity_value": "1", "timestamp_us": 1100, "semantic_explicit": True}, {"identity_type": "frame_id", "identity_value": "2", "timestamp_us": 2201, "semantic_explicit": True}]
+        pairs = extract_semantic_correspondences(pred, gt, raw)
+        self.assertEqual(correspondence_status(pairs, True)["status"], "CONFLICTING_TIME_ORIGIN")
+
+    def test_00c_same_numbers_without_identity_are_unresolved(self):
+        self.assertEqual(extract_semantic_correspondences([], [], []), [])
+
+    def test_00d_identity_without_same_record_timestamp_is_not_verified(self):
+        pred = [{"identity_type": "frame_id", "identity_value": "x", "timestamp_us": 1, "semantic_explicit": False}]
+        self.assertEqual(extract_semantic_correspondences(pred, pred, pred), [])
+
+    def test_00e_timeline_hash_clean_guided_roles(self):
+        rows = [{"mode": "m", "alpha": 0.0, "clean_waypoints": [{"t_s": 0.1}, {"t_s": 0.2}]}, {"mode": "m", "alpha": 0.5, "guided_waypoints": [{"t_s": 0.1}, {"t_s": 0.2}]}]
+        reports, conflicts = _timeline_consistency(rows)
+        self.assertEqual(len(reports), 2)
+        self.assertEqual(conflicts, [])
+
+    def test_00f_timeline_hash_conflict(self):
+        rows = [{"clean_waypoints": [{"t_s": 0.1}, {"t_s": 0.2}]}, {"clean_waypoints": [{"t_s": 0.1}, {"t_s": 0.3}]}]
+        _, conflicts = _timeline_consistency(rows)
+        self.assertEqual(conflicts, ["PREDICTION_TIMELINE_CONFLICT"])
     def test_01_explicit_shared_clock_is_classifiable(self):
         self.assertEqual(unit_evidence("timestamp_micros")["status"], "UNIT_EXPLICIT")
 
