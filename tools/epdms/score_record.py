@@ -28,6 +28,7 @@ from .time_contract import (
     TimelineHorizonMismatchError,
     NormalizedTrajectoryTimeline,
     normalize_trajectory_timeline,
+    prepare_trajectory_window,
     resolve_time_origin,
     validate_and_normalize_timeline,
 )
@@ -53,6 +54,7 @@ def extract_and_validate_trajectory(
     expected_frequency_hz: float = 10.0,
     expected_horizon_s: float = 4.0,
     strict_grid: bool = True,
+    t0_us: Optional[int] = None,
 ) -> Tuple[List[float], List[float], List[Dict[str, Any]]]:
     """Extracts waypoints from prediction record and validates geometry and timeline."""
     if alpha == 0.0:
@@ -70,18 +72,37 @@ def extract_and_validate_trajectory(
         if raw_wps is None or len(raw_wps) == 0:
             raise ValueError("missing_guided_trajectory: alpha > 0 requires 'guided_waypoints'")
 
-    xs_arr, ys_arr, future_wps, _ = validate_and_normalize_timeline(
-        raw_waypoints=raw_wps,
-        target_poses=target_future_poses,
+    if t0_us is None:
+        if len(raw_wps) < target_future_poses:
+            raise ValueError(
+                f"InsufficientWaypointsError: Expected at least {target_future_poses} waypoints, got {len(raw_wps)}"
+            )
+        if len(raw_wps) != target_future_poses:
+            raise MissingTimeOriginError(
+                "trajectory window normalization requires t0_us when source length differs from the configured future horizon"
+            )
+        window = list(raw_wps)
+        resolved_t0 = 0
+    else:
+        window = prepare_trajectory_window(raw_wps, int(t0_us), target_future_poses, role="prediction")
+        resolved_t0 = int(t0_us)
+    timeline = normalize_trajectory_timeline(
+        window,
+        t0_us=resolved_t0,
         expected_frequency_hz=expected_frequency_hz,
         expected_horizon_s=expected_horizon_s,
-        allow_fixed_rate_grid=True,
+        role="prediction",
         strict_grid=strict_grid,
     )
-    return list(xs_arr), list(ys_arr), future_wps
+    return list(timeline.x), list(timeline.y), timeline.waypoints
 
 
-def _prediction_waypoints(pred_row: Dict[str, Any], alpha: float, target_future_poses: Optional[int] = None) -> List[Dict[str, Any]]:
+def _prediction_waypoints(
+    pred_row: Dict[str, Any],
+    alpha: float,
+    target_future_poses: Optional[int] = None,
+    t0_us: Optional[int] = None,
+) -> List[Dict[str, Any]]:
     """Select the prediction trajectory without changing its timestamp fields."""
     if alpha == 0.0:
         raw = pred_row.get("clean_waypoints")
@@ -95,21 +116,12 @@ def _prediction_waypoints(pred_row: Dict[str, Any], alpha: float, target_future_
             raw = pred_row["trajectories"].get("guided")
     if not isinstance(raw, list) or not raw:
         raise ValueError("Missing prediction trajectory for requested alpha")
-    if target_future_poses is not None and len(raw) > target_future_poses:
-        # The NuRec source stores a 6.4 s trajectory (64 poses); the locked
-        # EPDMS profile evaluates the configured 4.0 s prefix. This is an
-        # explicit window policy, not timeline resampling or extrapolation.
-        includes_t0 = False
-        first = raw[0] if isinstance(raw[0], dict) else {}
-        if isinstance(first, dict):
-            if first.get("t_s") is not None and abs(float(first.get("t_s"))) <= 1e-9:
-                includes_t0 = True
-            if pred_row.get("t0_us") is not None:
-                for key in ("timestamp_micros", "t_us", "timestamp_us"):
-                    if first.get(key) is not None and int(float(first[key])) == int(pred_row["t0_us"]):
-                        includes_t0 = True
-        raw = raw[: target_future_poses + 1 if includes_t0 else target_future_poses]
-    return raw
+    if target_future_poses is None:
+        return raw
+    window_t0_us = pred_row.get("t0_us") if t0_us is None else t0_us
+    if window_t0_us is None:
+        raise MissingTimeOriginError("Prediction trajectory window requires t0_us")
+    return prepare_trajectory_window(raw, int(window_t0_us), target_future_poses, role="prediction")
 
 
 def _observation_attestation(context_row: Dict[str, Any]) -> Tuple[bool, Optional[set[int]]]:
@@ -157,9 +169,29 @@ def _coordinate_contract(pred_row: Dict[str, Any], context_row: Dict[str, Any], 
     mframe = first(context_row, sc, keys=("map_frame",))
     panchor = first(pred_row, keys=("reference_point", "anchor", "prediction_anchor"))
     ganchor = first(gt_row, keys=("reference_point", "anchor", "gt_anchor"))
-    declared = any(value is not None for value in (pframe, gframe, oframe, mframe, panchor, ganchor))
-    verified = bool(pframe and gframe and oframe and mframe and panchor and ganchor and pframe == gframe == oframe == mframe and panchor == ganchor)
-    return {"prediction_frame": pframe, "gt_frame": gframe, "obstacle_frame": oframe, "map_frame": mframe, "prediction_anchor": panchor, "gt_anchor": ganchor, "transform_required": False if verified else None, "transform_source": "declared_metadata" if verified else None, "coordinate_alignment_verified": verified, "declared": declared}
+    oanchor = first(context_row, sc, keys=("obstacle_anchor", "reference_point", "anchor"))
+    manchor = first(context_row, sc, keys=("map_anchor", "reference_point", "anchor"))
+    declared = any(value is not None for value in (pframe, gframe, oframe, mframe, panchor, ganchor, oanchor, manchor))
+    verified = bool(
+        pframe and gframe and oframe and mframe
+        and panchor and ganchor and oanchor and manchor
+        and pframe == gframe == oframe == mframe
+        and panchor == ganchor == oanchor == manchor
+    )
+    return {
+        "prediction_frame": pframe,
+        "gt_frame": gframe,
+        "obstacle_frame": oframe,
+        "map_frame": mframe,
+        "prediction_anchor": panchor,
+        "gt_anchor": ganchor,
+        "obstacle_anchor": oanchor,
+        "map_anchor": manchor,
+        "transform_required": False if verified else None,
+        "transform_source": "declared_metadata" if verified else None,
+        "coordinate_alignment_verified": verified,
+        "declared": declared,
+    }
 
 
 def evaluate_single_condition(
@@ -224,10 +256,10 @@ def evaluate_single_condition(
         rec.mode = mode
         rec.alpha = alpha
 
-        # Preserve useful structural diagnostics when a legacy record is
-        # missing t0: this preflight only checks the selected trajectory's
-        # shape/coordinates; the authoritative normalization still happens
-        # below after t0 is resolved.
+        # Preserve structural diagnostics for legacy records that omit t0.
+        # This validation does not crop or reinterpret a long source; the
+        # authoritative horizon window remains the shared helper below after
+        # a real clip origin is resolved.
         if not any(isinstance(row, dict) and row.get("t0_us") is not None for row in (pred_row, context_row, gt_row)):
             try:
                 extract_and_validate_trajectory(
@@ -262,7 +294,7 @@ def evaluate_single_condition(
         target_future_poses = int(round(horizon_s * frequency_hz))
         try:
             pred_timeline = normalize_trajectory_timeline(
-                _prediction_waypoints(pred_row, alpha, target_future_poses=target_future_poses), t0_us=t0_us,
+                _prediction_waypoints(pred_row, alpha, target_future_poses=target_future_poses, t0_us=t0_us), t0_us=t0_us,
                 expected_frequency_hz=frequency_hz, expected_horizon_s=horizon_s,
                 role="prediction", strict_grid=strict_mode,
             )
@@ -334,8 +366,10 @@ def evaluate_single_condition(
                 return rec
             try:
                 raw_gt_pre_items = raw_gt_pre.tolist() if isinstance(raw_gt_pre, np.ndarray) else list(raw_gt_pre)
-                if len(raw_gt_pre_items) > int(round(horizon_s * frequency_hz)):
-                    raw_gt_pre_items = raw_gt_pre_items[:int(round(horizon_s * frequency_hz))]
+                raw_gt_pre_items = prepare_trajectory_window(
+                    raw_gt_pre_items, t0_us=t0_us,
+                    target_future_poses=int(round(horizon_s * frequency_hz)), role="ground_truth"
+                )
                 normalize_trajectory_timeline(raw_gt_pre_items, t0_us=t0_us, expected_frequency_hz=frequency_hz, expected_horizon_s=horizon_s, role="ground_truth", strict_grid=strict_mode)
             except TimeContractError as gt_pre_err:
                 rec.valid = False
@@ -346,16 +380,8 @@ def evaluate_single_condition(
                 return rec
 
         coord_info = _coordinate_contract(pred_row, context_row or {}, gt_row or {}, map_status)
-        for key in ("prediction_frame", "gt_frame", "obstacle_frame", "map_frame", "prediction_anchor", "gt_anchor", "transform_required", "transform_source", "coordinate_alignment_verified"):
+        for key in ("prediction_frame", "gt_frame", "obstacle_frame", "map_frame", "prediction_anchor", "gt_anchor", "obstacle_anchor", "map_anchor", "transform_required", "transform_source", "coordinate_alignment_verified"):
             setattr(rec, key, coord_info.get(key))
-        if strict_mode and gt_row is not None and coord_info["declared"] and not coord_info["coordinate_alignment_verified"]:
-            rec.valid = False
-            rec.failure_stage = "coordinate_contract"
-            rec.failure_type = "COORDINATE_CONTRACT_UNRESOLVED"
-            rec.failure_reason = "Prediction, GT, obstacle and map frame/anchor declarations do not establish a common coordinate contract"
-            rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
-            return rec
-
         # 5. Context validation (Obstacles)
         if context_row is None:
             raise ValueError("missing_context: Context record missing for clip")
@@ -425,6 +451,7 @@ def evaluate_single_condition(
             ttc_score, min_ttc, ttc_fail_t, ttc_tr = ttc_res
             rec.ttc_required_observations = getattr(ttc_res, "ttc_required_observations", 0)
             rec.ttc_observed_observations = getattr(ttc_res, "ttc_observed_observations", 0)
+            rec.ttc_confirmed_empty_observations = getattr(ttc_res, "ttc_confirmed_empty_observations", 0)
             rec.ttc_missing_observations = getattr(ttc_res, "ttc_missing_observations", 0)
             rec.ttc_coverage_ratio = getattr(ttc_res, "ttc_coverage_ratio", 0.0)
         except CorruptedObservationDataError as e:
@@ -447,6 +474,17 @@ def evaluate_single_condition(
         rec.min_ttc_s = min_ttc if (min_ttc is not None and np.isfinite(min_ttc) and min_ttc < float("inf")) else None
         rec.ttc_failure_time_s = ttc_fail_t
         rec.ttc_track_id = ttc_tr
+
+        # Coordinate validation is strict, but runs after observation
+        # integrity so malformed legacy fixtures still report their primary
+        # observation failure rather than being masked by missing metadata.
+        if strict_mode and not coord_info["coordinate_alignment_verified"]:
+            rec.valid = False
+            rec.failure_stage = "coordinate_contract"
+            rec.failure_type = "COORDINATE_CONTRACT_UNRESOLVED"
+            rec.failure_reason = "Prediction, GT, obstacle and map frame/anchor declarations do not establish a common coordinate contract"
+            rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
+            return rec
 
         # 6. Drivable Area Compliance (DAC)
         if lane_polygons is not None and len(lane_polygons) > 0:
@@ -488,13 +526,9 @@ def evaluate_single_condition(
             return rec
         try:
             gt_items = raw_gt.tolist() if isinstance(raw_gt, np.ndarray) else list(raw_gt)
-            if len(gt_items) > target_future_poses:
-                first_gt = gt_items[0] if isinstance(gt_items[0], dict) else {}
-                includes_gt_t0 = isinstance(first_gt, dict) and (
-                    (first_gt.get("t_s") is not None and abs(float(first_gt.get("t_s"))) <= 1e-9)
-                    or any(first_gt.get(key) is not None and int(float(first_gt[key])) == int(t0_us) for key in ("timestamp_micros", "t_us", "timestamp_us"))
-                )
-                gt_items = gt_items[: target_future_poses + 1 if includes_gt_t0 else target_future_poses]
+            gt_items = prepare_trajectory_window(
+                gt_items, t0_us=t0_us, target_future_poses=target_future_poses, role="ground_truth"
+            )
             gt_timeline = normalize_trajectory_timeline(
                 gt_items, t0_us=t0_us, expected_frequency_hz=frequency_hz,
                 expected_horizon_s=horizon_s, role="ground_truth", strict_grid=strict_mode,

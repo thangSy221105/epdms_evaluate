@@ -115,6 +115,7 @@ def verify_resume_safety_before_recovery(
             "epdms_errors_300.jsonl",
             "epdms_errors_300.jsonl.tmp",
         ]
+        artifact_names.extend(p.name for p in score_dir.glob("epdms_errors_300_attempt_*.jsonl*"))
 
     manifest_path = score_dir / manifest_filename
 
@@ -151,34 +152,76 @@ def verify_resume_safety_before_recovery(
             f"Existing artifacts ({existing_artifacts}) belong to a different run configuration."
         )
 
-    # If a target and its pending .tmp both contain the same key, recovery is
-    # ambiguous and must stop before modifying either checkpoint.
+    # Reject internal duplicates and target/.tmp overlap before recovery.
+    def _keys(path: Path) -> Set[str]:
+        found: Set[str] = set()
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    row = json.loads(line)
+                    key = row.get("record_key")
+                    if not key:
+                        continue
+                    key = str(key)
+                    if key in found:
+                        raise AmbiguousCheckpointError(
+                            f"AMBIGUOUS_CHECKPOINT: {path.name} contains duplicate record key {key}"
+                        )
+                    found.add(key)
+        except AmbiguousCheckpointError:
+            raise
+        except Exception as exc:
+            raise RunIdentityError(f"Resume rejected: cannot inspect checkpoint {path.name}: {exc}") from exc
+        return found
+
     for target_name in ("epdms_scores_300.jsonl", "epdms_errors_300.jsonl"):
         target = score_dir / target_name
         temp = score_dir / f"{target_name}.tmp"
-        if not (target.is_file() and target.stat().st_size > 0 and temp.is_file() and temp.stat().st_size > 0):
-            continue
-
-        def _keys(path: Path) -> Set[str]:
-            found: Set[str] = set()
-            try:
-                with path.open("r", encoding="utf-8") as handle:
-                    for line in handle:
-                        if line.strip():
-                            row = json.loads(line)
-                            if row.get("record_key"):
-                                found.add(str(row["record_key"]))
-            except Exception as exc:
-                raise RunIdentityError(f"Resume rejected: cannot inspect checkpoint {path.name}: {exc}") from exc
-            return found
-
-        overlap = _keys(target) & _keys(temp)
+        target_keys = _keys(target) if target.is_file() and target.stat().st_size > 0 else set()
+        temp_keys = _keys(temp) if temp.is_file() and temp.stat().st_size > 0 else set()
+        overlap = target_keys & temp_keys
         if overlap:
             raise AmbiguousCheckpointError(
                 f"AMBIGUOUS_CHECKPOINT: {target.name} and {temp.name} overlap on record keys {sorted(overlap)[:5]}"
             )
 
     return prev_manifest
+
+
+def load_latest_checkpoint_states(score_dir: Path, expected_run_id: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    """Load one latest state per record key while preserving retry history."""
+    paths: List[Path] = []
+    for name in ("epdms_scores_300.jsonl", "epdms_errors_300.jsonl"):
+        path = score_dir / name
+        if path.is_file():
+            paths.append(path)
+    paths.extend(sorted(score_dir.glob("epdms_errors_300_attempt_*.jsonl")))
+    states: Dict[str, Dict[str, Any]] = {}
+    for path in paths:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if expected_run_id is not None and row.get("run_id") not in (None, expected_run_id):
+                    continue
+                key = row.get("record_key")
+                if not key:
+                    continue
+                key = str(key)
+                current = states.get(key)
+                try:
+                    attempt = int(row.get("attempt_number", 1))
+                except (TypeError, ValueError):
+                    attempt = 1
+                previous_attempt = int(current.get("attempt_number", 1)) if current else -1
+                if current is None or attempt >= previous_attempt:
+                    states[key] = dict(row)
+                    states[key]["record_key"] = key
+                    states[key]["attempt_number"] = attempt
+    return states
 
 
 def write_manifest_atomic(manifest_path: Path, manifest_data: Dict[str, Any]) -> None:

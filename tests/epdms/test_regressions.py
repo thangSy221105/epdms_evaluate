@@ -299,6 +299,7 @@ class TestPeerReviewRegressions(unittest.TestCase):
             "mode": "cross_scene",
             "alpha": 0.0,
             "t0_us": 5_100_000,
+            "coordinate_frame": "ar1_ego", "reference_point": "rear_axle",
             "clean_waypoints": [{"x_m": i * 0.5, "y_m": 0.0} for i in range(40)]
         }
         context_row = {
@@ -326,6 +327,7 @@ class TestPeerReviewRegressions(unittest.TestCase):
             "mode": "cross_scene",
             "alpha": 0.0,
             "t0_us": 5_100_000,
+            "coordinate_frame": "ar1_ego", "reference_point": "rear_axle",
             "clean_waypoints": [{"x_m": i * 0.5, "y_m": 0.0} for i in range(40)]
         }
         context_row = {
@@ -382,7 +384,9 @@ class TestPeerReviewRegressions(unittest.TestCase):
             "clean_waypoints": [{"x_m": i * 0.5, "y_m": 0.0} for i in range(40)]
         }
         context_empty = {
-            "clip_id": "clip_001",
+            "clip_id": "clip_001", "t0_us": 5_100_000,
+            "coordinate_frame": "ar1_ego", "obstacle_frame": "ar1_ego", "map_frame": "ar1_ego",
+            "obstacle_anchor": "rear_axle", "map_anchor": "rear_axle", "confirmed_empty_scene": True,
             "semantic_context": {"obstacle": {"all_obstacles": []}}
         }
         bad_poly = np.array([[0.0, 0.0], [np.nan, 5.0], [5.0, 5.0]])
@@ -402,7 +406,9 @@ class TestPeerReviewRegressions(unittest.TestCase):
             "clean_waypoints": [{"x_m": i * 0.5, "y_m": 0.0} for i in range(40)]
         }
         context_empty = {
-            "clip_id": "clip_001",
+            "clip_id": "clip_001", "t0_us": 5_100_000,
+            "coordinate_frame": "ar1_ego", "obstacle_frame": "ar1_ego", "map_frame": "ar1_ego",
+            "obstacle_anchor": "rear_axle", "map_anchor": "rear_axle", "confirmed_empty_scene": True,
             "semantic_context": {"obstacle": {"all_obstacles": []}}
         }
         lane_polys = [np.array([[-10.0, -10.0], [50.0, -10.0], [50.0, 10.0], [-10.0, 10.0]])]
@@ -423,14 +429,17 @@ class TestPeerReviewRegressions(unittest.TestCase):
             "mode": "cross_scene",
             "alpha": 0.0,
             "t0_us": 5_100_000,
+            "coordinate_frame": "ar1_ego", "reference_point": "rear_axle",
             "clean_waypoints": [{"x_m": i * 0.5, "y_m": 0.0} for i in range(40)]
         }
         context_empty = {
-            "clip_id": "clip_001",
+            "clip_id": "clip_001", "t0_us": 5_100_000,
+            "coordinate_frame": "ar1_ego", "obstacle_frame": "ar1_ego", "map_frame": "ar1_ego",
+            "obstacle_anchor": "rear_axle", "map_anchor": "rear_axle", "confirmed_empty_scene": True,
             "semantic_context": {"obstacle": {"all_obstacles": []}}
         }
         lane_polys = [np.array([[-10.0, -10.0], [50.0, -10.0], [50.0, 10.0], [-10.0, 10.0]])]
-        gt_row = {"clip_id": "clip_001", "ego_future_xyz": [[i * 0.5, 0.0, 0.0] for i in range(40)]}
+        gt_row = {"clip_id": "clip_001", "t0_us": 5_100_000, "coordinate_frame": "ar1_ego", "reference_point": "rear_axle", "ego_future_xyz": [[i * 0.5, 0.0, 0.0] for i in range(40)]}
         rec = evaluate_single_condition(
             pred_row, context_row=context_empty, gt_row=gt_row, vehicle=self.vehicle, lane_polygons=lane_polys
         )
@@ -481,8 +490,8 @@ class TestPeerReviewRegressions(unittest.TestCase):
     # 27. ADE and FDE metrics computed, and ADE-Safety disagreement detected
     def test_27_ade_fde_computed_and_disagreement_summary(self):
         gt_waypoints = [[float(i), 0.0, 0.0] for i in range(40)]
-        gt_row = {"clip_id": "c1", "ego_future_xyz": gt_waypoints}
-        context_empty = {"clip_id": "c1", "semantic_context": {"obstacle": {"all_obstacles": []}}}
+        gt_row = {"clip_id": "c1", "t0_us": 5_100_000, "coordinate_frame": "ar1_ego", "reference_point": "rear_axle", "ego_future_xyz": gt_waypoints}
+        context_empty = {"clip_id": "c1", "t0_us": 5_100_000, "coordinate_frame": "ar1_ego", "obstacle_frame": "ar1_ego", "map_frame": "ar1_ego", "obstacle_anchor": "rear_axle", "map_anchor": "rear_axle", "confirmed_empty_scene": True, "semantic_context": {"obstacle": {"all_obstacles": []}}}
         lane_polys = [np.array([[-10.0, -10.0], [50.0, -10.0], [50.0, 10.0], [-10.0, 10.0]])]
 
         pred_base = {
@@ -490,6 +499,7 @@ class TestPeerReviewRegressions(unittest.TestCase):
             "mode": "cross_scene",
             "alpha": 0.0,
             "t0_us": 5_100_000,
+            "coordinate_frame": "ar1_ego", "reference_point": "rear_axle",
             "clean_waypoints": [{"x_m": float(i), "y_m": 0.0} for i in range(40)],
         }
         pred_guided = {
@@ -497,6 +507,7 @@ class TestPeerReviewRegressions(unittest.TestCase):
             "mode": "cross_scene",
             "alpha": 0.5,
             "t0_us": 5_100_000,
+            "coordinate_frame": "ar1_ego", "reference_point": "rear_axle",
             "guided_waypoints": [{"x_m": float(i), "y_m": 2.0} for i in range(40)],
         }
 
@@ -529,17 +540,17 @@ class TestPeerReviewRegressions(unittest.TestCase):
             gt_file = td / "gt.jsonl"
 
             r1 = {
-                "clip_id": "c1", "mode": "cross_scene", "alpha": 0.5,
+                "clip_id": "c1", "t0_us": 5_100_000, "mode": "cross_scene", "alpha": 0.5,
                 "guided_waypoints": [{"x_m": float(i), "y_m": 0.0} for i in range(40)]
             }
             r2 = {
-                "clip_id": "c1", "mode": "cross_scene", "alpha": 0.0,
+                "clip_id": "c1", "t0_us": 5_100_000, "mode": "cross_scene", "alpha": 0.0,
                 "clean_waypoints": [{"x_m": float(i), "y_m": 0.0} for i in range(40)]
             }
             with pred_file.open("w", encoding="utf-8") as f:
                 f.write(json.dumps(r1) + "\n" + json.dumps(r2) + "\n")
-            ctx_file.write_text('{"clip_id": "c1"}\n', encoding="utf-8")
-            gt_file.write_text('{"clip_id": "c1"}\n', encoding="utf-8")
+            ctx_file.write_text('{"clip_id": "c1", "t0_us": 5100000}\n', encoding="utf-8")
+            gt_file.write_text('{"clip_id": "c1", "t0_us": 5100000}\n', encoding="utf-8")
 
             cfg = EvaluationConfig({
                 "metric_profile": "nurec_safety_proxy_v1",

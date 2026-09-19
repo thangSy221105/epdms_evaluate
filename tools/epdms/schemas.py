@@ -98,6 +98,7 @@ class EvaluationScoreRecord:
     cf_coverage_ratio: Optional[float] = None
     ttc_required_observations: int = 0
     ttc_observed_observations: int = 0
+    ttc_confirmed_empty_observations: int = 0
     ttc_missing_observations: int = 0
     ttc_coverage_ratio: Optional[float] = None
     invalid_obstacle_count: int = 0
@@ -114,6 +115,8 @@ class EvaluationScoreRecord:
     map_frame: Optional[str] = None
     prediction_anchor: Optional[str] = None
     gt_anchor: Optional[str] = None
+    obstacle_anchor: Optional[str] = None
+    map_anchor: Optional[str] = None
     transform_required: Optional[bool] = None
     transform_source: Optional[str] = None
     coordinate_alignment_verified: bool = False
@@ -181,6 +184,7 @@ class EvaluationScoreRecord:
             "cf_coverage_ratio": self.cf_coverage_ratio,
             "ttc_required_observations": self.ttc_required_observations,
             "ttc_observed_observations": self.ttc_observed_observations,
+            "ttc_confirmed_empty_observations": self.ttc_confirmed_empty_observations,
             "ttc_missing_observations": self.ttc_missing_observations,
             "ttc_coverage_ratio": self.ttc_coverage_ratio,
             "invalid_obstacle_count": self.invalid_obstacle_count,
@@ -195,6 +199,8 @@ class EvaluationScoreRecord:
             "map_frame": self.map_frame,
             "prediction_anchor": self.prediction_anchor,
             "gt_anchor": self.gt_anchor,
+            "obstacle_anchor": self.obstacle_anchor,
+            "map_anchor": self.map_anchor,
             "transform_required": self.transform_required,
             "transform_source": self.transform_source,
             "coordinate_alignment_verified": self.coordinate_alignment_verified,

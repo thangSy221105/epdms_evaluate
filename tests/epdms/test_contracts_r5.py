@@ -131,7 +131,7 @@ class TestContractsRound5(unittest.TestCase):
         frame = {"coordinate_frame": "ar1_ego", "reference_point": "rear_axle"}
         pred = {"clip_id": "r5", "mode": "cross_scene", "alpha": 0.0, "t0_us": self.t0, **frame, "clean_waypoints": self._wps()}
         gt = {"clip_id": "r5", "t0_us": self.t0, **frame, "expert_future": self._wps()}
-        context = {"clip_id": "r5", "t0_us": self.t0, "coordinate_frame": "ar1_ego", "obstacle_frame": "ar1_ego", "map_frame": "ar1_ego", "confirmed_empty_scene": True, "semantic_context": {"obstacle": {"all_obstacles": []}}}
+        context = {"clip_id": "r5", "t0_us": self.t0, "coordinate_frame": "ar1_ego", "obstacle_frame": "ar1_ego", "map_frame": "ar1_ego", "obstacle_anchor": "rear_axle", "map_anchor": "rear_axle", "confirmed_empty_scene": True, "semantic_context": {"obstacle": {"all_obstacles": []}}}
         polygon = [np.asarray([[-20.0, -20.0], [30.0, -20.0], [30.0, 20.0], [-20.0, 20.0]])]
         record = evaluate_single_condition(pred, context, gt, self.vehicle, lane_polygons=polygon, strict_mode=True)
         self.assertTrue(record.valid, record.failure_reason)

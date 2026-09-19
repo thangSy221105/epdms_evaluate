@@ -22,6 +22,8 @@ from .observation_contract import (
     ObservationCoverageDiagnostics,
     ObservationState,
     evaluate_query_coverage,
+    build_ttc_projection_timestamps,
+    expand_confirmed_empty_timestamps,
     index_and_filter_obstacles,
     normalize_and_validate_obstacle,
 )
@@ -132,39 +134,22 @@ def compute_collision_free_proxy(
     n_poses = len(x)
     required_frames = n_poses
 
-    # Confirmed clear road (empty scene)
-    if len(obstacles) == 0:
-        # An empty container is absence of records, not evidence that every
-        # required frame was observed.  Strict production scoring therefore
-        # requires an explicit dataset-level observation attestation.
-        if confirmed_empty_scene or not strict_mode:
-            return CollisionFreeResult(
-                1.0, None, None, [], [],
-                matched_observation_frames=0,
-                required_observation_frames=required_frames,
-                observation_coverage_ratio=1.0,
-                confirmed_empty_frames=required_frames,
-            )
-        return CollisionFreeResult(
-            None, None, None, [], [],
-            matched_observation_frames=0,
-            required_observation_frames=required_frames,
-            observation_coverage_ratio=0.0,
-            missing_frames=required_frames,
-        )
-
     # Index obstacles and validate every record (strict mode raises CorruptedObservationDataError)
     obs_by_time, all_obs_timestamps, invalid_count, missing_ts_count = index_and_filter_obstacles(
         obstacles, raise_on_corrupt=strict_mode
     )
 
     # Evaluate observation coverage on the required ego timestamps
+    effective_empty_timestamps = expand_confirmed_empty_timestamps(
+        timestamps_us, confirmed_empty_timestamps, confirmed_empty_scene
+    )
     states, observed_count, confirmed_empty_count, missing_count, coverage_ratio = evaluate_query_coverage(
-        timestamps_us, obs_by_time, all_obs_timestamps, confirmed_empty_timestamps=confirmed_empty_timestamps
+        timestamps_us, obs_by_time, all_obs_timestamps, confirmed_empty_timestamps=effective_empty_timestamps
     )
 
-    # Gating: In strict mode, if obstacles were present but coverage is incomplete, reject
-    if strict_mode and (missing_count > 0 or observed_count == 0):
+    # Coverage, rather than object-count, is the strict gate. A fully observed
+    # scene may legitimately be empty at every frame.
+    if strict_mode and missing_count > 0:
         return CollisionFreeResult(
             None, None, None, [], [],
             matched_observation_frames=observed_count,
@@ -177,7 +162,7 @@ def compute_collision_free_proxy(
         )
 
     # Non-strict mode fallback check
-    if len(obstacles) > 0 and observed_count == 0 and confirmed_empty_count == 0:
+    if observed_count == 0 and confirmed_empty_count == 0:
         return CollisionFreeResult(
             None, None, None, [], [],
             matched_observation_frames=0,
@@ -321,20 +306,6 @@ def compute_ttc_proxy(
     if len(x) < 2:
         return TtcResult(None, None, None, None)
 
-    if len(obstacles) == 0:
-        # Match CF: strict mode accepts an empty scene only when the caller
-        # supplies independent evidence that the queried frames were observed.
-        if strict_mode and not confirmed_empty_scene:
-            return TtcResult(
-                None, None, None, None,
-                ttc_required_observations=len(x),
-                ttc_observed_observations=0,
-                ttc_confirmed_empty_observations=0,
-                ttc_missing_observations=len(x),
-                ttc_coverage_ratio=0.0,
-            )
-        return TtcResult(1.0, None, None, None, len(x), 0, len(x), 0, 1.0)
-
     # Index obstacles and validate
     obs_by_time, all_obs_timestamps, invalid_count, missing_ts_count = index_and_filter_obstacles(
         obstacles, raise_on_corrupt=strict_mode
@@ -342,26 +313,22 @@ def compute_ttc_proxy(
 
     step_s = 0.2
     dt_proj_list = [round(float(dt), 2) for dt in np.arange(0.0, float(ttc_horizon_s) + 1e-6, step_s)]
-
-    # Collect all unique projection timestamps required by TTC
     n_poses = len(x)
-    all_proj_ts_set: Set[int] = set()
-    for i in range(n_poses):
-        curr_t_us = int(timestamps_us[i])
-        for dt_proj in dt_proj_list:
-            all_proj_ts_set.add(curr_t_us + int(round(dt_proj * 1_000_000)))
-
-    unique_proj_ts = np.array(sorted(all_proj_ts_set), dtype=np.int64)
+    unique_proj_ts = build_ttc_projection_timestamps(timestamps_us, ttc_horizon_s, step_s)
     total_proj_queries = len(unique_proj_ts)
 
     # Evaluate TTC coverage across all projection queries
+    effective_empty_timestamps = expand_confirmed_empty_timestamps(
+        unique_proj_ts, confirmed_empty_timestamps, confirmed_empty_scene
+    )
     ttc_states, ttc_obs, ttc_empty, ttc_missing, ttc_cov_ratio = evaluate_query_coverage(
-        unique_proj_ts, obs_by_time, all_obs_timestamps, confirmed_empty_timestamps=confirmed_empty_timestamps,
+        unique_proj_ts, obs_by_time, all_obs_timestamps, confirmed_empty_timestamps=effective_empty_timestamps,
         half_step_us=100_000
     )
 
-    # Gating in strict mode: if obstacles present but TTC coverage incomplete, reject
-    if strict_mode and (ttc_missing > 0 or ttc_obs == 0):
+    # As with CF, complete per-query empty evidence is a valid observation
+    # state; observed object count must not be required to be positive.
+    if strict_mode and ttc_missing > 0:
         return TtcResult(
             None, None, None, None,
             ttc_required_observations=total_proj_queries,
@@ -371,7 +338,7 @@ def compute_ttc_proxy(
             ttc_coverage_ratio=ttc_cov_ratio,
         )
 
-    if len(obstacles) > 0 and ttc_obs == 0 and ttc_empty == 0:
+    if ttc_obs == 0 and ttc_empty == 0:
         return TtcResult(
             None, None, None, None,
             ttc_required_observations=total_proj_queries,

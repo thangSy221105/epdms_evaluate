@@ -318,3 +318,34 @@ def evaluate_query_coverage(
 
     coverage_ratio = float((observed_count + confirmed_empty_count) / n_queries)
     return states, observed_count, confirmed_empty_count, missing_count, coverage_ratio
+
+
+def expand_confirmed_empty_timestamps(
+    query_timestamps_us: np.ndarray,
+    confirmed_empty_timestamps: Optional[Set[int]] = None,
+    confirmed_empty_scene: bool = False,
+) -> Set[int]:
+    """Combine per-frame attestation with an explicit scene-wide attestation."""
+    result = {int(value) for value in (confirmed_empty_timestamps or set())}
+    if confirmed_empty_scene:
+        result.update(int(value) for value in query_timestamps_us)
+    return result
+
+
+def build_ttc_projection_timestamps(
+    timestamps_us: np.ndarray,
+    ttc_horizon_s: float,
+    step_s: float = 0.2,
+) -> np.ndarray:
+    """Build the exact deduplicated query grid used by TTC scoring."""
+    if len(timestamps_us) == 0:
+        return np.array([], dtype=np.int64)
+    if ttc_horizon_s < 0 or step_s <= 0:
+        raise ValueError("TTC horizon must be non-negative and step must be positive")
+    dt_proj_list = [round(float(dt), 2) for dt in np.arange(0.0, float(ttc_horizon_s) + 1e-6, step_s)]
+    values = {
+        int(timestamp) + int(round(dt * 1_000_000))
+        for timestamp in timestamps_us
+        for dt in dt_proj_list
+    }
+    return np.asarray(sorted(values), dtype=np.int64)

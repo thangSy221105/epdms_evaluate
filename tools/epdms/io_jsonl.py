@@ -96,6 +96,7 @@ class AtomicJsonlWriter:
                 # Never merge an overlapping crash checkpoint silently. The
                 # CLI performs the same check before recovery; keeping the
                 # guard here protects direct library callers as well.
+                from .run_identity import AmbiguousCheckpointError
                 target_keys = set()
                 temp_keys = set()
                 try:
@@ -104,8 +105,17 @@ class AtomicJsonlWriter:
                             for line in handle:
                                 if line.strip():
                                     row = json.loads(line)
-                                    if row.get("record_key"):
-                                        destination.add(str(row["record_key"]))
+                                    key = row.get("record_key")
+                                    if not key:
+                                        continue
+                                    key = str(key)
+                                    if key in destination:
+                                        raise AmbiguousCheckpointError(
+                                            f"AMBIGUOUS_CHECKPOINT: {source.name} contains duplicate record key {key}"
+                                        )
+                                    destination.add(key)
+                except AmbiguousCheckpointError:
+                    raise
                 except Exception as exc:
                     raise ValueError(f"Ambiguous checkpoint: cannot inspect {temp_path.name}: {exc}") from exc
                 overlap = target_keys & temp_keys

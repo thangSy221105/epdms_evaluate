@@ -40,6 +40,75 @@ class MissingGroundTruthCoordinatesError(TimeContractError):
     """Raised when ground-truth waypoints lack required coordinates."""
 
 
+def _waypoint_includes_t0(waypoints: Sequence[Dict[str, Any]], t0_us: int) -> bool:
+    """Determine t0 inclusion from explicit timestamp metadata only.
+
+    A pose count is deliberately not sufficient evidence: a 41-pose sequence
+    may still be future-only and must not be silently reinterpreted.
+    """
+    if not waypoints:
+        return False
+    first_value, kind, _ = _extract_timestamp_metadata(waypoints[0])
+    if first_value is None:
+        return False
+    if kind == "relative":
+        return abs(first_value) <= 1e-9
+    return abs(first_value - float(t0_us)) <= 1e-3
+
+
+def prepare_trajectory_window(
+    waypoints: Sequence[Any],
+    t0_us: int,
+    target_future_poses: int,
+    role: str = "trajectory",
+) -> List[Dict[str, Any]]:
+    """Return one canonical prefix for the configured evaluation horizon.
+
+    The helper is shared by prediction, GT, scorer preflight, and audit.  It
+    recognizes t0 from timestamp semantics, never from coordinates or length,
+    and only crops a longer source after that distinction is established.
+    """
+    if not isinstance(waypoints, (list, tuple)):
+        raise TypeError(f"{role} waypoints must be a list/tuple")
+    if target_future_poses <= 0:
+        raise ValueError("target_future_poses must be positive")
+    raw = _as_waypoint_dicts(waypoints, role)
+    if len(raw) < target_future_poses:
+        raise TimelineHorizonMismatchError(
+            f"{role} has {len(raw)} waypoints; expected at least {target_future_poses} future poses"
+        )
+    t0 = _coerce_t0(t0_us, "trajectory_window")
+    parsed = [_extract_timestamp_metadata(wp) for wp in raw]
+    present = [item[0] is not None for item in parsed]
+    if any(present) and not all(present):
+        raise InconsistentWaypointTimelineError(f"{role} waypoints have partial timestamps")
+    kinds = {item[1] for item in parsed if item[1] is not None}
+    if len(kinds) > 1:
+        raise InconsistentWaypointTimelineError(f"{role} mixes relative and absolute timestamp fields")
+
+    includes_t0 = _waypoint_includes_t0(raw, t0) if all(present) else False
+    if len(raw) == target_future_poses + 1 and not includes_t0:
+        raise TimelineOriginMismatchError(
+            f"{role} has {target_future_poses + 1} poses but its first timestamp does not identify t0"
+        )
+    if len(raw) in (target_future_poses, target_future_poses + 1):
+        window_len = len(raw)
+    elif len(raw) > target_future_poses + 1:
+        # Long NuRec sources are cropped only after explicit t0 detection.  A
+        # timestamp-less long source is treated as future-only by contract;
+        # it cannot claim an included t0 without metadata.
+        window_len = target_future_poses + 1 if includes_t0 else target_future_poses
+    else:
+        window_len = len(raw)
+    window = raw[:window_len]
+    # Validate coordinates here so audit and scoring reject the same malformed
+    # input before the normalizer reports a later timeline error.
+    for idx, wp in enumerate(window):
+        _coordinate(wp, "x_m", "x", idx, role)
+        _coordinate(wp, "y_m", "y", idx, role)
+    return window
+
+
 @dataclass
 class TimelineProvenance:
     t0_us: int
@@ -215,7 +284,7 @@ def normalize_trajectory_timeline(waypoints: Sequence[Any], t0_us: int, expected
         kind = next(iter(kinds))
         values = np.asarray([p[0] for p in parsed], dtype=float)
         if np.any(np.diff(values) <= 0):
-            raise NonMonotonicWaypointTimelineError(f"{role} timestamps must be strictly increasing")
+            raise NonMonotonicWaypointTimelineError(f"NonMonotonicWaypointTimelineError: {role} timestamps must be strictly increasing")
         if kind == "absolute":
             timestamp_kind = "absolute_us"
             rel_s = (values - t0) / 1_000_000.0
@@ -238,7 +307,7 @@ def normalize_trajectory_timeline(waypoints: Sequence[Any], t0_us: int, expected
         rel_s = np.arange(0.0 if includes_t0 else dt_s, expected_horizon_s + dt_s / 2.0, dt_s)[: len(raw)]
         timestamps_us = np.rint(t0 + rel_s * 1_000_000.0).astype(np.int64)
     if len(timestamps_us) > 1 and np.any(np.diff(timestamps_us) <= 0):
-        raise NonMonotonicWaypointTimelineError(f"{role} normalized timestamps are not strictly increasing")
+        raise NonMonotonicWaypointTimelineError(f"NonMonotonicWaypointTimelineError: {role} normalized timestamps are not strictly increasing")
     z_values: List[float] = []
     has_z = False
     for i, wp in enumerate(raw):

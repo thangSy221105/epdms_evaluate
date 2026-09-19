@@ -60,6 +60,7 @@ class EvaluationConfig:
         self,
         source_hashes: Optional[Dict[str, str]] = None,
         runtime_overrides: Optional[Dict[str, Any]] = None,
+        clip_scope: Optional[List[str]] = None,
     ) -> str:
         """Delegate to the sole run-identity fingerprint implementation."""
         from .run_identity import compute_run_effective_fingerprint
@@ -74,6 +75,7 @@ class EvaluationConfig:
             effective,
             source_hashes or {},
             runtime_overrides=runtime_overrides,
+            clip_scope=clip_scope,
         )
 
     @classmethod
