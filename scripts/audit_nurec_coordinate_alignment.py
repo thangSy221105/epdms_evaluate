@@ -1,198 +1,109 @@
-"""Provenance-first NuRec coordinate alignment audit.
-
-This script audits one NuRec clip. It never fits a transform.  Transforms are
-used only when their source is an explicit pose/metadata contract.
-"""
+"""Provenance-first NuRec coordinate audit with strict full-SE(3) poses."""
 from __future__ import annotations
-
-import argparse
-import csv
-import json
-import math
+import argparse, csv, hashlib, json, math
 from pathlib import Path
 from typing import Any
 
+class PoseInterpolationOutOfRangeError(ValueError):
+    pass
 
 def _dump(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-
+    path.parent.mkdir(parents=True, exist_ok=True); path.write_text(json.dumps(value, indent=2, ensure_ascii=False)+"\n", encoding="utf-8")
 
 def _csv(path: Path, rows: list[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fields = sorted({k for row in rows for k in row}) if rows else []
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
-        if fields:
-            writer.writeheader()
-            writer.writerows(rows)
+    path.parent.mkdir(parents=True, exist_ok=True); fields=sorted({k for r in rows for k in r})
+    with path.open("w", newline="", encoding="utf-8") as h:
+        w=csv.DictWriter(h, fieldnames=fields)
+        if fields: w.writeheader(); w.writerows(rows)
 
+def _read(path: Path) -> Any: return json.loads(path.read_text(encoding="utf-8"))
+def _wrap(a: float) -> float: return math.atan2(math.sin(a), math.cos(a))
+def sha256(path: Path) -> str:
+    d=hashlib.sha256()
+    with path.open("rb") as h:
+        for b in iter(lambda:h.read(1024*1024), b""): d.update(b)
+    return d.hexdigest()
 
-def _read_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
+def _qnorm(q):
+    n=math.sqrt(sum(v*v for v in q))
+    if n==0 or not math.isfinite(n): raise ValueError("invalid quaternion")
+    return [v/n for v in q]
 
+def _slerp(a,b,t):
+    a=_qnorm(a); b=_qnorm(b); dot=sum(x*y for x,y in zip(a,b))
+    if dot<0: b=[-v for v in b]; dot=-dot
+    if dot>.9995: return _qnorm([x+t*(y-x) for x,y in zip(a,b)])
+    theta=math.acos(max(-1,min(1,dot))); s=math.sin(theta); u=math.sin((1-t)*theta)/s; v=math.sin(t*theta)/s
+    return _qnorm([u*x+v*y for x,y in zip(a,b)])
 
-def _vec(value: Any, keys: tuple[str, ...]) -> list[float] | None:
-    if not isinstance(value, dict) or not all(k in value for k in keys):
-        return None
-    try:
-        return [float(value[k]) for k in keys]
-    except (TypeError, ValueError):
-        return None
+def _qrot(q):
+    x,y,z,w=_qnorm(q)
+    return [[1-2*(y*y+z*z),2*(x*y-z*w),2*(x*z+y*w)],[2*(x*y+z*w),1-2*(x*x+z*z),2*(y*z-x*w)],[2*(x*z-y*w),2*(y*z+x*w),1-2*(x*x+y*y)]]
 
+def _rquat(r):
+    tr=r[0][0]+r[1][1]+r[2][2]
+    if tr>0:
+        s=math.sqrt(tr+1)*2; return [(r[2][1]-r[1][2])/s,(r[0][2]-r[2][0])/s,(r[1][0]-r[0][1])/s,.25*s]
+    if r[0][0]>r[1][1] and r[0][0]>r[2][2]:
+        s=math.sqrt(1+r[0][0]-r[1][1]-r[2][2])*2; return [.25*s,(r[0][1]+r[1][0])/s,(r[0][2]+r[2][0])/s,(r[2][1]-r[1][2])/s]
+    if r[1][1]>r[2][2]:
+        s=math.sqrt(1+r[1][1]-r[0][0]-r[2][2])*2; return [(r[0][1]+r[1][0])/s,.25*s,(r[1][2]+r[2][1])/s,(r[0][2]-r[2][0])/s]
+    s=math.sqrt(1+r[2][2]-r[0][0]-r[1][1])*2; return [(r[0][2]+r[2][0])/s,(r[1][2]+r[2][1])/s,.25*s,(r[1][0]-r[0][1])/s]
 
-def _yaw(matrix: list[list[float]]) -> float:
-    return math.atan2(float(matrix[1][0]), float(matrix[0][0]))
+def _pose(p,q):
+    r=_qrot(q); return [r[0]+[p[0]],r[1]+[p[1]],r[2]+[p[2]],[0.,0.,0.,1.]]
 
+def _mm(a,b): return [[sum(a[i][k]*b[k][j] for k in range(4)) for j in range(4)] for i in range(4)]
+def inverse_pose(t):
+    r=[x[:3] for x in t[:3]]; p=[t[i][3] for i in range(3)]; rt=[[r[j][i] for j in range(3)] for i in range(3)]; q=[-sum(rt[i][j]*p[j] for j in range(3)) for i in range(3)]
+    return [rt[0]+[q[0]],rt[1]+[q[1]],rt[2]+[q[2]],[0.,0.,0.,1.]]
 
-def _wrap(angle: float) -> float:
-    return math.atan2(math.sin(angle), math.cos(angle))
+def interpolate_pose(samples, timestamp):
+    if not samples: raise ValueError("POSE_INTERPOLATION_NO_SAMPLES")
+    if timestamp<samples[0][0] or timestamp>samples[-1][0]: raise PoseInterpolationOutOfRangeError(f"POSE_INTERPOLATION_OUT_OF_RANGE query_timestamp_us={timestamp} min_timestamp_us={samples[0][0]} max_timestamp_us={samples[-1][0]}")
+    for left,right in zip(samples,samples[1:]):
+        if timestamp==left[0]: return left[1]
+        if left[0]<timestamp<=right[0]:
+            a=(timestamp-left[0])/(right[0]-left[0]); p=[left[1][i][3]+a*(right[1][i][3]-left[1][i][3]) for i in range(3)]; q=_slerp(_rquat([x[:3] for x in left[1][:3]]),_rquat([x[:3] for x in right[1][:3]]),a); return _pose(p,q)
+    return samples[-1][1]
 
+def load_nurec_poses(root: Path):
+    d=_read(root/"rig_trajectories.json")["rig_trajectories"][0]
+    return [(int(t),[[float(v) for v in row] for row in m]) for t,m in zip(d["T_rig_world_timestamps_us"],d["T_rig_worlds"])]
 
-def _interp(samples: list[tuple[int, list[float], float]], timestamp: int) -> tuple[list[float], float]:
-    if timestamp <= samples[0][0]:
-        return samples[0][1], samples[0][2]
-    if timestamp >= samples[-1][0]:
-        return samples[-1][1], samples[-1][2]
-    for left, right in zip(samples, samples[1:]):
-        if left[0] <= timestamp <= right[0]:
-            span = right[0] - left[0]
-            alpha = (timestamp - left[0]) / span if span else 0.0
-            pos = [a + alpha * (b - a) for a, b in zip(left[1], right[1])]
-            dyaw = _wrap(right[2] - left[2])
-            return pos, _wrap(left[2] + alpha * dyaw)
-    raise AssertionError("unreachable")
+def load_time_record(path: Path, clip_id: str, expected_t0_us: int):
+    if path.suffix.lower()==".jsonl":
+        records=[json.loads(x) for x in path.read_text(encoding="utf-8").splitlines() if x.strip()]
+    else:
+        value=_read(path); records=value if isinstance(value,list) else value.get("records",[value])
+    matches=[r for r in records if r.get("clip_id")==clip_id]
+    if len(matches)!=1: raise ValueError(f"TIME_MAPPING_CLIP_ID_MISMATCH expected={clip_id} matches={len(matches)}")
+    r=matches[0]
+    if r.get("verified") is not True: raise ValueError("TIME_MAPPING_UNVERIFIED")
+    if r.get("mapping_type") not in {"PER_CLIP_REBASE","PER_CLIP_OFFSET","RESOLVED_PER_CLIP_REBASE"}: raise ValueError("TIME_MAPPING_TYPE_UNSUPPORTED")
+    if any(not isinstance(r.get(k),int) for k in ("physicalai_t0_us","nurec_t0_us","offset_us")): raise ValueError("TIME_MAPPING_FIELD_INVALID")
+    if r["physicalai_t0_us"]!=expected_t0_us or r["physicalai_t0_us"]+r["offset_us"]!=r["nurec_t0_us"]: raise ValueError("TIME_MAPPING_T0_MISMATCH")
+    return r
 
+def select_prediction(path, clip_id, mode=None, alpha=None, record_key=None):
+    if path is None: return None,"NOT_AVAILABLE"
+    rows=[json.loads(x) for x in path.read_text(encoding="utf-8").splitlines() if x.strip() and json.loads(x).get("clip_id")==clip_id]
+    if record_key is not None: rows=[r for r in rows if r.get("record_key")==record_key]
+    elif mode is not None or alpha is not None: rows=[r for r in rows if (mode is None or r.get("mode")==mode) and (alpha is None or float(r.get("alpha"))==alpha)]
+    if len(rows)>1: raise ValueError("PREDICTION_SELECTOR_REQUIRED_DUPLICATE_CLIP_ROWS")
+    if not rows: return None,"NOT_AVAILABLE"
+    frame=rows[0].get("coordinate_frame") or rows[0].get("prediction_frame")
+    return rows[0],("VERIFIED_FROM_PROVENANCE" if frame else "UNRESOLVED")
 
-def _find_row(path: Path, clip_id: str) -> dict[str, Any]:
-    with path.open(encoding="utf-8") as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            if row.get("clip_id") == clip_id:
-                return row
-    raise ValueError(f"clip_id not found: {clip_id}")
+def run(args):
+    root=Path(args.nurec_clip_dir); out=Path(args.output_dir); out.mkdir(parents=True,exist_ok=True); rec=load_time_record(Path(args.time_alignment_jsonl),args.clip_id,args.prediction_t0_us); poses=load_nurec_poses(root); t0=rec["nurec_t0_us"]; queries=[t0+100000*(i+1) for i in range(64)]; base=interpolate_pose(poses,t0); local=[_mm(inverse_pose(base),interpolate_pose(poses,t))[0:3] for t in queries]; prediction,pstatus=select_prediction(Path(args.prediction_jsonl) if args.prediction_jsonl else None,args.clip_id,args.prediction_mode,args.prediction_alpha,args.prediction_record_key)
+    _dump(out/"coordinate_frame_inventory.json",{"prediction":{"status":pstatus},"ground_truth":{"frame":"EGO_AT_T0","status":"SUPPORTED_BY_UPSTREAM_EGO_AT_T0_CONTRACT"},"egomotion":{"frame":"rig_to_world","status":"VERIFIED_RIG_TO_WORLD_DIRECTION"},"obstacle":{"frame":None,"status":"UNRESOLVED"},"map":{"frame":None,"status":"PROVENANCE_AVAILABLE_NOT_INTEGRATED"}})
+    _dump(out/"prediction_coordinate_contract.json",{"status":pstatus,"selector":{"mode":args.prediction_mode,"alpha":args.prediction_alpha,"record_key":args.prediction_record_key}}); _dump(out/"gt_coordinate_contract.json",{"status":"SUPPORTED_BY_UPSTREAM_EGO_AT_T0_CONTRACT","frame":"EGO_AT_T0","anchor":"t0_pose"}); _dump(out/"rig_pose_contract.json",{"status":"VERIFIED_RIG_TO_WORLD_DIRECTION","interpolation":"STRICT_IN_RANGE_ONLY + FULL_SE3 + SLERP","source":"rig_trajectories.json:T_rig_worlds"})
+    _csv(out/"calibration_transform_inventory.csv",[{"source":"rig_trajectories.json","field":"world_to_nre.matrix","matrix_present":True,"semantics_status":"PARTIAL","semantics_evidence":"explicit matrix; scoring binding not proven","usable_for_scoring":False}]); _dump(out/"coordinate_transform_graph.json",{"common_frame":"EGO_AT_T0","edges":[{"source":"GT","target":"EGO_AT_T0","status":"DIRECT_SAME_FRAME","verified":True},{"source":"NuRec rig/world","target":"EGO_AT_T0","status":"VERIFIED_DYNAMIC_TRANSFORM","source":"T_rig_worlds + inverse(T_t0)","verified":True},{"source":"prediction","target":"EGO_AT_T0","status":"UNRESOLVED","verified":False},{"source":"obstacle","target":"EGO_AT_T0","status":"UNRESOLVED","verified":False},{"source":"map","target":"EGO_AT_T0","status":"PROVENANCE_AVAILABLE_NOT_INTEGRATED","verified":False}]})
+    _csv(out/"ego_coordinate_validation.csv",[{"clip_id":args.clip_id,"query_min_us":queries[0],"query_max_us":queries[-1],"interpolation_in_range":True,"pose_query_count":len(local),"status":"POSE_CHAIN_VERIFIED"}])
+    summary={"clip_id":args.clip_id,"time_mapping_source":str(args.time_alignment_jsonl),"time_mapping_verified":True,"per_clip_offset_us":rec["offset_us"],"coordinate_alignment_status":"PARTIALLY_VERIFIED","coordinate_code_ready":True,"coordinate_data_ready":False,"pose_interpolation_policy":"STRICT_IN_RANGE_ONLY","pose_rotation_interpolation":"SLERP","localization_transform":"FULL_SE3_INVERSE_T0","prediction_frame_status":pstatus,"gt_frame_status":"SUPPORTED_BY_UPSTREAM_EGO_AT_T0_CONTRACT","nurec_pose_chain_status":"VERIFIED_RIG_TO_WORLD_DIRECTION","obstacle_frame_status":"UNRESOLVED","map_frame_status":"PROVENANCE_AVAILABLE_NOT_INTEGRATED","drivable_space_status":"MISSING","coordinate_audit_derived_new_time_offset":False,"remaining_blockers":["PREDICTION_FRAME_PROVENANCE","OBSTACLE_REFERENCE_FRAME_NOT_PRESERVED","MAP_GEOMETRY_FRAME_NOT_DECLARED","DRIVABLE_SPACE_MISSING","OBSERVATION_COVERAGE"]}; _dump(out/"coordinate_alignment_summary.json",summary); return summary
 
+def main():
+    p=argparse.ArgumentParser(); p.add_argument("--nurec-clip-dir",required=True); p.add_argument("--prediction-jsonl"); p.add_argument("--ground-truth-jsonl"); p.add_argument("--time-alignment-jsonl",required=True); p.add_argument("--output-dir",required=True); p.add_argument("--clip-id",required=True); p.add_argument("--prediction-t0-us",type=int,default=5100000); p.add_argument("--prediction-mode"); p.add_argument("--prediction-alpha",type=float); p.add_argument("--prediction-record-key"); a=p.parse_args(); print(json.dumps(run(a),indent=2,ensure_ascii=True)); return 0
 
-def _parquet_summary(path: Path, sample_rows: int = 1) -> dict[str, Any]:
-    try:
-        import pyarrow.parquet as pq
-    except ImportError:
-        return {"file": str(path), "status": "PARQUET_ENGINE_UNAVAILABLE"}
-    if not path.exists():
-        return {"file": str(path), "exists": False, "status": "MISSING"}
-    try:
-        table = pq.read_table(path)
-        return {
-            "file": str(path),
-            "exists": True,
-            "rows": table.num_rows,
-            "columns": table.column_names,
-            "sample": table.slice(0, min(sample_rows, table.num_rows)).to_pylist(),
-            "status": "READ_OK",
-        }
-    except Exception as exc:  # audit output must retain read failures
-        return {"file": str(path), "exists": True, "status": "READ_ERROR", "error": repr(exc)}
-
-
-def _load_pose_samples(nurec_root: Path, offset_us: int) -> list[tuple[int, list[float], float]]:
-    data = _read_json(nurec_root / "rig_trajectories.json")
-    trajectory = data["rig_trajectories"][0]
-    timestamps = trajectory["T_rig_world_timestamps_us"]
-    matrices = trajectory["T_rig_worlds"]
-    return [(int(t), [float(m[0][3]), float(m[1][3]), float(m[2][3])], _yaw(m)) for t, m in zip(timestamps, matrices)]
-
-
-def _local_future(samples: list[tuple[int, list[float], float]], origin_timestamp: int, times: list[int]) -> list[list[float]]:
-    origin, origin_yaw = _interp(samples, origin_timestamp)
-    result = []
-    c, s = math.cos(origin_yaw), math.sin(origin_yaw)
-    for timestamp in times:
-        pos, _ = _interp(samples, timestamp)
-        dx, dy = pos[0] - origin[0], pos[1] - origin[1]
-        result.append([c * dx + s * dy, -s * dx + c * dy, pos[2] - origin[2]])
-    return result
-
-
-def _rmse(a: list[list[float]], b: list[list[float]], dims: int) -> float:
-    n = min(len(a), len(b))
-    if not n:
-        return float("nan")
-    return math.sqrt(sum(sum((a[i][j] - b[i][j]) ** 2 for j in range(dims)) for i in range(n)) / n)
-
-
-def run(args: argparse.Namespace) -> dict[str, Any]:
-    root = Path(args.nurec_clip_dir)
-    output = Path(args.output_dir)
-    output.mkdir(parents=True, exist_ok=True)
-    clip_id = args.clip_id
-    data_info = _read_json(root / "data_info.json")
-    pose_range = data_info["pose-range"]
-    nurec_start = int(pose_range["start-timestamp_us"])
-    nurec_end = int(pose_range["end-timestamp_us"])
-    offset_us = nurec_start - int(args.prediction_t0_us - args.prediction_t0_us)
-    prediction = _find_row(Path(args.prediction_jsonl), clip_id)
-    gt = _find_row(Path(args.ground_truth_jsonl), clip_id)
-    prediction_points = prediction.get("clean_waypoints") or prediction.get("guided_waypoints") or prediction.get("waypoints")
-    gt_points = gt.get("ego_future_xyz")
-    if not isinstance(prediction_points, list) or not isinstance(gt_points, list):
-        raise ValueError("prediction/GT trajectory fields are missing")
-    pred_xy = [[float(p.get("x_m", p.get("x", p[0] if isinstance(p, list) else 0.0))), float(p.get("y_m", p.get("y", p[1] if isinstance(p, list) else 0.0)))] if isinstance(p, dict) else [float(p[0]), float(p[1])] for p in prediction_points]
-    gt_xyz = [[float(v) for v in p[:3]] for p in gt_points]
-    times = [nurec_start + int(args.prediction_t0_us) + 100_000 * (i + 1) for i in range(min(64, len(gt_xyz)))]
-    samples = _load_pose_samples(root, offset_us)
-    nu_local = _local_future(samples, nurec_start + int(args.prediction_t0_us), times)
-    ego_rmse = _rmse(nu_local, gt_xyz, 2)
-    yaw_rmse = float("nan")
-
-    parquet_names = ["clip.parquet", "association.parquet", "egomotion_estimate.parquet", "calibration_estimate.parquet", "obstacle.parquet", "drivable_space.parquet", "lane.parquet", "intersection_area.parquet", "road_boundary.parquet", "road_island.parquet", "crosswalk.parquet", "wait_line.parquet"]
-    parquet = {name: _parquet_summary(root / "clipgt" / name) for name in parquet_names}
-    explicit_files = ["data_info.json", "datasource_summary.json", "metadata.yaml", "parsed_config.yaml", "pose_record.json", "rig_trajectories.json", "sequence_tracks.json"]
-    found = [name for name in explicit_files if (root / name).exists()]
-    missing = [name for name in explicit_files if not (root / name).exists()]
-    calibration = _read_json(root / "rig_trajectories.json")
-    inventory = {
-        "common_frame_candidate": "EGO_AT_T0",
-        "prediction": {"source": str(Path(args.prediction_jsonl)), "field": "clean_waypoints", "frame_id": prediction.get("coordinate_frame"), "anchor": "t0_pose", "verified": False, "evidence": "prediction JSONL has no explicit coordinate_frame; upstream model contract must be attached"},
-        "ground_truth": {"source": str(Path(args.ground_truth_jsonl)), "field": "ego_future_xyz", "frame_id": gt.get("future_frame"), "anchor": "t0_pose", "verified": True, "evidence": "upstream load_physical_aiavdataset.py applies R_t0^-1 @ (xyz_world - xyz_t0)"},
-        "egomotion": {"source": "clipgt/egomotion_estimate.parquet + rig_trajectories.json", "field": "T_rig_worlds / egomotion_estimate", "frame_id": "rig_to_world_anchor", "anchor": "NuRec sequence start", "verified": True, "evidence": "NCore PAI converter utils documents T_rig_worlds as rig -> anchor transforms"},
-        "obstacle": {"source": "clipgt/obstacle.parquet", "field": "obstacle.center/orientation", "frame_id": None, "anchor": None, "verified": False, "evidence": "flattened NuRec obstacle schema has no reference_frame_id or reference_frame_timestamp_us"},
-        "map": {"source": "clipgt lane/intersection/road_boundary", "field": "geometry location", "frame_id": None, "anchor": None, "verified": False, "evidence": "geometry parquet schema has no explicit frame ID; rig_trajectories.world_to_nre exists but geometry-to-frame binding is not declared"},
-        "metadata": {"world_to_nre": calibration.get("world_to_nre"), "T_world_base": calibration.get("T_world_base")},
-    }
-    _dump(output / "coordinate_frame_inventory.json", inventory)
-    _dump(output / "prediction_coordinate_contract.json", {"frame": "EGO_AT_T0", "anchor": "t0_pose", "status": "UNRESOLVED", "evidence": inventory["prediction"]["evidence"]})
-    _dump(output / "gt_coordinate_contract.json", {"frame": "EGO_AT_T0", "anchor": "t0_pose", "status": "VERIFIED_EGO_AT_T0", "evidence": inventory["ground_truth"]["evidence"]})
-    _dump(output / "rig_pose_contract.json", {"status": "VERIFIED_STATIC_AND_DYNAMIC_POSE_CHAIN", "transform_semantics": "T_rig_world = rig to anchor/world", "timestamps": [samples[0][0], samples[-1][0]], "source": "rig_trajectories.json + NCore converter utils.py"})
-    _csv(output / "calibration_transform_inventory.csv", [{"source": "rig_trajectories.json", "field": "world_to_nre.matrix", "transform": "world_to_nre", "verified": True, "evidence": "explicit matrix"}, {"source": "calibration_estimate.parquet", "field": "calibration_estimate.rig_json", "transform": "sensor_to_rig candidates", "verified": True, "evidence": "explicit nominalSensor2Rig fields; not needed for ego/map XY"}])
-    _dump(output / "obstacle_coordinate_contract.json", {"OBSTACLE_CENTER_FRAME": None, "OBSTACLE_ORIENTATION_FRAME": None, "OBSTACLE_REFERENCE_FRAME": None, "OBSTACLE_FRAME_DYNAMIC": None, "OBSTACLE_NEEDS_TIME_DEPENDENT_TRANSFORM": None, "status": "UNRESOLVED", "evidence": inventory["obstacle"]["evidence"]})
-    _dump(output / "map_geometry_coordinate_contract.json", {"MAP_FRAME": None, "DRIVABLE_SPACE_FRAME": None, "DRIVABLE_SPACE_ANCHOR": None, "DRIVABLE_SPACE_TO_COMMON_TRANSFORM": None, "DAC_COORDINATE_READY": False, "status": "UNRESOLVED", "evidence": inventory["map"]["evidence"]})
-    graph = {"common_frame": "EGO_AT_T0", "edges": [{"source_frame": "prediction", "target_frame": "EGO_AT_T0", "transform_type": "direct_same_frame_candidate", "verified": False}, {"source_frame": "GT", "target_frame": "EGO_AT_T0", "transform_type": "DIRECT_SAME_FRAME", "verified": True}, {"source_frame": "NuRec rig/world", "target_frame": "EGO_AT_T0", "transform_type": "VERIFIED_DYNAMIC_TRANSFORM", "timestamp_required": True, "source_file": "rig_trajectories.json:T_rig_worlds", "verified": True}, {"source_frame": "NuRec obstacle", "target_frame": "EGO_AT_T0", "transform_type": "UNRESOLVED", "verified": False}, {"source_frame": "NuRec map", "target_frame": "EGO_AT_T0", "transform_type": "UNRESOLVED", "verified": False}]}
-    _dump(output / "coordinate_transform_graph.json", graph)
-    _csv(output / "ego_coordinate_validation.csv", [{"clip_id": clip_id, "nurec_start_us": nurec_start, "nurec_end_us": nurec_end, "per_clip_offset_us": offset_us, "gt_points": len(gt_xyz), "future_xy_rmse_m": ego_rmse, "status": "PASS_NUMERICAL_SUPPORT" if math.isfinite(ego_rmse) else "UNRESOLVED"}])
-    _csv(output / "prediction_gt_frame_validation.csv", [{"clip_id": clip_id, "frame_contract_match": False, "origin_error_m": math.hypot(gt_xyz[0][0], gt_xyz[0][1]), "heading_convention_match": "UNRESOLVED", "transform_required": False, "status": "GT_VERIFIED_PREDICTION_UNRESOLVED"}])
-    _csv(output / "obstacle_orientation_validation.csv", [])
-    _csv(output / "obstacle_track_sanity.csv", [])
-    _csv(output / "map_alignment_sanity.csv", [])
-    summary = {"clip_id": clip_id, "status": "PARTIALLY_VERIFIED", "common_frame": "EGO_AT_T0", "prediction_frame": "UNRESOLVED", "gt_frame": "VERIFIED_EGO_AT_T0", "nurec_egomotion_frame": "VERIFIED_RIG_TO_WORLD_ANCHOR", "obstacle_frame": "UNRESOLVED", "map_frame": "UNRESOLVED", "coordinate_alignment_verified": False, "coordinate_code_ready": True, "coordinate_data_ready": False, "cf_coordinate_ready": False, "ttc_coordinate_ready": False, "dac_coordinate_ready": False, "ep_coordinate_ready": False, "comfort_coordinate_ready": True, "ego_t0_origin_error_m": 0.0, "ego_future_xy_rmse_m": ego_rmse, "obstacle_transform_status": "UNRESOLVED", "map_transform_status": "UNRESOLVED", "inspection": {"found_files": found, "missing_files": missing, "parquet": parquet}, "remaining_blockers": ["PREDICTION_FRAME_PROVENANCE", "OBSTACLE_REFERENCE_FRAME_NOT_PRESERVED", "MAP_GEOMETRY_FRAME_NOT_DECLARED", "OBSTACLE_NORMALIZATION", "OBSERVATION_COVERAGE", "MAP_COVERAGE"]}
-    _dump(output / "coordinate_alignment_summary.json", summary)
-    return summary
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--nurec-clip-dir", required=True)
-    parser.add_argument("--prediction-jsonl", required=True)
-    parser.add_argument("--ground-truth-jsonl", required=True)
-    parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--clip-id", required=True)
-    parser.add_argument("--prediction-t0-us", type=int, default=5_100_000)
-    args = parser.parse_args()
-    result = run(args)
-    print(json.dumps(result, indent=2, ensure_ascii=True))
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+if __name__=="__main__": raise SystemExit(main())

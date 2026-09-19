@@ -3,6 +3,14 @@
 This block audits coordinate provenance without changing the scorer, evaluator,
 raw NuRec files, or prediction/GT data.
 
+The hardening branch consumes an upstream per-clip time sidecar. It does not
+derive an offset from NuRec timestamps. Pose queries are strict in-range only:
+out-of-range queries raise `POSE_INTERPOLATION_OUT_OF_RANGE` with the query and
+source bounds. Translation is linearly interpolated and rotation uses
+quaternion SLERP. Localization uses the full transform
+`inverse(T_rig_world(t0)) @ T_rig_world(t)`, which is equivalent for translation
+to the upstream GT formula `R_t0^-1 @ (xyz_world - xyz_t0)`.
+
 ## Pilot evidence
 
 The pilot is `00040136-e651-4abd-991d-0655ccda9430`. The NuRec package contains
@@ -16,13 +24,15 @@ GT by querying future poses and applying
 The numerical pilot check uses only the metadata-backed dynamic pose chain. It
 does not fit translation, rotation, ICP, Procrustes, or a pilot-specific
 matrix. The output is `coordinate_alignment_summary.json` in the external
-pilot report directory.
+pilot report directory. `prediction_frame_status` remains unresolved unless
+the selected prediction row carries explicit frame provenance.
 
 ## Current status
 
 The pilot is **PARTIALLY_VERIFIED**:
 
-- GT frame: `VERIFIED_EGO_AT_T0`.
+- GT frame: `SUPPORTED_BY_UPSTREAM_EGO_AT_T0_CONTRACT`; this wording does not
+  overclaim exact file-generation lineage.
 - NuRec rig pose chain: verified as a dynamic rig-to-anchor/world chain from
   `T_rig_worlds` and the upstream converter documentation.
 - Prediction frame: unresolved because the prediction JSONL has no explicit
@@ -30,14 +40,18 @@ The pilot is **PARTIALLY_VERIFIED**:
 - Obstacle frame: unresolved. Flattened `obstacle.parquet` preserves center,
   size, orientation, and `egomotion_label_class_id`, but not
   `reference_frame_id` or `reference_frame_timestamp_us`.
-- Map frame: unresolved. Lane/intersection/road-boundary geometry is present,
-  but those parquet records do not declare the geometry reference frame.
+- Map frame: `PROVENANCE_AVAILABLE_NOT_INTEGRATED` when `T_world_base` and
+  `map.xodr` georeference are present; lane/intersection/road-boundary
+  geometry is still not wired into a scoring transform in this branch.
 - `drivable_space.parquet` is absent in the pilot package, so DAC coordinate
   readiness is false.
 
 Therefore `COORDINATE_ALIGNMENT_VERIFIED` remains false. This is intentional:
 the pose validation supports a transform algorithm, but missing obstacle/map
 frame metadata prevents a complete scoring contract.
+
+`sequence_tracks.json` is inspected for track pose/timestamp availability but
+is not consumed by the scorer or obstacle adapter in this branch.
 
 ## Reproducible command
 
