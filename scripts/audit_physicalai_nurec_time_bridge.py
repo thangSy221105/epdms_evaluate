@@ -115,41 +115,95 @@ def _walk_values(value: Any, path: str = ""):
         yield path, value
 
 
-def inspect_nurec_provenance(clip_dir: str | Path | None) -> dict[str, Any]:
-    """Inspect listed NuRec metadata and make no source-identity inference."""
+NUREC_INSPECTION_FILES = [
+    "data_info.json", "datasource_summary.json", "metadata.yaml", "parsed_config.yaml",
+    "pose_record.json", "rig_trajectories.json", "sequence_tracks.json",
+    "clipgt/clip.parquet", "clipgt/association.parquet", "clipgt/egomotion_estimate.parquet",
+    "clipgt/obstacle.parquet", "clipgt/calibration_estimate.parquet",
+]
+PROVENANCE_SEARCH_TERMS = (
+    "source_clip_id", "source_sequence_id", "parent_clip_id", "source_repo_id", "source_revision",
+    "source_commit_sha", "physicalai", "physical_ai", "ncore", "nre", "converter_version",
+    "sequence_id", "scene_id", "clip_id", "time_offset", "timestamp_offset", "sequence_offset", "clock_offset",
+    "timestamp_micros", "timestamp_us", "start_micros", "end_micros",
+)
+
+
+def _identity_class(field: str) -> str:
+    name = field.lower().split(".")[-1]
+    if name in {"source_clip_id", "parent_clip_id", "source_sequence_id"}:
+        return "SOURCE_IDENTITY"
+    if name in {"nurec_clip_id", "target_clip_id", "scene_id"}:
+        return "TARGET_IDENTITY"
+    if name == "clip_id":
+        return "GENERIC_IDENTITY"
+    return "UNKNOWN_IDENTITY"
+
+
+def _candidate(path: str, field_path: str, value: Any, expected_source_clip_id: str, identity_values: list[Any] | None = None) -> dict[str, Any]:
+    identity_class = _identity_class(field_path)
+    values = identity_values if identity_values is not None else (value if isinstance(value, list) else [value])
+    matches = expected_source_clip_id in values if identity_class == "SOURCE_IDENTITY" else False
+    verified = identity_class == "SOURCE_IDENTITY" and matches
+    return {
+        "source_file": path,
+        "field_path": field_path,
+        "value": value,
+        "candidate_type": "IDENTITY_OR_TIME_FIELD",
+        "identity_class": identity_class,
+        "matches_expected_source_clip": matches,
+        "semantic_status": "SOURCE_LINEAGE_MATCH" if verified else "CANDIDATE",
+        "verification_status": "VERIFIED_SOURCE_PROVENANCE" if verified else "CANDIDATE_ONLY",
+    }
+
+
+def inspect_nurec_provenance(clip_dir: str | Path | None, expected_source_clip_id: str = CLIP_ID) -> dict[str, Any]:
+    """Inspect a bounded NuRec scope; read failures never become provenance candidates."""
     if not clip_dir:
-        return {"status": "NOT_INSPECTED", "inspected_files": [], "candidates": []}
+        return {"status": "NOT_INSPECTED", "requested_files": [], "found_files": [], "missing_files": [], "successfully_read_files": [], "failed_files": [], "inspected_files": [], "verified_candidates": [], "inspection_errors": []}
     root = Path(clip_dir)
     if not root.exists():
-        return {"status": "NOT_INSPECTED", "inspected_files": [], "candidates": [], "reason": "clip directory does not exist"}
-    names = {"data_info.json", "datasource_summary.json", "metadata.yaml", "pose_record.json", "rig_trajectories.json", "sequence_tracks.json", "clip.parquet", "association.parquet"}
-    inspected: list[str] = []
-    candidates: list[dict[str, Any]] = []
-    try:
-        import yaml
-    except ImportError:
-        yaml = None
-    for path in sorted(root.rglob("*")):
-        if not path.is_file() or path.name not in names:
+        return {"status": "NOT_INSPECTED", "requested_files": NUREC_INSPECTION_FILES, "found_files": [], "missing_files": NUREC_INSPECTION_FILES, "successfully_read_files": [], "failed_files": [], "inspected_files": [], "verified_candidates": [], "inspection_errors": [], "reason": "clip directory does not exist"}
+    found_files, missing_files, successfully_read, failed_files = [], [], [], []
+    candidates, inspection_errors = [], []
+    for relative in NUREC_INSPECTION_FILES:
+        path = root / relative
+        if not path.is_file():
+            missing_files.append(relative)
             continue
-        rel = str(path.relative_to(root)).replace("\\", "/")
-        inspected.append(rel)
+        found_files.append(relative)
         try:
             if path.suffix.lower() == ".parquet":
                 frame = pd.read_parquet(path)
                 for column in frame.columns:
-                    if any(token in str(column).lower() for token in ("source_clip", "clip_id", "repo_id", "commit_sha", "revision")):
-                        candidates.append({"path": f"{rel}:column:{column}", "value": {"row_count": len(frame)}, "verification_status": "FOUND"})
-                continue
-            raw = json.loads(path.read_text(encoding="utf-8")) if path.suffix.lower() == ".json" else (yaml.safe_load(path.read_text(encoding="utf-8")) if yaml else None)
-            for key_path, value in _walk_values(raw):
-                key = key_path.rsplit(".", 1)[-1].lower().replace("[", "")
-                if any(token in key for token in ("source_clip_id", "source_repo_id", "source_revision", "source_commit_sha")):
-                    candidates.append({"path": f"{rel}:{key_path}", "value": value, "verification_status": "FOUND"})
+                    lower = str(column).lower()
+                    if any(term in lower for term in PROVENANCE_SEARCH_TERMS):
+                        values = [str(v) for v in frame[column].dropna().astype(str).unique().tolist()]
+                        value = {"unique_value_count": len(values), "first_N_values": values[:20]}
+                        candidates.append(_candidate(relative, str(column), value, expected_source_clip_id, values))
+            else:
+                if path.suffix.lower() == ".json":
+                    raw = json.loads(path.read_text(encoding="utf-8"))
+                else:
+                    import yaml
+                    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+                for key_path, value in _walk_values(raw):
+                    key = key_path.rsplit(".", 1)[-1].lower().replace("[", "")
+                    if any(term in key or term in str(value).lower() for term in PROVENANCE_SEARCH_TERMS):
+                        candidates.append(_candidate(relative, key_path, value, expected_source_clip_id))
+            successfully_read.append(relative)
         except Exception as exc:
-            candidates.append({"path": rel, "value": None, "verification_status": "NOT_FOUND_AFTER_INSPECTION", "error": f"{type(exc).__name__}: {exc}"})
-    status = "FOUND" if candidates else ("NOT_FOUND_AFTER_INSPECTION" if inspected else "NOT_INSPECTED")
-    return {"status": status, "inspected_files": inspected, "candidates": candidates}
+            failed_files.append(relative)
+            inspection_errors.append({"file": relative, "exception_type": type(exc).__name__, "message": str(exc), "inspection_status": "READ_ERROR"})
+    verified_candidates = [c for c in candidates if c["verification_status"] == "VERIFIED_SOURCE_PROVENANCE"]
+    status = "FOUND" if verified_candidates else ("NOT_FOUND_AFTER_INSPECTION" if successfully_read or failed_files else "NOT_INSPECTED")
+    inspection_status = "COMPLETE" if len(successfully_read) == len(NUREC_INSPECTION_FILES) else ("PARTIAL" if successfully_read or failed_files else "NOT_INSPECTED")
+    return {
+        "status": status, "inspection_status": inspection_status, "requested_files": NUREC_INSPECTION_FILES, "found_files": found_files,
+        "missing_files": missing_files, "successfully_read_files": successfully_read, "failed_files": failed_files,
+        "inspected_files": successfully_read + failed_files, "verified_candidates": verified_candidates,
+        "candidates": candidates, "inspection_errors": inspection_errors,
+    }
 
 
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -158,6 +212,22 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _external_dataset_evidence(args: argparse.Namespace) -> dict[str, Any]:
+    evidence = {
+        "official_ncore": {"status": args.official_ncore_pilot_presence, "source": "EXTERNAL_INSPECTION", "dataset": "nvidia/PhysicalAI-Autonomous-Vehicles-NCore"},
+        "official_nurec": {"status": args.official_nurec_pilot_presence, "source": "EXTERNAL_INSPECTION", "dataset": "nvidia/PhysicalAI-Autonomous-Vehicles-NuRec"},
+    }
+    if args.external_dataset_evidence:
+        evidence = json.loads(Path(args.external_dataset_evidence).read_text(encoding="utf-8"))
+        for record in evidence.values():
+            record.setdefault("source", "EXTERNAL_INSPECTION")
+            record["verified_by_this_script"] = False
+    for record in evidence.values():
+        record["evidence_source"] = "EXTERNAL_INSPECTION"
+        record["verified_by_this_script"] = False
+    return evidence
 
 
 def audit(args: argparse.Namespace) -> dict[str, Any]:
@@ -187,7 +257,8 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
     diagnostics = constant_delta_diagnostics(semantic_pairs, semantic_verified=False)
     t0_contract = t0_query_contract(pai_ego)
     pai_ncore_contract = pai_to_ncore_timestamp_contract(pai_ego)
-    nurec_provenance = inspect_nurec_provenance(args.nurec_clip_dir)
+    nurec_provenance = inspect_nurec_provenance(args.nurec_clip_dir, args.expected_source_clip_id)
+    external_evidence = _external_dataset_evidence(args)
     coverage = {
         "cf_required_range_us": [T0_US + 100_000, T0_US + 4_000_000],
         "ttc_required_range_us": [T0_US + 100_000, T0_US + 5_000_000],
@@ -206,7 +277,7 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
         ],
         "pai_to_ncore_contract": pai_ncore_contract,
         "nurec_source_provenance": nurec_provenance,
-        "official_dataset_presence": {"ncore": args.official_ncore_pilot_presence, "nurec": args.official_nurec_pilot_presence},
+        "official_dataset_presence": external_evidence,
     }
     bridge = {
         "clip_id": args.clip_id,
@@ -237,6 +308,12 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
         "physicalai_obstacle_windows": obstacle_windows,
         "delta_diagnostics": diagnostics,
         "coverage": coverage,
+        "source_clip_lineage_verified": nurec_provenance["status"] == "FOUND",
+        "nurec_local_metadata_inspection_status": nurec_provenance.get("inspection_status", "NOT_INSPECTED"),
+        "time_mapping_verified": False,
+        "time_forensic_status": "EXHAUSTED_WITH_PUBLIC_EVIDENCE",
+        "true_remaining_time_blocker": "NCORE_TO_NUREC_TIME_TRANSFORM_NOT_PUBLICLY_PROVEN",
+        "official_dataset_presence": external_evidence,
     }
     (output / "time_lineage.json").write_text(json.dumps(lineage, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     (output / "physicalai_ncore_nurec_time_lineage.json").write_text(json.dumps(lineage, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -263,16 +340,21 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
 This is not evidence for NCore -> NuRec.
 """, encoding="utf-8")
     (output / "nurec_source_provenance.json").write_text(json.dumps({"clip_id": args.clip_id, **nurec_provenance}, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    (output / "inspection_scope.json").write_text(json.dumps({"clip_id": args.clip_id, **{key: nurec_provenance.get(key) for key in ("inspection_status", "requested_files", "found_files", "missing_files", "successfully_read_files", "failed_files", "inspection_errors")}}, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     (output / "ncore_to_nurec_public_trace.md").write_text("""# NCore to NuRec public trace
+
+`PUBLIC_NCORE_TO_NUREC_REVIEW_MODE = MANUAL_REVIEW_RECORDED_IN_REPOSITORY`
+
+Evidence origins: public-code claims are `PUBLIC_CODE_MANUAL_REVIEW`; generated observations are `LOCAL_AUTOMATED_INSPECTION`; external dataset presence is `EXTERNAL_MANUAL_INSPECTION`.
 
 | Candidate | Status | Evidence |
 |---|---|---|
-| NCore PAI converter | READ_REFERENCE | PAI timestamps retained for non-negative rows. |
-| NuRec `clipgt/*:key.timestamp_micros` writer | NOT_FOUND_AFTER_INSPECTION | No public writer/manifest mapping found in inspected repositories. |
-| Numeric delta | DIAGNOSTIC_ONLY | Numeric proximity without semantic identity is not a pair. |
-| NCore -> NuRec offset/scale | UNRESOLVED | No public evidence establishes one. |
+| NCore PAI converter | READ_REFERENCE | PAI timestamps retained for non-negative rows. (`PUBLIC_CODE_MANUAL_REVIEW`) |
+| NuRec `clipgt/*:key.timestamp_micros` writer | NOT_FOUND_AFTER_INSPECTION | No writer/manifest mapping was found in the manually reviewed public sources. (`PUBLIC_CODE_MANUAL_REVIEW`) |
+| Numeric delta | DIAGNOSTIC_ONLY | Numeric proximity without semantic identity is not a pair. (`LOCAL_AUTOMATED_INSPECTION`) |
+| NCore -> NuRec offset/scale | UNRESOLVED | No public evidence establishes one. (`PUBLIC_CODE_MANUAL_REVIEW`) |
 """, encoding="utf-8")
-    (output / "official_ncore_timestamp_inventory.csv").write_text("clip_id,dataset,pilot_presence,status\n" + f"{args.clip_id},NCore,{args.official_ncore_pilot_presence},{args.official_ncore_pilot_presence}\n" + f"{args.clip_id},NuRec,{args.official_nurec_pilot_presence},{args.official_nurec_pilot_presence}\n", encoding="utf-8")
+    (output / "official_ncore_timestamp_inventory.csv").write_text("clip_id,dataset,pilot_presence,status,evidence_source,verified_by_this_script\n" + f"{args.clip_id},NCore,{external_evidence['official_ncore']['status']},{external_evidence['official_ncore']['status']},EXTERNAL_INSPECTION,false\n" + f"{args.clip_id},NuRec,{external_evidence['official_nurec']['status']},{external_evidence['official_nurec']['status']},EXTERNAL_INSPECTION,false\n", encoding="utf-8")
     (output / "pai_nurec_sequence_diagnostics.json").write_text(json.dumps({"physicalai_egomotion": _summary(pai_ego), "nurec_egomotion": _summary(nurec_ego), "semantic_pairs": semantic_pairs, "diagnostics": diagnostics}, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     (output / "obstacle_time_windows.json").write_text(json.dumps(obstacle_windows, indent=2) + "\n", encoding="utf-8")
     return bridge
@@ -287,6 +369,8 @@ def main() -> None:
     parser.add_argument("--nurec-obstacle", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--nurec-clip-dir", default=None)
+    parser.add_argument("--expected-source-clip-id", default=CLIP_ID)
+    parser.add_argument("--external-dataset-evidence", default=None)
     parser.add_argument("--official-ncore-pilot-presence", choices=sorted(PROVENANCE_STATUSES), default="NOT_INSPECTED")
     parser.add_argument("--official-nurec-pilot-presence", choices=sorted(PROVENANCE_STATUSES), default="NOT_INSPECTED")
     parser.add_argument("--pai-egomotion-field", default="timestamp")

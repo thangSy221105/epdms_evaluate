@@ -1,11 +1,15 @@
 import tempfile
 import unittest
+import argparse
 from pathlib import Path
+
+import pandas as pd
 
 from scripts.audit_physicalai_nurec_time_bridge import (
     constant_delta_diagnostics,
     inspect_nurec_provenance,
     explicit_ncore_nurec_mapping,
+    _external_dataset_evidence,
     pai_to_ncore_timestamp_contract,
     per_sequence_mapping,
     t0_query_contract,
@@ -58,15 +62,76 @@ class TestPhysicalAINuRecTimeBridge(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "data_info.json"
             path.write_text('{"pose-range": {"start-timestamp_us": 1}}', encoding="utf-8")
-            self.assertEqual(inspect_nurec_provenance(directory)["status"], "NOT_FOUND_AFTER_INSPECTION")
+            result = inspect_nurec_provenance(directory)
+            self.assertEqual(result["status"], "NOT_FOUND_AFTER_INSPECTION")
+            self.assertEqual(result["inspection_errors"], [])
 
     def test_recursive_provenance_finds_source_clip_id(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "metadata.yaml"
             path.write_text("nested:\n  source_clip_id: pilot-1\n", encoding="utf-8")
-            result = inspect_nurec_provenance(directory)
+            result = inspect_nurec_provenance(directory, expected_source_clip_id="pilot-1")
             self.assertEqual(result["status"], "FOUND")
-            self.assertTrue(any(item["value"] == "pilot-1" for item in result["candidates"]))
+            self.assertTrue(any(item["verification_status"] == "VERIFIED_SOURCE_PROVENANCE" for item in result["verified_candidates"]))
+
+    def test_malformed_metadata_read_error_never_becomes_found(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "metadata.yaml"
+            path.write_text("broken: [", encoding="utf-8")
+            result = inspect_nurec_provenance(directory)
+            self.assertNotEqual(result["status"], "FOUND")
+            self.assertEqual(result["verified_candidates"], [])
+            self.assertTrue(result["inspection_errors"])
+            self.assertEqual(result["inspection_errors"][0]["inspection_status"], "READ_ERROR")
+
+    def test_generic_clip_id_is_candidate_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "clipgt").mkdir()
+            pd.DataFrame({"clip_id": ["00040136-e651-4abd-991d-0655ccda9430"]}).to_parquet(Path(directory) / "clipgt" / "clip.parquet")
+            result = inspect_nurec_provenance(directory)
+            candidate = result["candidates"][0]
+            self.assertEqual(candidate["identity_class"], "GENERIC_IDENTITY")
+            self.assertEqual(candidate["verification_status"], "CANDIDATE_ONLY")
+
+    def test_source_clip_id_matching_expected_is_verified(self):
+        with tempfile.TemporaryDirectory() as directory:
+            expected = "00040136-e651-4abd-991d-0655ccda9430"
+            (Path(directory) / "clipgt").mkdir()
+            pd.DataFrame({"source_clip_id": [expected]}).to_parquet(Path(directory) / "clipgt" / "clip.parquet")
+            result = inspect_nurec_provenance(directory, expected)
+            candidate = result["verified_candidates"][0]
+            self.assertEqual(candidate["identity_class"], "SOURCE_IDENTITY")
+            self.assertTrue(candidate["matches_expected_source_clip"])
+            self.assertEqual(candidate["verification_status"], "VERIFIED_SOURCE_PROVENANCE")
+
+    def test_wrong_source_clip_id_is_not_verified(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "clipgt").mkdir()
+            pd.DataFrame({"source_clip_id": ["another-clip"]}).to_parquet(Path(directory) / "clipgt" / "clip.parquet")
+            result = inspect_nurec_provenance(directory, "expected")
+            self.assertEqual(result["status"], "NOT_FOUND_AFTER_INSPECTION")
+            self.assertEqual(result["candidates"][0]["verification_status"], "CANDIDATE_ONLY")
+
+    def test_external_presence_is_not_verified_by_script(self):
+        args = argparse.Namespace(official_ncore_pilot_presence="NOT_INSPECTED", official_nurec_pilot_presence="FOUND", external_dataset_evidence=None)
+        evidence = _external_dataset_evidence(args)
+        self.assertEqual(evidence["official_nurec"]["evidence_source"], "EXTERNAL_INSPECTION")
+        self.assertFalse(evidence["official_nurec"]["verified_by_this_script"])
+
+    def test_scope_includes_parsed_config_and_calibration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "clipgt"
+            root.mkdir()
+            (Path(directory) / "parsed_config.yaml").write_text("version: 1\n", encoding="utf-8")
+            (Path(directory) / "metadata.yaml").write_text("name: pilot\n", encoding="utf-8")
+            pd.DataFrame({"calibration_id": ["c1"]}).to_parquet(root / "calibration_estimate.parquet")
+            result = inspect_nurec_provenance(directory)
+            self.assertIn("parsed_config.yaml", result["successfully_read_files"])
+            self.assertIn("clipgt/calibration_estimate.parquet", result["successfully_read_files"])
+
+    def test_source_lineage_does_not_verify_time_mapping(self):
+        result = explicit_ncore_nurec_mapping({"source_clip_id": "a", "target_clip_id": "b"}, "a", "b")
+        self.assertFalse(result["verified"])
 
     def test_pai_to_ncore_filters_negative_rows_without_retiming(self):
         result = pai_to_ncore_timestamp_contract([-3, 0, 100, 200])

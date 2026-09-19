@@ -16,3 +16,5 @@ This document records only timestamp lineage. It does not modify coordinate tran
 No public NCore→NuRec/NRE writer, manifest, source identity, or semantic cross-domain timestamp pair was found. Numeric proximity between timestamp tables is retained only as diagnostic evidence and is never promoted to an offset. The resulting time alignment remains `UNRESOLVED`.
 
 The generated `nurec_source_provenance.json` uses only `FOUND`, `NOT_FOUND_AFTER_INSPECTION`, and `NOT_INSPECTED`.
+
+The final local inspection scope is explicit: `data_info.json`, `datasource_summary.json`, `metadata.yaml`, `parsed_config.yaml`, pose/trajectory metadata, and the six selected `clipgt` parquet files. Each provenance candidate includes its identity class and actual value summary. Generic `clip_id` is `CANDIDATE_ONLY`; only an explicit matching `source_clip_id` can verify source lineage, and even verified source lineage does not verify time mapping.

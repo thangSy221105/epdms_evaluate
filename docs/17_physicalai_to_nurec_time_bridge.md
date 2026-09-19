@@ -17,3 +17,5 @@ Therefore:
 `TIME_ALIGNMENT_VERIFIED = false`
 
 No `time_alignment_patch.jsonl` is created, and no scorer/evaluator/raw data is modified.
+
+Official NCore/NuRec pilot presence is recorded as external evidence, not as a claim that this audit script queried Hugging Face. Public code review is recorded as manual repository review, not exhaustive automated search.

@@ -7,3 +7,5 @@ The official PhysicalAI loader uses timestamp columns in microseconds, but the p
 The public NCore PAI converter uses the egomotion timestamps to define the sequence interval and filters obstacle `timestamp_us` against that interval. `PAI_TO_NCORE_NUMERIC_RETIMING = NONE_FOR_RETAINED_ROWS`; `PAI_TO_NCORE_NEGATIVE_EGO_ROWS = FILTERED`; scale is 1.0 and offset is 0. This establishes same-domain handling inside the PAI→NCore path without claiming that negative rows are retained.
 
 No public NCore→NuRec/NRE export mapping to `clipgt/*.parquet:key.timestamp_micros` was found in the inspected sources. Therefore the PhysicalAI clock is documented, but the cross-domain bridge remains unresolved.
+
+The local NuRec provenance scanner treats generic `clip_id` values as candidate-only. Read errors are reported separately and cannot produce `FOUND`; source identity is checked against the expected PhysicalAI clip before it can be verified.
