@@ -119,8 +119,60 @@ was converted into a safe DAC result.
 
 ## Next data action
 
-Install or expose `pyarrow`/`fastparquet` in the project runtime, then rerun the
-single-clip inspector first. Only after the actual parquet schemas are visible
-should the dataset audit be upgraded from conservative inventory to field-level
-validation. The evaluator should remain unchanged until that report identifies
-verified time and coordinate contracts.
+The initial 300-clip run used a runtime without a parquet engine. The current
+runtime now has `pyarrow 25.0.1`; rerun the dataset audit against the original
+300-clip roots only after confirming their raw parquet roots are complete. The
+evaluator should remain unchanged until the audit identifies verified time and
+coordinate contracts.
+
+## Follow-up: official Hugging Face real-clip probe
+
+After authenticating to Hugging Face, the official NuRec clip matching the
+local 300-clip set was probed:
+
+`00040136-e651-4abd-991d-0655ccda9430`
+
+Only the USDZ annotation/metadata entries were fetched through HTTP Range;
+checkpoint, volume, mesh, camera frames, and video were not downloaded. The
+probe staging root is:
+
+`D:\300_clip_nurec\hf_probe`
+
+With `pyarrow 25.0.1`, the real nested parquet schema is now readable:
+
+- obstacle: `key.timestamp_micros`, `obstacle.trackline_id`,
+  `obstacle.category`, `obstacle.center{x,y,z}`, `obstacle.size{x,y,z}`,
+  `obstacle.orientation{x,y,z,w}`;
+- egomotion: `key.timestamp_micros`,
+  `egomotion_estimate.location{x,y,z}` and
+  `egomotion_estimate.orientation{x,y,z,w}`;
+- lane geometry: `lane.left_rail` and `lane.right_rail`;
+- intersection/road-boundary geometry: `*.location` point lists.
+
+The nested-field audit fix is covered by the data-preparation tests. The
+latest reports are:
+
+- `D:\300_clip_nurec\hf_probe\schema_v3\schema_report.md`
+- `D:\300_clip_nurec\hf_probe\audit_v5\dataset_readiness_summary.md`
+- `D:\300_clip_nurec\hf_probe\prepared_v5\00040136-e651-4abd-991d-0655ccda9430\contract.json`
+
+Observed for this clip:
+
+```text
+obstacle rows                  = 3,287
+obstacle timestamps            = 3,287 unique
+obstacle tracks                = 78
+invalid obstacle rows          = 0
+egomotion rows                 = 202
+lane geometry                  = 235 / 235 valid
+intersection geometry          = 4 / 4 valid
+road boundary geometry         = 246 / 246 valid
+drivable_space.parquet         = missing
+recommended DAC source         = lane_plus_intersection (candidate only)
+proxy-ready                    = false
+```
+
+The remaining blockers are intentionally conservative: AR1 `t0_us` is still
+not explicitly mapped to NuRec global timestamps, frame/anchor agreement is
+not verified although transform metadata is available as a candidate, and
+observation coverage cannot be certified until that time contract is proven.

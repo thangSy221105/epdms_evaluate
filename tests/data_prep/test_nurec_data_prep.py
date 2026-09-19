@@ -57,6 +57,26 @@ class TestNuRecDataPreparation(unittest.TestCase):
             self.assertEqual(result["status"], "OK")
             self.assertIn("timestamp_micros", result["timestamp_field_candidates"])
 
+    def test_03b_nurec_nested_struct_schema_is_inspected(self):
+        frame = pd.DataFrame({
+            "key": [{"timestamp_micros": 100}, {"timestamp_micros": 200}],
+            "obstacle": [{
+                "trackline_id": "a",
+                "center": {"x": 1.0, "y": 0.0, "z": 0.5},
+                "size": {"x": 4.0, "y": 2.0, "z": 1.5},
+                "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+                "category": "automobile",
+            }] * 2,
+        })
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(nurec, "parquet_engine", return_value={"available": True, "engines": ["pyarrow"], "status": "READY"}), mock.patch("pandas.read_parquet", return_value=frame):
+            path = Path(td) / "obstacle.parquet"; path.write_bytes(b"fixture")
+            result = nurec.inspect_parquet(path)
+            self.assertIn("key.timestamp_micros", result["timestamp_field_candidates"])
+            self.assertIn("obstacle.center.x", result["coordinate_field_candidates"])
+            details = nurec._obstacle_inventory(path)
+            self.assertEqual(details["status"], "OK")
+            self.assertEqual(details["unique_timestamp_count"], 2)
+
     def test_04_obstacle_missing_timestamp_is_visible(self):
         frame = pd.DataFrame({"center_x": [1.0], "center_y": [0.0]})
         with tempfile.TemporaryDirectory() as td, mock.patch.object(nurec, "parquet_engine", return_value={"available": True, "engines": ["pyarrow"], "status": "READY"}), mock.patch("pandas.read_parquet", return_value=frame):
