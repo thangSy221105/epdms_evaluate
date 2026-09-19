@@ -34,6 +34,15 @@ class WorldToNreBindingTests(unittest.TestCase):
             for j in range(4):
                 self.assertAlmostEqual(identity[i][j], 1.0 if i == j else 0.0, places=6)
 
+    def test_rebase_prevents_raw_global_translation_leak(self):
+        first = _pose([1000, 2000, 0], [0, 0, 0, 1])
+        later = _pose([1010, 2000, 0], [0, 0, 0, 1])
+        world_to_scene = _pose([0, 0, 0], [0, 0, 0, 1])
+        direct = _mm(world_to_scene, later)
+        rebased = _mm(world_to_scene, _mm(inv(first), later))
+        self.assertEqual(direct[0][3], 1010)
+        self.assertAlmostEqual(rebased[0][3], 10)
+
 
 if __name__ == "__main__":
     unittest.main()
