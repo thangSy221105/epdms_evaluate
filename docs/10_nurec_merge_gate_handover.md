@@ -60,3 +60,7 @@ DAC_GEOMETRY_UNVERIFIED
 
 No `QUERY_GRID_CONFIG_UNVERIFIED` blocker is present when the explicit config
 is supplied.
+
+The final ready-gate pass removes global `obstacle_table_complete` from object
+coverage readiness. Completeness remains required only for confirmed-empty
+states; object-only full coverage can be complete without frame evidence.
