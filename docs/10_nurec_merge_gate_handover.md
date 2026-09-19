@@ -2,7 +2,7 @@
 
 BASE_COMMIT: `6eac07e830fcab6f823b5791d2aba9b4ecca007a`
 BRANCH: `fix/nurec-data-prep-final-parity`
-NEW_COMMIT: `<filled after commit>`
+NEW_COMMIT: `a921317` (`fix(data): finalize NuRec scorer parity and grid readiness`)
 
 ## Scope
 
