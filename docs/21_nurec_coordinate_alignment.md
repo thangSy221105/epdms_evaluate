@@ -61,6 +61,7 @@ $py = "C:\Users\DELL\.cache\codex-runtimes\codex-primary-runtime\dependencies\py
   --nurec-clip-dir "D:\300_clip_nurec\hf_probe\official_nvidia_00040136" `
   --prediction-jsonl "D:\300_clip_nurec\00_raw\ar1_output\reasoning_intervention_nurec_selected_300.jsonl" `
   --ground-truth-jsonl "D:\300_clip_nurec\00_raw\ground_truth\ego_future_gt_nurec_300.jsonl" `
+  --time-alignment-jsonl "configs/nurec_coordinate_time_contract_5clip.jsonl" `
   --output-dir "D:\300_clip_nurec\hf_probe\coordinate_alignment_v1\00040136-e651-4abd-991d-0655ccda9430" `
   --clip-id "00040136-e651-4abd-991d-0655ccda9430"
 ```

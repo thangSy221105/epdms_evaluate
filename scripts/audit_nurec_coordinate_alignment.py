@@ -81,7 +81,7 @@ def load_time_record(path: Path, clip_id: str, expected_t0_us: int):
     r=matches[0]
     if r.get("verified") is not True: raise ValueError("TIME_MAPPING_UNVERIFIED")
     if r.get("mapping_type") not in {"PER_CLIP_REBASE","PER_CLIP_OFFSET","RESOLVED_PER_CLIP_REBASE"}: raise ValueError("TIME_MAPPING_TYPE_UNSUPPORTED")
-    if any(not isinstance(r.get(k),int) for k in ("physicalai_t0_us","nurec_t0_us","offset_us")): raise ValueError("TIME_MAPPING_FIELD_INVALID")
+    if any(type(r.get(k)) is not int for k in ("physicalai_t0_us","nurec_t0_us","offset_us")): raise ValueError("TIME_MAPPING_FIELD_INVALID")
     if r["physicalai_t0_us"]!=expected_t0_us or r["physicalai_t0_us"]+r["offset_us"]!=r["nurec_t0_us"]: raise ValueError("TIME_MAPPING_T0_MISMATCH")
     return r
 
@@ -92,16 +92,48 @@ def select_prediction(path, clip_id, mode=None, alpha=None, record_key=None):
     elif mode is not None or alpha is not None: rows=[r for r in rows if (mode is None or r.get("mode")==mode) and (alpha is None or float(r.get("alpha"))==alpha)]
     if len(rows)>1: raise ValueError("PREDICTION_SELECTOR_REQUIRED_DUPLICATE_CLIP_ROWS")
     if not rows: return None,"NOT_AVAILABLE"
-    frame=rows[0].get("coordinate_frame") or rows[0].get("prediction_frame")
-    return rows[0],("VERIFIED_FROM_PROVENANCE" if frame else "UNRESOLVED")
+    row=rows[0]; frame=row.get("coordinate_frame") or row.get("prediction_frame")
+    anchor=row.get("anchor") or row.get("reference_point") or row.get("prediction_anchor")
+    provenance=row.get("provenance") or row.get("source") or row.get("source_declaration")
+    if not frame: return row,"UNRESOLVED"
+    if frame and anchor and provenance: return row,"VERIFIED_FROM_PROVENANCE"
+    return row,"DECLARED_UNVERIFIED"
+
+def _has_key(value, wanted):
+    if isinstance(value, dict):
+        if wanted in value: return True
+        return any(_has_key(v, wanted) for v in value.values())
+    if isinstance(value, list): return any(_has_key(v, wanted) for v in value)
+    return False
+
+def inspect_map(root: Path):
+    rig=root/"rig_trajectories.json"; xodr=root/"map.xodr"; drivable=root/"clipgt"/"drivable_space.parquet"
+    rig_value=None
+    if rig.is_file():
+        try: rig_value=_read(rig)
+        except Exception: rig_value=None
+    if not rig.is_file(): map_status="MISSING_T_WORLD_BASE"
+    elif not _has_key(rig_value, "T_world_base"): map_status="MISSING_T_WORLD_BASE"
+    elif not xodr.is_file(): map_status="MAP_XODR_MISSING"
+    else:
+        text=xodr.read_text(encoding="utf-8", errors="replace")
+        map_status="PROVENANCE_AVAILABLE_NOT_INTEGRATED" if "geoReference" in text or "georeference" in text.lower() else "MAP_GEOREFERENCE_MISSING"
+    if not drivable.is_file(): drivable_status="MISSING"
+    else:
+        try:
+            import pyarrow.parquet as pq
+            pq.read_schema(drivable); drivable_status="FOUND_NOT_INTEGRATED"
+        except Exception: drivable_status="READ_ERROR"
+    return map_status, drivable_status
 
 def run(args):
     root=Path(args.nurec_clip_dir); out=Path(args.output_dir); out.mkdir(parents=True,exist_ok=True); rec=load_time_record(Path(args.time_alignment_jsonl),args.clip_id,args.prediction_t0_us); poses=load_nurec_poses(root); t0=rec["nurec_t0_us"]; queries=[t0+100000*(i+1) for i in range(64)]; base=interpolate_pose(poses,t0); local=[_mm(inverse_pose(base),interpolate_pose(poses,t))[0:3] for t in queries]; prediction,pstatus=select_prediction(Path(args.prediction_jsonl) if args.prediction_jsonl else None,args.clip_id,args.prediction_mode,args.prediction_alpha,args.prediction_record_key)
-    _dump(out/"coordinate_frame_inventory.json",{"prediction":{"status":pstatus},"ground_truth":{"frame":"EGO_AT_T0","status":"SUPPORTED_BY_UPSTREAM_EGO_AT_T0_CONTRACT"},"egomotion":{"frame":"rig_to_world","status":"VERIFIED_RIG_TO_WORLD_DIRECTION"},"obstacle":{"frame":None,"status":"UNRESOLVED"},"map":{"frame":None,"status":"PROVENANCE_AVAILABLE_NOT_INTEGRATED"}})
-    _dump(out/"prediction_coordinate_contract.json",{"status":pstatus,"selector":{"mode":args.prediction_mode,"alpha":args.prediction_alpha,"record_key":args.prediction_record_key}}); _dump(out/"gt_coordinate_contract.json",{"status":"SUPPORTED_BY_UPSTREAM_EGO_AT_T0_CONTRACT","frame":"EGO_AT_T0","anchor":"t0_pose"}); _dump(out/"rig_pose_contract.json",{"status":"VERIFIED_RIG_TO_WORLD_DIRECTION","interpolation":"STRICT_IN_RANGE_ONLY + FULL_SE3 + SLERP","source":"rig_trajectories.json:T_rig_worlds"})
-    _csv(out/"calibration_transform_inventory.csv",[{"source":"rig_trajectories.json","field":"world_to_nre.matrix","matrix_present":True,"semantics_status":"PARTIAL","semantics_evidence":"explicit matrix; scoring binding not proven","usable_for_scoring":False}]); _dump(out/"coordinate_transform_graph.json",{"common_frame":"EGO_AT_T0","edges":[{"source":"GT","target":"EGO_AT_T0","status":"DIRECT_SAME_FRAME","verified":True},{"source":"NuRec rig/world","target":"EGO_AT_T0","status":"VERIFIED_DYNAMIC_TRANSFORM","source":"T_rig_worlds + inverse(T_t0)","verified":True},{"source":"prediction","target":"EGO_AT_T0","status":"UNRESOLVED","verified":False},{"source":"obstacle","target":"EGO_AT_T0","status":"UNRESOLVED","verified":False},{"source":"map","target":"EGO_AT_T0","status":"PROVENANCE_AVAILABLE_NOT_INTEGRATED","verified":False}]})
+    map_status,drivable_status=inspect_map(root)
+    _dump(out/"coordinate_frame_inventory.json",{"prediction":{"status":pstatus},"ground_truth":{"frame":"EGO_AT_T0","status":"SUPPORTED_BY_UPSTREAM_EGO_AT_T0_CONTRACT","verified":False},"egomotion":{"frame":"rig_to_world","status":"VERIFIED_RIG_TO_WORLD_DIRECTION"},"obstacle":{"frame":None,"status":"UNRESOLVED"},"map":{"status":map_status},"sequence_tracks":{"available":(root/"sequence_tracks.json").is_file()}})
+    _dump(out/"prediction_coordinate_contract.json",{"status":pstatus,"selector":{"mode":args.prediction_mode,"alpha":args.prediction_alpha,"record_key":args.prediction_record_key}}); _dump(out/"gt_coordinate_contract.json",{"status":"SUPPORTED_BY_UPSTREAM_EGO_AT_T0_CONTRACT","verified":False,"frame":"EGO_AT_T0","anchor":"t0_pose"}); _dump(out/"rig_pose_contract.json",{"status":"VERIFIED_RIG_TO_WORLD_DIRECTION","interpolation":"STRICT_IN_RANGE_ONLY + FULL_SE3 + SLERP","source":"rig_trajectories.json:T_rig_worlds"})
+    _csv(out/"calibration_transform_inventory.csv",[{"source":"rig_trajectories.json","field":"world_to_nre.matrix","matrix_present":True,"semantics_status":"PARTIAL","semantics_evidence":"explicit matrix; scoring binding not proven","usable_for_scoring":False}]); _dump(out/"coordinate_transform_graph.json",{"common_frame":"EGO_AT_T0","edges":[{"source":"GT","target":"EGO_AT_T0","status":"SUPPORTED_BY_UPSTREAM_EGO_AT_T0_CONTRACT","verified":False},{"source":"NuRec rig/world","target":"EGO_AT_T0","status":"VERIFIED_DYNAMIC_TRANSFORM","source":"T_rig_worlds + inverse(T_t0)","verified":True},{"source":"prediction","target":"EGO_AT_T0","status":pstatus,"verified":pstatus=="VERIFIED_FROM_PROVENANCE"},{"source":"obstacle","target":"EGO_AT_T0","status":"UNRESOLVED","verified":False},{"source":"map","target":"EGO_AT_T0","status":map_status,"verified":False}]})
     _csv(out/"ego_coordinate_validation.csv",[{"clip_id":args.clip_id,"query_min_us":queries[0],"query_max_us":queries[-1],"interpolation_in_range":True,"pose_query_count":len(local),"status":"POSE_CHAIN_VERIFIED"}])
-    summary={"clip_id":args.clip_id,"time_mapping_source":str(args.time_alignment_jsonl),"time_mapping_verified":True,"per_clip_offset_us":rec["offset_us"],"coordinate_alignment_status":"PARTIALLY_VERIFIED","coordinate_code_ready":True,"coordinate_data_ready":False,"pose_interpolation_policy":"STRICT_IN_RANGE_ONLY","pose_rotation_interpolation":"SLERP","localization_transform":"FULL_SE3_INVERSE_T0","prediction_frame_status":pstatus,"gt_frame_status":"SUPPORTED_BY_UPSTREAM_EGO_AT_T0_CONTRACT","nurec_pose_chain_status":"VERIFIED_RIG_TO_WORLD_DIRECTION","obstacle_frame_status":"UNRESOLVED","map_frame_status":"PROVENANCE_AVAILABLE_NOT_INTEGRATED","drivable_space_status":"MISSING","coordinate_audit_derived_new_time_offset":False,"remaining_blockers":["PREDICTION_FRAME_PROVENANCE","OBSTACLE_REFERENCE_FRAME_NOT_PRESERVED","MAP_GEOMETRY_FRAME_NOT_DECLARED","DRIVABLE_SPACE_MISSING","OBSERVATION_COVERAGE"]}; _dump(out/"coordinate_alignment_summary.json",summary); return summary
+    summary={"clip_id":args.clip_id,"time_mapping_source":str(args.time_alignment_jsonl),"time_mapping_verified":True,"per_clip_offset_us":rec["offset_us"],"coordinate_alignment_status":"PARTIALLY_VERIFIED","ego_pose_coordinate_status":"VERIFIED_WITH_NUMERICAL_SUPPORT","coordinate_code_ready":True,"coordinate_data_ready":False,"pose_interpolation_policy":"STRICT_IN_RANGE_ONLY","pose_rotation_interpolation":"SLERP","localization_transform":"FULL_SE3_INVERSE_T0","prediction_frame_status":pstatus,"gt_frame_status":"SUPPORTED_BY_UPSTREAM_EGO_AT_T0_CONTRACT","nurec_pose_chain_status":"VERIFIED_RIG_TO_WORLD_DIRECTION","obstacle_frame_status":"UNRESOLVED","map_frame_status":map_status,"drivable_space_status":drivable_status,"sequence_tracks_available":(root/"sequence_tracks.json").is_file(),"coordinate_audit_derived_new_time_offset":False,"remaining_blockers":["PREDICTION_FRAME_PROVENANCE","OBSTACLE_REFERENCE_FRAME_NOT_PRESERVED","MAP_GEOMETRY_FRAME_NOT_DECLARED","OBSERVATION_COVERAGE"]}; _dump(out/"coordinate_alignment_summary.json",summary); return summary
 
 def main():
     p=argparse.ArgumentParser(); p.add_argument("--nurec-clip-dir",required=True); p.add_argument("--prediction-jsonl"); p.add_argument("--ground-truth-jsonl"); p.add_argument("--time-alignment-jsonl",required=True); p.add_argument("--output-dir",required=True); p.add_argument("--clip-id",required=True); p.add_argument("--prediction-t0-us",type=int,default=5100000); p.add_argument("--prediction-mode"); p.add_argument("--prediction-alpha",type=float); p.add_argument("--prediction-record-key"); a=p.parse_args(); print(json.dumps(run(a),indent=2,ensure_ascii=True)); return 0

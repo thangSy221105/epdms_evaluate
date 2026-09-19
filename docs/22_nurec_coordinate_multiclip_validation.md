@@ -14,7 +14,8 @@ egomotion parquet chunk.
 
 The runner rejects an unverified/mismatched time sidecar and rejects any pose
 query outside the source range. It reports PAI↔NuRec yaw as
-`PAI_NUREC_YAW_VALIDATION`; no GT yaw is fabricated.
+`PAI_NUREC_YAW_VALIDATION`; no GT yaw is fabricated. The machine-readable
+field is `yaw_validation_source = PAI_NUREC_POSE`.
 
 | clip | per-clip offset (us) | XY RMSE (m) | XY P95 (m) | yaw RMSE (deg) |
 |---|---:|---:|---:|---:|
@@ -36,10 +37,11 @@ The status remains:
 
 ```text
 TIME_ALIGNMENT = RESOLVED_PER_CLIP_REBASE
-NUREC_POSE_ALIGNMENT = PASS_NUMERICAL_SUPPORT
+POSE_CHAIN_STATUS = VERIFIED_WITH_NUMERICAL_SUPPORT
+NUMERICAL_VALIDATION_STATUS = PASS_NUMERICAL_SUPPORT
 COORDINATE_ALIGNMENT = PARTIALLY_VERIFIED
 OBSTACLE_FRAME = UNRESOLVED
-MAP_FRAME = UNRESOLVED
+MAP_FRAME = PROVENANCE_AVAILABLE_NOT_INTEGRATED
 DRIVABLE_SPACE = MISSING_IN_THE_FIVE_PACKAGES
 ```
 
