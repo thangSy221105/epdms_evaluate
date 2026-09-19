@@ -134,21 +134,23 @@ def compute_collision_free_proxy(
 
     # Confirmed clear road (empty scene)
     if len(obstacles) == 0:
+        # An empty container is absence of records, not evidence that every
+        # required frame was observed.  Strict production scoring therefore
+        # requires an explicit dataset-level observation attestation.
         if confirmed_empty_scene or not strict_mode:
             return CollisionFreeResult(
                 1.0, None, None, [], [],
                 matched_observation_frames=0,
-                required_observation_frames=0,
+                required_observation_frames=required_frames,
                 observation_coverage_ratio=1.0,
                 confirmed_empty_frames=required_frames,
             )
-        # In strict mode without confirmation, if obstacles is empty list, treat as confirmed clear
         return CollisionFreeResult(
-            1.0, None, None, [], [],
+            None, None, None, [], [],
             matched_observation_frames=0,
-            required_observation_frames=0,
-            observation_coverage_ratio=1.0,
-            confirmed_empty_frames=required_frames,
+            required_observation_frames=required_frames,
+            observation_coverage_ratio=0.0,
+            missing_frames=required_frames,
         )
 
     # Index obstacles and validate every record (strict mode raises CorruptedObservationDataError)
@@ -310,13 +312,28 @@ def compute_ttc_proxy(
     context_present: bool = True,
     strict_mode: bool = False,
     confirmed_empty_timestamps: Optional[Set[int]] = None,
+    confirmed_empty_scene: bool = False,
 ) -> TtcResult:
     """Evaluates Time-to-Collision (TTC) proxy metric with separate TTC observation coverage gating."""
     if not context_present or obstacles is None:
         return TtcResult(None, None, None, None)
 
-    if len(obstacles) == 0 or len(x) < 2:
-        return TtcResult(1.0, None, None, None, 0, 0, 0, 0, 1.0)
+    if len(x) < 2:
+        return TtcResult(None, None, None, None)
+
+    if len(obstacles) == 0:
+        # Match CF: strict mode accepts an empty scene only when the caller
+        # supplies independent evidence that the queried frames were observed.
+        if strict_mode and not confirmed_empty_scene:
+            return TtcResult(
+                None, None, None, None,
+                ttc_required_observations=len(x),
+                ttc_observed_observations=0,
+                ttc_confirmed_empty_observations=0,
+                ttc_missing_observations=len(x),
+                ttc_coverage_ratio=0.0,
+            )
+        return TtcResult(1.0, None, None, None, len(x), 0, len(x), 0, 1.0)
 
     # Index obstacles and validate
     obs_by_time, all_obs_timestamps, invalid_count, missing_ts_count = index_and_filter_obstacles(

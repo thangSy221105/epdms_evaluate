@@ -108,6 +108,15 @@ class EvaluationScoreRecord:
     timeline_policy: str = "strict_grid"
     t0_source: Optional[str] = None
     map_status: Optional[str] = None
+    prediction_frame: Optional[str] = None
+    gt_frame: Optional[str] = None
+    obstacle_frame: Optional[str] = None
+    map_frame: Optional[str] = None
+    prediction_anchor: Optional[str] = None
+    gt_anchor: Optional[str] = None
+    transform_required: Optional[bool] = None
+    transform_source: Optional[str] = None
+    coordinate_alignment_verified: bool = False
 
     # Backward compatibility aliases
     matched_observation_frames: int = 0
@@ -180,6 +189,15 @@ class EvaluationScoreRecord:
             "timeline_policy": self.timeline_policy,
             "t0_source": self.t0_source,
             "map_status": self.map_status,
+            "prediction_frame": self.prediction_frame,
+            "gt_frame": self.gt_frame,
+            "obstacle_frame": self.obstacle_frame,
+            "map_frame": self.map_frame,
+            "prediction_anchor": self.prediction_anchor,
+            "gt_anchor": self.gt_anchor,
+            "transform_required": self.transform_required,
+            "transform_source": self.transform_source,
+            "coordinate_alignment_verified": self.coordinate_alignment_verified,
             "matched_observation_frames": self.matched_observation_frames,
             "required_observation_frames": self.required_observation_frames,
             "observation_coverage_ratio": self.observation_coverage_ratio,

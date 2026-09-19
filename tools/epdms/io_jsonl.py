@@ -93,6 +93,25 @@ class AtomicJsonlWriter:
         if temp_path.is_file():
             if target_path.is_file():
                 repair_truncated_jsonl(target_path)
+                # Never merge an overlapping crash checkpoint silently. The
+                # CLI performs the same check before recovery; keeping the
+                # guard here protects direct library callers as well.
+                target_keys = set()
+                temp_keys = set()
+                try:
+                    for source, destination in ((target_path, target_keys), (temp_path, temp_keys)):
+                        with source.open("r", encoding="utf-8") as handle:
+                            for line in handle:
+                                if line.strip():
+                                    row = json.loads(line)
+                                    if row.get("record_key"):
+                                        destination.add(str(row["record_key"]))
+                except Exception as exc:
+                    raise ValueError(f"Ambiguous checkpoint: cannot inspect {temp_path.name}: {exc}") from exc
+                overlap = target_keys & temp_keys
+                if overlap:
+                    from .run_identity import AmbiguousCheckpointError
+                    raise AmbiguousCheckpointError(f"AMBIGUOUS_CHECKPOINT: overlapping record keys {sorted(overlap)[:5]}")
                 with temp_path.open("r", encoding="utf-8") as tf, target_path.open("a", encoding="utf-8") as af:
                     for line in tf:
                         s = line.strip()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -18,6 +19,17 @@ class RunIdentityError(ValueError):
 class AmbiguousCheckpointError(RunIdentityError):
     """Raised when conflicting checkpoint files exist without verifiable relation."""
     pass
+
+
+METRIC_IMPLEMENTATION_VERSION = "2.3.0-r5"
+
+
+def _safe_git_commit_sha() -> str:
+    try:
+        out = subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True, timeout=2)
+        return out.strip()
+    except Exception:
+        return ""
 
 
 def compute_file_content_sha256(path: Path) -> str:
@@ -56,18 +68,24 @@ def compute_run_effective_fingerprint(
     clip_scope: Optional[List[str]] = None,
 ) -> str:
     """Computes a deterministic SHA-256 fingerprint for a run configuration."""
+    proxy = config_dict.get("proxy", {}) if isinstance(config_dict.get("proxy", {}), dict) else {}
     identity: Dict[str, Any] = {
+        "implementation_version": METRIC_IMPLEMENTATION_VERSION,
         "metric_profile": config_dict.get("metric_profile"),
         "horizon_s": config_dict.get("horizon_s"),
         "frequency_hz": config_dict.get("frequency_hz"),
         "strict_mode": config_dict.get("strict_mode"),
-        "touch_is_collision": config_dict.get("proxy", {}).get("touch_is_collision"),
-        "ttc_horizon_s": config_dict.get("proxy", {}).get("ttc_horizon_s"),
-        "progress_stationary_threshold_m": config_dict.get("proxy", {}).get("progress_stationary_threshold_m"),
+        "observation_policy": config_dict.get("observation_policy", "strict_full_coverage"),
+        "timeline_policy": config_dict.get("timeline_policy", "strict_grid_common_t0"),
+        "map_policy": config_dict.get("map_policy", "strict_valid_geometry"),
+        "proxy": proxy,
         "vehicle": config_dict.get("vehicle"),
+        "alphas": config_dict.get("alphas"),
+        "modes": config_dict.get("modes"),
         "source_hashes": source_hashes,
+        "map_content_hash": source_hashes.get("context_filtered_map", ""),
         "clip_scope": sorted(clip_scope) if clip_scope is not None else "ALL",
-        "implementation_version": "v2.2.0_r4_contracts",
+        "git_commit_sha": config_dict.get("git_commit_sha") or _safe_git_commit_sha(),
     }
     if runtime_overrides:
         identity.update(runtime_overrides)
@@ -132,6 +150,33 @@ def verify_resume_safety_before_recovery(
             f"(existing={prev_fp}, current={expected_fingerprint}). "
             f"Existing artifacts ({existing_artifacts}) belong to a different run configuration."
         )
+
+    # If a target and its pending .tmp both contain the same key, recovery is
+    # ambiguous and must stop before modifying either checkpoint.
+    for target_name in ("epdms_scores_300.jsonl", "epdms_errors_300.jsonl"):
+        target = score_dir / target_name
+        temp = score_dir / f"{target_name}.tmp"
+        if not (target.is_file() and target.stat().st_size > 0 and temp.is_file() and temp.stat().st_size > 0):
+            continue
+
+        def _keys(path: Path) -> Set[str]:
+            found: Set[str] = set()
+            try:
+                with path.open("r", encoding="utf-8") as handle:
+                    for line in handle:
+                        if line.strip():
+                            row = json.loads(line)
+                            if row.get("record_key"):
+                                found.add(str(row["record_key"]))
+            except Exception as exc:
+                raise RunIdentityError(f"Resume rejected: cannot inspect checkpoint {path.name}: {exc}") from exc
+            return found
+
+        overlap = _keys(target) & _keys(temp)
+        if overlap:
+            raise AmbiguousCheckpointError(
+                f"AMBIGUOUS_CHECKPOINT: {target.name} and {temp.name} overlap on record keys {sorted(overlap)[:5]}"
+            )
 
     return prev_manifest
 

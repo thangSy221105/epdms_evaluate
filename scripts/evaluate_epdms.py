@@ -27,6 +27,7 @@ from tools.epdms.io_jsonl import AtomicJsonlWriter, compute_file_sha256, iter_js
 from tools.epdms.map_loader import inspect_clip_map_status, load_lane_polygons_for_clip
 from tools.epdms.reporting import export_table_to_csv
 from tools.epdms.run_identity import (
+    METRIC_IMPLEMENTATION_VERSION,
     compute_map_directory_content_sha256,
     verify_resume_safety_before_recovery,
     write_manifest_atomic,
@@ -53,6 +54,7 @@ def main() -> None:
     )
     parser.add_argument("--horizon", type=float, default=None, help="Evaluation horizon in seconds (default: 4.0).")
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=None, help="Resume from existing score file.")
+    parser.add_argument("--retry-invalid", action="store_true", help="Re-evaluate keys found in the previous errors JSONL.")
     parser.add_argument("--score-dir", type=Path, default=None, help="Output directory for scores.")
     parser.add_argument("--max-clips", type=int, default=None, help="Limit number of clips to evaluate.")
     args = parser.parse_args()
@@ -99,6 +101,11 @@ def main() -> None:
     score_jsonl = score_dir / "epdms_scores_300.jsonl"
     score_csv = score_dir / "epdms_scores_300.csv"
     error_jsonl = score_dir / "epdms_errors_300.jsonl"
+    error_output_jsonl = error_jsonl
+    if args.retry_invalid and resume and error_jsonl.is_file():
+        # Keep retry attempts append-safe and auditable instead of creating
+        # duplicate latest-state rows in the canonical errors file.
+        error_output_jsonl = score_dir / f"epdms_errors_300_attempt_{time.strftime('%Y%m%d%H%M%S')}.jsonl"
     manifest_json = score_dir / "run_manifest.json"
 
     # 1. Validate identity on resume BEFORE any recovery or file modification
@@ -120,21 +127,30 @@ def main() -> None:
 
     # 3. Open writers
     score_writer = AtomicJsonlWriter(score_jsonl, append_if_exists=resume)
-    error_writer = AtomicJsonlWriter(error_jsonl, append_if_exists=resume)
+    error_writer = AtomicJsonlWriter(error_output_jsonl, append_if_exists=resume and error_output_jsonl == error_jsonl)
 
-    completed_keys = set()
+    valid_keys = set()
+    invalid_keys = set()
+    previous_invalid_types: Dict[str, str] = {}
     all_score_dicts: List[Dict[str, Any]] = []
 
-    # 4. Read cleanly recovered records from score_jsonl
+    # 4. Read both valid and invalid completed state.  Invalid rows are
+    # skipped by default; --retry-invalid explicitly opts into reprocessing.
     if resume and score_jsonl.is_file():
         for r in iter_jsonl(score_jsonl):
             k = r.get("record_key")
             if k:
-                if k in completed_keys:
+                if k in valid_keys:
                     raise ValueError(f"Corrupted score file: duplicate record key found on resume: {k}")
-                completed_keys.add(k)
+                valid_keys.add(k)
                 all_score_dicts.append(r)
-        print(f"[*] Resuming: found {len(completed_keys)} already evaluated conditions in {score_jsonl.name}")
+    if resume and error_jsonl.is_file():
+        for r in iter_jsonl(error_jsonl):
+            k = r.get("record_key")
+            if k:
+                invalid_keys.add(str(k))
+                previous_invalid_types[str(k)] = str(r.get("failure_type") or "unknown")
+    print(f"[*] Resuming: valid={len(valid_keys)}, invalid={len(invalid_keys)}")
 
     # Load context & ground truth indexed by clip_id
     print(f"[*] Loading context index from: {config.context_jsonl}")
@@ -178,11 +194,13 @@ def main() -> None:
         "frequency_hz": config.frequency_hz,
         "total_conditions": total_conditions,
         "processed_this_run": 0,
-        "skipped_resumed": len(completed_keys),
+        "skipped_resumed": len(valid_keys) + (0 if args.retry_invalid else len(invalid_keys)),
+        "retry_invalid": bool(args.retry_invalid),
         "total_completed": len(all_score_dicts),
         "total_runtime_s": 0.0,
         "config_sha256": config.sha256,
         "effective_fingerprint": current_effective_fingerprint,
+        "implementation_version": METRIC_IMPLEMENTATION_VERSION,
         "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -199,7 +217,7 @@ def main() -> None:
                 mode = str(pred_row.get("mode", "unknown"))
                 record_key = f"{clip_id}|{mode}|{alpha:.3f}".rstrip("0").rstrip(".") if alpha != 0 else f"{clip_id}|{mode}|0"
 
-                if record_key in completed_keys:
+                if record_key in valid_keys or (record_key in invalid_keys and not args.retry_invalid):
                     skipped_count += 1
                     continue
 
@@ -247,6 +265,11 @@ def main() -> None:
 
             eval_record.config_sha256 = config.sha256
             rec_dict = eval_record.to_dict()
+            if args.retry_invalid and record_key in previous_invalid_types:
+                rec_dict["attempt_number"] = 2
+                rec_dict["previous_failure_type"] = previous_invalid_types[record_key]
+            else:
+                rec_dict["attempt_number"] = 1
 
             if eval_record.valid:
                 score_writer.write(rec_dict)
@@ -255,7 +278,10 @@ def main() -> None:
                 error_writer.write(rec_dict)
 
             processed_this_run += 1
-            completed_keys.add(record_key)
+            if eval_record.valid:
+                valid_keys.add(record_key)
+            else:
+                invalid_keys.add(record_key)
 
             if processed_this_run % 50 == 0:
                 score_writer.flush()
@@ -275,8 +301,10 @@ def main() -> None:
 
     # Save final run manifest with COMPLETED status
     total_time = time.time() - start_time
+    pilot_gating_only = args.max_clips is not None and len(all_score_dicts) == 0
     manifest_data.update({
-        "status": "COMPLETED",
+        "status": "PILOT_GATING_COMPLETED" if pilot_gating_only else ("DATASET_NOT_READY" if len(all_score_dicts) == 0 and processed_this_run > 0 else "COMPLETED"),
+        "pilot_status": "REAL_SCORING_PILOT_BLOCKED" if pilot_gating_only else ("SCORING_COMPLETED" if all_score_dicts else "DATASET_NOT_READY"),
         "processed_this_run": processed_this_run,
         "skipped_resumed": skipped_count,
         "total_completed": len(all_score_dicts),
@@ -294,6 +322,8 @@ def main() -> None:
     print(f"    Scores JSONL:    {score_jsonl}")
     print(f"    Scores CSV:      {score_csv}")
     print(f"    Run Manifest:    {manifest_json}")
+    if pilot_gating_only:
+        print("    Pilot Status:    REAL_SCORING_PILOT_BLOCKED (PILOT_GATING_COMPLETED)")
 
 
 if __name__ == "__main__":

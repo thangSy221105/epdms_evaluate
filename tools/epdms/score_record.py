@@ -24,7 +24,10 @@ from .time_contract import (
     MissingTimeOriginError,
     NonMonotonicWaypointTimelineError,
     TimeContractError,
+    TimelineOriginMismatchError,
     TimelineHorizonMismatchError,
+    NormalizedTrajectoryTimeline,
+    normalize_trajectory_timeline,
     resolve_time_origin,
     validate_and_normalize_timeline,
 )
@@ -76,6 +79,87 @@ def extract_and_validate_trajectory(
         strict_grid=strict_grid,
     )
     return list(xs_arr), list(ys_arr), future_wps
+
+
+def _prediction_waypoints(pred_row: Dict[str, Any], alpha: float, target_future_poses: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Select the prediction trajectory without changing its timestamp fields."""
+    if alpha == 0.0:
+        raw = pred_row.get("clean_waypoints")
+        if raw is None and isinstance(pred_row.get("trajectories"), dict):
+            raw = pred_row["trajectories"].get("clean") or pred_row["trajectories"].get("guided")
+        if raw is None:
+            raw = pred_row.get("guided_waypoints")
+    else:
+        raw = pred_row.get("guided_waypoints")
+        if raw is None and isinstance(pred_row.get("trajectories"), dict):
+            raw = pred_row["trajectories"].get("guided")
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("Missing prediction trajectory for requested alpha")
+    if target_future_poses is not None and len(raw) > target_future_poses:
+        # The NuRec source stores a 6.4 s trajectory (64 poses); the locked
+        # EPDMS profile evaluates the configured 4.0 s prefix. This is an
+        # explicit window policy, not timeline resampling or extrapolation.
+        includes_t0 = False
+        first = raw[0] if isinstance(raw[0], dict) else {}
+        if isinstance(first, dict):
+            if first.get("t_s") is not None and abs(float(first.get("t_s"))) <= 1e-9:
+                includes_t0 = True
+            if pred_row.get("t0_us") is not None:
+                for key in ("timestamp_micros", "t_us", "timestamp_us"):
+                    if first.get(key) is not None and int(float(first[key])) == int(pred_row["t0_us"]):
+                        includes_t0 = True
+        raw = raw[: target_future_poses + 1 if includes_t0 else target_future_poses]
+    return raw
+
+
+def _observation_attestation(context_row: Dict[str, Any]) -> Tuple[bool, Optional[set[int]]]:
+    """Read explicit empty-scene evidence; never infer it from an empty list."""
+    sc = context_row.get("semantic_context", {}) if isinstance(context_row, dict) else {}
+    obstacle = sc.get("obstacle", {}) if isinstance(sc, dict) else {}
+    candidates = [
+        context_row.get("confirmed_empty_scene"),
+        context_row.get("observation_metadata", {}).get("confirmed_empty_scene") if isinstance(context_row.get("observation_metadata"), dict) else None,
+        obstacle.get("confirmed_empty_scene") if isinstance(obstacle, dict) else None,
+    ]
+    confirmed_scene = any(value is True for value in candidates)
+    raw_ts = None
+    for container in (context_row, sc, obstacle):
+        if isinstance(container, dict):
+            for key in ("confirmed_empty_timestamps_us", "observed_empty_timestamps_us", "sensor_timestamps_us"):
+                if key in container:
+                    raw_ts = container[key]
+                    break
+        if raw_ts is not None:
+            break
+    timestamps = None
+    if isinstance(raw_ts, list):
+        try:
+            timestamps = {int(v) for v in raw_ts}
+        except (TypeError, ValueError):
+            raise CorruptedObservationDataError("Observation timestamp attestation contains non-integer values")
+    return confirmed_scene, timestamps
+
+
+def _coordinate_contract(pred_row: Dict[str, Any], context_row: Dict[str, Any], gt_row: Dict[str, Any], map_status: Optional[str]) -> Dict[str, Any]:
+    """Resolve only declared frame/anchor metadata; never infer transforms."""
+    sc = context_row.get("semantic_context", {}) if isinstance(context_row, dict) else {}
+    sc = sc if isinstance(sc, dict) else {}
+    def first(*containers: Any, keys: Tuple[str, ...]) -> Optional[str]:
+        for container in containers:
+            if isinstance(container, dict):
+                for key in keys:
+                    if container.get(key) is not None:
+                        return str(container[key])
+        return None
+    pframe = first(pred_row, keys=("coordinate_frame", "frame", "prediction_frame"))
+    gframe = first(gt_row, keys=("coordinate_frame", "frame", "gt_frame"))
+    oframe = first(context_row, sc, keys=("obstacle_frame", "coordinate_frame", "frame"))
+    mframe = first(context_row, sc, keys=("map_frame",))
+    panchor = first(pred_row, keys=("reference_point", "anchor", "prediction_anchor"))
+    ganchor = first(gt_row, keys=("reference_point", "anchor", "gt_anchor"))
+    declared = any(value is not None for value in (pframe, gframe, oframe, mframe, panchor, ganchor))
+    verified = bool(pframe and gframe and oframe and mframe and panchor and ganchor and pframe == gframe == oframe == mframe and panchor == ganchor)
+    return {"prediction_frame": pframe, "gt_frame": gframe, "obstacle_frame": oframe, "map_frame": mframe, "prediction_anchor": panchor, "gt_anchor": ganchor, "transform_required": False if verified else None, "transform_source": "declared_metadata" if verified else None, "coordinate_alignment_verified": verified, "declared": declared}
 
 
 def evaluate_single_condition(
@@ -140,28 +224,26 @@ def evaluate_single_condition(
         rec.mode = mode
         rec.alpha = alpha
 
-        # 2. Extract and validate trajectory waypoints and timeline
-        target_future_poses = int(round(horizon_s * frequency_hz))
-        try:
-            xs, ys, future_wps = extract_and_validate_trajectory(
-                pred_row, alpha, target_future_poses=target_future_poses,
-                expected_frequency_hz=frequency_hz, expected_horizon_s=horizon_s,
-                strict_grid=strict_mode,
-            )
-        except (NonMonotonicWaypointTimelineError, TimelineHorizonMismatchError, InconsistentWaypointTimelineError) as t_err:
-            rec.valid = False
-            rec.failure_stage = "timeline_contract"
-            rec.failure_type = type(t_err).__name__
-            rec.failure_reason = str(t_err)
-            rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
-            return rec
+        # Preserve useful structural diagnostics when a legacy record is
+        # missing t0: this preflight only checks the selected trajectory's
+        # shape/coordinates; the authoritative normalization still happens
+        # below after t0 is resolved.
+        if not any(isinstance(row, dict) and row.get("t0_us") is not None for row in (pred_row, context_row, gt_row)):
+            try:
+                extract_and_validate_trajectory(
+                    pred_row, alpha, target_future_poses=int(round(horizon_s * frequency_hz)),
+                    expected_frequency_hz=frequency_hz, expected_horizon_s=horizon_s,
+                    strict_grid=strict_mode,
+                )
+            except Exception as preflight_err:
+                rec.valid = False
+                rec.failure_stage = "timeline_contract"
+                rec.failure_type = type(preflight_err).__name__
+                rec.failure_reason = str(preflight_err)
+                rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
+                return rec
 
-        # Prepend state at t=0.0 (origin of ar1_ego frame)
-        x_arr = np.array([0.0] + xs, dtype=float)
-        y_arr = np.array([0.0] + ys, dtype=float)
-        n_poses = len(x_arr)
-
-        # 3. Resolve time origin t0
+        # 2. Resolve one time origin before parsing either trajectory.
         try:
             t0_us, t0_src = resolve_time_origin(
                 pred_row, context_row, gt_row, strict_mode=strict_mode
@@ -175,8 +257,36 @@ def evaluate_single_condition(
             rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
             return rec
 
-        dt_us = int(round(1_000_000 / frequency_hz))
-        timestamps_us = t0_us + np.arange(n_poses, dtype=np.int64) * dt_us
+        # 3. Prediction and GT both use the same normalizer.  Explicit input
+        # timestamps are retained and passed to every time-sensitive metric.
+        target_future_poses = int(round(horizon_s * frequency_hz))
+        try:
+            pred_timeline = normalize_trajectory_timeline(
+                _prediction_waypoints(pred_row, alpha, target_future_poses=target_future_poses), t0_us=t0_us,
+                expected_frequency_hz=frequency_hz, expected_horizon_s=horizon_s,
+                role="prediction", strict_grid=strict_mode,
+            )
+        except TimeContractError as t_err:
+            rec.valid = False
+            rec.failure_stage = "timeline_contract"
+            rec.failure_type = type(t_err).__name__
+            rec.failure_reason = str(t_err)
+            rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
+            return rec
+
+        if pred_timeline.includes_t0:
+            x_arr = pred_timeline.x.copy()
+            y_arr = pred_timeline.y.copy()
+            timestamps_us = pred_timeline.timestamps_us.copy()
+            xs = list(x_arr[1:])
+            ys = list(y_arr[1:])
+        else:
+            xs = list(pred_timeline.x)
+            ys = list(pred_timeline.y)
+            x_arr = np.concatenate(([0.0], pred_timeline.x))
+            y_arr = np.concatenate(([0.0], pred_timeline.y))
+            timestamps_us = np.concatenate(([t0_us], pred_timeline.timestamps_us))
+        n_poses = len(x_arr)
 
         # 4. Derive headings and Kinematics
         headings = derive_heading_from_xy(x_arr, y_arr)
@@ -191,6 +301,61 @@ def evaluate_single_condition(
         fc_score = 1.0 if kin.comfort_pass else 0.0
         rec.future_comfort_proxy = fc_score
 
+        # A partial map is a deterministic blocker and is reported before
+        # observation/GT work, preserving a useful failure stage.
+        if map_status == "PARTIAL" and strict_mode:
+            rec.valid = False
+            rec.failure_stage = "map_geometry_contract"
+            rec.failure_type = "PartialCorruptedMapError"
+            rec.failure_reason = "Map contains corrupted/partial polygons and cannot be used for strict scoring"
+            rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
+            return rec
+        if lane_polygons is not None and len(lane_polygons) > 0:
+            for polygon in lane_polygons:
+                if not isinstance(polygon, np.ndarray) or len(polygon) < 3 or not np.all(np.isfinite(polygon)):
+                    rec.valid = False
+                    rec.failure_stage = "map_geometry_contract"
+                    rec.failure_type = "NonFiniteGeometryError"
+                    rec.failure_reason = "Map polygon contains non-finite coordinates or fewer than 3 vertices"
+                    rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
+                    return rec
+
+        # Validate GT structure before obstacle gating so a malformed GT is
+        # reported as a GT contract failure rather than being masked by a
+        # separate missing-observation failure.
+        if gt_row is not None:
+            raw_gt_pre = next((gt_row.get(k) for k in ("ego_future_xyz", "expert_future", "future_waypoints") if gt_row.get(k) is not None), None)
+            if raw_gt_pre is None:
+                rec.valid = False
+                rec.failure_stage = "ground_truth_contract"
+                rec.failure_type = "InsufficientWaypointsError"
+                rec.failure_reason = f"Ground truth missing or has fewer than {int(round(horizon_s * frequency_hz))} waypoints"
+                rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
+                return rec
+            try:
+                raw_gt_pre_items = raw_gt_pre.tolist() if isinstance(raw_gt_pre, np.ndarray) else list(raw_gt_pre)
+                if len(raw_gt_pre_items) > int(round(horizon_s * frequency_hz)):
+                    raw_gt_pre_items = raw_gt_pre_items[:int(round(horizon_s * frequency_hz))]
+                normalize_trajectory_timeline(raw_gt_pre_items, t0_us=t0_us, expected_frequency_hz=frequency_hz, expected_horizon_s=horizon_s, role="ground_truth", strict_grid=strict_mode)
+            except TimeContractError as gt_pre_err:
+                rec.valid = False
+                rec.failure_stage = "ground_truth_contract"
+                rec.failure_type = type(gt_pre_err).__name__
+                rec.failure_reason = str(gt_pre_err)
+                rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
+                return rec
+
+        coord_info = _coordinate_contract(pred_row, context_row or {}, gt_row or {}, map_status)
+        for key in ("prediction_frame", "gt_frame", "obstacle_frame", "map_frame", "prediction_anchor", "gt_anchor", "transform_required", "transform_source", "coordinate_alignment_verified"):
+            setattr(rec, key, coord_info.get(key))
+        if strict_mode and gt_row is not None and coord_info["declared"] and not coord_info["coordinate_alignment_verified"]:
+            rec.valid = False
+            rec.failure_stage = "coordinate_contract"
+            rec.failure_type = "COORDINATE_CONTRACT_UNRESOLVED"
+            rec.failure_reason = "Prediction, GT, obstacle and map frame/anchor declarations do not establish a common coordinate contract"
+            rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
+            return rec
+
         # 5. Context validation (Obstacles)
         if context_row is None:
             raise ValueError("missing_context: Context record missing for clip")
@@ -202,6 +367,7 @@ def evaluate_single_condition(
         obstacles = sc.get("obstacle", {}).get("all_obstacles")
         if obstacles is None:
             raise ValueError("missing_obstacles: 'all_obstacles' not found in context")
+        confirmed_empty_scene, confirmed_empty_timestamps = _observation_attestation(context_row)
 
         # Compute Collision Free (CF)
         try:
@@ -209,6 +375,8 @@ def evaluate_single_condition(
                 x_arr, y_arr, headings, timestamps_us, obstacles, vehicle,
                 t0_us=t0_us, touch_is_collision=touch_is_collision, context_present=True,
                 strict_mode=strict_mode,
+                confirmed_empty_timestamps=confirmed_empty_timestamps,
+                confirmed_empty_scene=confirmed_empty_scene,
             )
             cf_score, col_t, min_clear, col_tracks, col_types = cf_res
             rec.cf_required_frames = getattr(cf_res, "cf_required_frames", len(x_arr))
@@ -230,7 +398,7 @@ def evaluate_single_condition(
             rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
             return rec
 
-        if obstacles is not None and len(obstacles) > 0 and cf_score is None:
+        if cf_score is None:
             rec.valid = False
             rec.failure_stage = "obstacle_observation_contract"
             rec.failure_type = "INSUFFICIENT_OBSERVATION_DATA"
@@ -251,6 +419,8 @@ def evaluate_single_condition(
                 x_arr, y_arr, headings, speeds, timestamps_us, obstacles, vehicle,
                 t0_us=t0_us, ttc_horizon_s=ttc_horizon_s, context_present=True,
                 strict_mode=strict_mode,
+                confirmed_empty_timestamps=confirmed_empty_timestamps,
+                confirmed_empty_scene=confirmed_empty_scene,
             )
             ttc_score, min_ttc, ttc_fail_t, ttc_tr = ttc_res
             rec.ttc_required_observations = getattr(ttc_res, "ttc_required_observations", 0)
@@ -265,7 +435,7 @@ def evaluate_single_condition(
             rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
             return rec
 
-        if obstacles is not None and len(obstacles) > 0 and ttc_score is None:
+        if ttc_score is None:
             rec.valid = False
             rec.failure_stage = "obstacle_observation_contract"
             rec.failure_type = "INSUFFICIENT_OBSERVATION_DATA"
@@ -279,14 +449,6 @@ def evaluate_single_condition(
         rec.ttc_track_id = ttc_tr
 
         # 6. Drivable Area Compliance (DAC)
-        if map_status == "PARTIAL" and strict_mode:
-            rec.valid = False
-            rec.failure_stage = "map_geometry_contract"
-            rec.failure_type = "PartialCorruptedMapError"
-            rec.failure_reason = "Map contains corrupted/partial polygons and cannot be used for strict scoring"
-            rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
-            return rec
-
         if lane_polygons is not None and len(lane_polygons) > 0:
             for p in lane_polygons:
                 if not isinstance(p, np.ndarray) or len(p) < 3 or not np.all(np.isfinite(p)):
@@ -312,82 +474,48 @@ def evaluate_single_condition(
         if gt_row is None:
             raise ValueError("missing_ground_truth: Ground truth record missing for clip")
 
-        raw_gt = gt_row.get("ego_future_xyz") or gt_row.get("expert_future") or gt_row.get("future_waypoints")
-        if raw_gt is None or len(raw_gt) < target_future_poses:
+        raw_gt = None
+        for key in ("ego_future_xyz", "expert_future", "future_waypoints"):
+            if key in gt_row and gt_row.get(key) is not None:
+                raw_gt = gt_row.get(key)
+                break
+        if raw_gt is None:
             rec.valid = False
             rec.failure_stage = "ground_truth_contract"
             rec.failure_type = "InsufficientWaypointsError"
             rec.failure_reason = f"Ground truth missing or has fewer than {target_future_poses} waypoints"
             rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
             return rec
-
-        if isinstance(raw_gt[0], dict):
-            gt_pts = []
-            prev_gt_time = None
-            for idx, p in enumerate(raw_gt[:target_future_poses]):
-                if not isinstance(p, dict):
-                    rec.valid = False
-                    rec.failure_stage = "ground_truth_contract"
-                    rec.failure_type = "InvalidGroundTruthWaypointError"
-                    rec.failure_reason = f"Ground truth waypoint {idx} is not a dict: {p}"
-                    rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
-                    return rec
-
-                gt_t = p.get("timestamp_micros") or p.get("t_us") or p.get("t_s") or p.get("timestamp_s") or p.get("time_s")
-                if gt_t is not None:
-                    try:
-                        gt_tf = float(gt_t)
-                        if prev_gt_time is not None and gt_tf <= prev_gt_time:
-                            rec.valid = False
-                            rec.failure_stage = "ground_truth_contract"
-                            rec.failure_type = "NonMonotonicWaypointTimelineError"
-                            rec.failure_reason = f"Ground truth waypoint {idx} timestamp {gt_tf} <= previous {prev_gt_time}"
-                            rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
-                            return rec
-                        prev_gt_time = gt_tf
-                    except (TypeError, ValueError):
-                        pass
-
-                x_val = p.get("x_m", p.get("x"))
-                y_val = p.get("y_m", p.get("y"))
-                if x_val is None or y_val is None:
-                    rec.valid = False
-                    rec.failure_stage = "ground_truth_contract"
-                    rec.failure_type = "MissingGroundTruthCoordinatesError"
-                    rec.failure_reason = f"Ground truth waypoint {idx} missing 'x' and 'y' coordinates: {p}"
-                    rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
-                    return rec
-
-                try:
-                    xf = float(x_val)
-                    yf = float(y_val)
-                    zf = float(p.get("z_m", p.get("z", 0.0)))
-                except (TypeError, ValueError) as ex:
-                    rec.valid = False
-                    rec.failure_stage = "ground_truth_contract"
-                    rec.failure_type = "NonNumericGroundTruthError"
-                    rec.failure_reason = f"Non-numeric Ground Truth coordinate at {idx}: {ex}"
-                    rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
-                    return rec
-
-                if not (np.isfinite(xf) and np.isfinite(yf) and np.isfinite(zf)):
-                    rec.valid = False
-                    rec.failure_stage = "ground_truth_contract"
-                    rec.failure_type = "NonFiniteGroundTruthError"
-                    rec.failure_reason = f"NaN or Inf found in Ground Truth at {idx}"
-                    rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
-                    return rec
-
-                gt_pts.append([xf, yf, zf])
-            gt_xyz = np.array(gt_pts, dtype=float)
-        else:
-            gt_xyz = np.array(raw_gt[:target_future_poses], dtype=float)
-
-        if not np.all(np.isfinite(gt_xyz)):
+        try:
+            gt_items = raw_gt.tolist() if isinstance(raw_gt, np.ndarray) else list(raw_gt)
+            if len(gt_items) > target_future_poses:
+                first_gt = gt_items[0] if isinstance(gt_items[0], dict) else {}
+                includes_gt_t0 = isinstance(first_gt, dict) and (
+                    (first_gt.get("t_s") is not None and abs(float(first_gt.get("t_s"))) <= 1e-9)
+                    or any(first_gt.get(key) is not None and int(float(first_gt[key])) == int(t0_us) for key in ("timestamp_micros", "t_us", "timestamp_us"))
+                )
+                gt_items = gt_items[: target_future_poses + 1 if includes_gt_t0 else target_future_poses]
+            gt_timeline = normalize_trajectory_timeline(
+                gt_items, t0_us=t0_us, expected_frequency_hz=frequency_hz,
+                expected_horizon_s=horizon_s, role="ground_truth", strict_grid=strict_mode,
+            )
+            pred_future_ts = timestamps_us[1:]
+            pred_future_xy = np.column_stack([x_arr[1:], y_arr[1:]])
+            gt_future_ts = gt_timeline.timestamps_us[1:] if gt_timeline.includes_t0 else gt_timeline.timestamps_us
+            gt_xyz = np.column_stack([
+                gt_timeline.x[1:] if gt_timeline.includes_t0 else gt_timeline.x,
+                gt_timeline.y[1:] if gt_timeline.includes_t0 else gt_timeline.y,
+                (gt_timeline.z[1:] if gt_timeline.includes_t0 else gt_timeline.z) if gt_timeline.z is not None else np.zeros(len(gt_future_ts)),
+            ])
+            if len(pred_future_ts) != len(gt_future_ts) or not np.array_equal(pred_future_ts, gt_future_ts):
+                raise TimelineOriginMismatchError(
+                    "Ground-truth and prediction do not share the same normalized future timestamp grid"
+                )
+        except TimeContractError as gt_err:
             rec.valid = False
             rec.failure_stage = "ground_truth_contract"
-            rec.failure_type = "NonFiniteGroundTruthError"
-            rec.failure_reason = "NaN or Inf found in Ground Truth"
+            rec.failure_type = type(gt_err).__name__
+            rec.failure_reason = str(gt_err)
             rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
             return rec
 
@@ -400,7 +528,7 @@ def evaluate_single_condition(
         rec.endpoint_displacement_error_m = ep_err
 
         # Compute ADE and FDE against Ground Truth
-        pred_coords = np.column_stack([xs, ys])
+        pred_coords = pred_future_xy
         gt_coords = gt_xyz[:, :2]
         disp_errors = np.hypot(pred_coords[:, 0] - gt_coords[:, 0], pred_coords[:, 1] - gt_coords[:, 1])
         rec.ade_m = float(np.mean(disp_errors))

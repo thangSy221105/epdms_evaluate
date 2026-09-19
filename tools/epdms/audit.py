@@ -7,12 +7,13 @@ import json
 import platform
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Optional, Set
 
 from .config import EvaluationConfig
-from .io_jsonl import compute_file_sha256, iter_jsonl
+from .io_jsonl import compute_file_sha256, iter_jsonl, read_jsonl_indexed
 from .map_loader import inspect_clip_map_status, load_lane_polygons_for_clip
 from .score_record import extract_and_validate_trajectory
+from .time_contract import extract_waypoint_time
 
 
 def audit_environment() -> Dict[str, Any]:
@@ -75,6 +76,165 @@ def audit_environment() -> Dict[str, Any]:
     env["official_full_possible"] = bool(env["navsim_available"] and env["nuplan_available"])
 
     return env
+
+
+def _trajectory_for_row(row: Dict[str, Any]) -> Any:
+    if not isinstance(row, dict):
+        return None
+    if row.get("clean_waypoints") is not None:
+        return row.get("clean_waypoints")
+    if row.get("guided_waypoints") is not None:
+        return row.get("guided_waypoints")
+    trajectories = row.get("trajectories")
+    if isinstance(trajectories, dict):
+        return trajectories.get("clean") or trajectories.get("guided")
+    return None
+
+
+def _explicit_time_range(waypoints: Any) -> tuple[Optional[float], Optional[float]]:
+    if not isinstance(waypoints, list) or not waypoints or not all(isinstance(w, dict) for w in waypoints):
+        return None, None
+    values = []
+    for wp in waypoints:
+        try:
+            value = extract_waypoint_time(wp)
+        except Exception:
+            return None, None
+        if value is None:
+            return None, None
+        values.append(float(value))
+    return values[0], values[-1]
+
+
+def audit_time_alignment(config: EvaluationConfig, max_rows: Optional[int] = None) -> Dict[str, Any]:
+    """Audit clock domains without applying an unverified offset."""
+    pred_map = read_jsonl_indexed(config.prediction_jsonl, lambda r: f"{r.get('clip_id')}|{r.get('mode')}|{float(r.get('alpha', 0.0))}") if config.prediction_jsonl.is_file() else {}
+    ctx_map = read_jsonl_indexed(config.context_jsonl, lambda r: str(r.get("clip_id", ""))) if config.context_jsonl.is_file() else {}
+    gt_map = read_jsonl_indexed(config.ground_truth_jsonl, lambda r: str(r.get("clip_id", ""))) if config.ground_truth_jsonl.is_file() else {}
+    rows: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for key, pred in pred_map.items():
+        clip_id = str(pred.get("clip_id", ""))
+        if clip_id in seen:
+            continue
+        seen.add(clip_id)
+        ctx = ctx_map.get(clip_id, {})
+        gt = gt_map.get(clip_id, {})
+        pred_waypoints = _trajectory_for_row(pred)
+        if isinstance(pred_waypoints, list):
+            pred_waypoints = pred_waypoints[:config.future_poses]
+        p0, p1 = _explicit_time_range(pred_waypoints)
+        graw = next((gt.get(k) for k in ("ego_future_xyz", "expert_future", "future_waypoints") if gt.get(k) is not None), None)
+        if isinstance(graw, list):
+            graw = graw[:config.future_poses]
+        g0, g1 = _explicit_time_range(graw)
+        # Numeric GT arrays have no per-pose fields but are still valid under
+        # the explicit fixed-grid policy once clip t0 is present.
+        if g0 is None and isinstance(graw, list) and len(graw) == config.future_poses:
+            g0, g1 = 1.0 / config.frequency_hz, config.horizon_s
+        obstacles = (((ctx.get("semantic_context") or {}).get("obstacle") or {}).get("all_obstacles") or [])
+        obs_ts = []
+        for obs in obstacles:
+            if isinstance(obs, dict):
+                ts = obs.get("timestamp_micros")
+                if ts is None and isinstance(obs.get("key"), dict):
+                    ts = obs["key"].get("timestamp_micros")
+                try:
+                    if ts is not None:
+                        obs_ts.append(int(ts))
+                except (TypeError, ValueError):
+                    pass
+        ego_values = []
+        for container in (ctx, (ctx.get("semantic_context") or {})):
+            if isinstance(container, dict):
+                for key_name in ("egomotion", "ego_motion", "ego_pose"):
+                    candidate = container.get(key_name)
+                    if isinstance(candidate, list):
+                        for item in candidate:
+                            if isinstance(item, dict):
+                                value = item.get("timestamp_micros", item.get("t_us"))
+                                try:
+                                    if value is not None:
+                                        ego_values.append(int(value))
+                                except (TypeError, ValueError):
+                                    pass
+        t0_pred = pred.get("t0_us")
+        t0_gt = gt.get("t0_us")
+        t0_ctx = ctx.get("t0_us")
+        def to_absolute(value: Optional[float], origin: Any) -> Optional[int]:
+            if value is None or origin is None:
+                return None
+            # extract_waypoint_time returns relative seconds for t_s and
+            # absolute seconds for microsecond fields.
+            return int(round(value * 1_000_000)) if value > 1_000_000 else int(round(int(origin) + value * 1_000_000))
+        status = "ALIGNED_DIRECT"
+        reason = ""
+        if t0_pred is None or t0_gt is None or t0_ctx is None:
+            status, reason = "INSUFFICIENT_ALIGNMENT_METADATA", "one or more source t0_us values are missing"
+        elif len({int(t0_pred), int(t0_gt), int(t0_ctx)}) > 1:
+            status, reason = "CONFLICTING_TIME_ORIGIN", "prediction/context/GT t0_us values disagree"
+        elif obs_ts and t0_pred is not None and (min(obs_ts) > int(t0_pred) + int(config.horizon_s * 1_000_000) + 1_000_000 or max(obs_ts) < int(t0_pred) - 1_000_000):
+            status, reason = "CLOCK_DOMAIN_MISMATCH", "obstacle timestamps do not overlap prediction clip clock"
+        if obs_ts and t0_pred is not None and (min(obs_ts) > int(t0_pred) + int(config.horizon_s * 1_000_000) + 1_000_000 or max(obs_ts) < int(t0_pred) - 1_000_000):
+            status, reason = "CLOCK_DOMAIN_MISMATCH", "obstacle timestamps do not overlap prediction clip clock"
+        if p0 is None or g0 is None:
+            status, reason = "INSUFFICIENT_ALIGNMENT_METADATA", "prediction or GT has no explicit timestamp range"
+        rows.append({
+            "clip_id": clip_id, "prediction_t0_us": t0_pred, "gt_t0_us": t0_gt, "context_t0_us": t0_ctx,
+            "prediction_first_time_us": to_absolute(p0, t0_pred),
+            "prediction_last_time_us": to_absolute(p1, t0_pred),
+            "gt_first_time_us": to_absolute(g0, t0_gt),
+            "gt_last_time_us": to_absolute(g1, t0_gt),
+            "obstacle_min_us": min(obs_ts) if obs_ts else None, "obstacle_max_us": max(obs_ts) if obs_ts else None,
+            "egomotion_min_us": min(ego_values) if ego_values else None, "egomotion_max_us": max(ego_values) if ego_values else None,
+            "candidate_pred_to_obstacle_offset_us": (int(t0_pred) - min(obs_ts)) if obs_ts and t0_pred is not None else None,
+            "candidate_pred_to_egomotion_offset_us": (int(t0_pred) - min(ego_values)) if ego_values and t0_pred is not None else None,
+            "time_alignment_status": status, "time_alignment_source": "direct_fields_only" if status == "ALIGNED_DIRECT" else "none",
+            "time_alignment_confidence": 1.0 if status == "ALIGNED_DIRECT" else 0.0, "failure_reason": reason,
+        })
+        if max_rows is not None and len(rows) >= max_rows:
+            break
+    counts: Dict[str, int] = {}
+    for row in rows:
+        counts[row["time_alignment_status"]] = counts.get(row["time_alignment_status"], 0) + 1
+    return {"rows": rows, "status_counts": counts, "clips_checked": len(rows), "ready": bool(rows) and all(r["time_alignment_status"] == "ALIGNED_DIRECT" for r in rows)}
+
+
+def audit_coordinate_alignment(config: EvaluationConfig, max_rows: Optional[int] = None) -> Dict[str, Any]:
+    """Audit frame and reference-point declarations without guessing transforms."""
+    pred_map = read_jsonl_indexed(config.prediction_jsonl, lambda r: f"{r.get('clip_id')}|{r.get('mode')}|{float(r.get('alpha', 0.0))}") if config.prediction_jsonl.is_file() else {}
+    ctx_map = read_jsonl_indexed(config.context_jsonl, lambda r: str(r.get("clip_id", ""))) if config.context_jsonl.is_file() else {}
+    gt_map = read_jsonl_indexed(config.ground_truth_jsonl, lambda r: str(r.get("clip_id", ""))) if config.ground_truth_jsonl.is_file() else {}
+    rows: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for pred in pred_map.values():
+        clip_id = str(pred.get("clip_id", ""))
+        if clip_id in seen:
+            continue
+        seen.add(clip_id)
+        ctx = ctx_map.get(clip_id, {})
+        gt = gt_map.get(clip_id, {})
+        sc = ctx.get("semantic_context") if isinstance(ctx, dict) else {}
+        sc = sc if isinstance(sc, dict) else {}
+        def first(*containers: Any, keys: tuple[str, ...]) -> Optional[str]:
+            for container in containers:
+                if isinstance(container, dict):
+                    for key in keys:
+                        value = container.get(key)
+                        if value is not None:
+                            return str(value)
+            return None
+        pframe = first(pred, keys=("coordinate_frame", "frame", "prediction_frame"))
+        gframe = first(gt, keys=("coordinate_frame", "frame", "gt_frame"))
+        oframe = first(ctx, sc, keys=("obstacle_frame", "coordinate_frame", "frame"))
+        mframe = first(ctx, sc, keys=("map_frame",))
+        panchor = first(pred, keys=("reference_point", "anchor", "prediction_anchor"))
+        ganchor = first(gt, keys=("reference_point", "anchor", "gt_anchor"))
+        verified = bool(pframe and gframe and oframe and mframe and panchor and ganchor and pframe == gframe == oframe == mframe and panchor == ganchor)
+        rows.append({"clip_id": clip_id, "prediction_frame": pframe, "gt_frame": gframe, "obstacle_frame": oframe, "map_frame": mframe, "prediction_anchor": panchor, "gt_anchor": ganchor, "transform_required": False if verified else None, "transform_source": "declared_metadata" if verified else None, "coordinate_alignment_verified": verified, "failure_reason": "" if verified else "COORDINATE_CONTRACT_UNRESOLVED"})
+        if max_rows is not None and len(rows) >= max_rows:
+            break
+    return {"rows": rows, "clips_checked": len(rows), "ready": bool(rows) and all(row["coordinate_alignment_verified"] for row in rows)}
 
 
 def audit_data_contracts(config: EvaluationConfig) -> Dict[str, Any]:
@@ -337,6 +497,24 @@ def audit_data_contracts(config: EvaluationConfig) -> Dict[str, Any]:
                     map_stats["sample_missing_map"].append(f"{cid} ({st})")
     report["map_stats"] = map_stats
 
+    # Round-5 readiness blockers. These diagnostics are observational only;
+    # no clock offset or coordinate transform is applied here.
+    report["time_alignment"] = audit_time_alignment(config)
+    report["coordinate_alignment"] = audit_coordinate_alignment(config)
+    observation_ready = True
+    if ctx_path.is_file():
+        for row in iter_jsonl(ctx_path):
+            sc = row.get("semantic_context") if isinstance(row, dict) else None
+            obstacle = sc.get("obstacle") if isinstance(sc, dict) else None
+            if not isinstance(obstacle, dict) or "all_obstacles" not in obstacle:
+                observation_ready = False
+                break
+            if obstacle.get("all_obstacles") == [] and obstacle.get("confirmed_empty_scene") is not True and row.get("confirmed_empty_scene") is not True:
+                observation_ready = False
+                break
+    else:
+        observation_ready = False
+
     # Check intersection & missing
     all_clips = pred_clips.union(ctx_clips).union(gt_clips)
     for cid in sorted(all_clips):
@@ -353,7 +531,7 @@ def audit_data_contracts(config: EvaluationConfig) -> Dict[str, Any]:
     # Profile readiness
     env = audit_environment()
     has_inputs = bool(pred_path.is_file() and ctx_path.is_file() and gt_path.is_file())
-    proxy_ready = (
+    input_grid_ready = (
         env["proxy_possible"]
         and has_inputs
         and len(report["missing_records"]) == 0
@@ -361,15 +539,30 @@ def audit_data_contracts(config: EvaluationConfig) -> Dict[str, Any]:
         and report["grid_stats"]["missing_grid_count"] == 0
         and len(trajectory_validation_issues) == 0
         and parquet_loader_status.startswith("OK")
-        and map_stats["clips_missing_map"] == 0
-        and map_stats["map_polygon_issues"] == 0
-        and map_stats["clips_with_map"] > 0
     )
+    map_ready = bool(map_stats["clips_checked"] > 0 and map_stats["clips_missing_map"] == 0 and map_stats["map_polygon_issues"] == 0)
+    gt_timeline_ready = bool(total_gt_records == len(pred_clips) and all(
+        item.get("clip_id") in gt_clips for item in report["missing_records"] if "ground_truth" in item.get("missing", [])
+    ))
+    timeline_ready = bool(len(trajectory_validation_issues) == 0 and report["time_alignment"]["ready"])
+    coordinate_ready = bool(report["coordinate_alignment"]["ready"])
+    proxy_ready = bool(input_grid_ready and map_ready and timeline_ready and coordinate_ready and observation_ready)
 
     report["readiness"] = {
         "nurec_safety_proxy_v1": "READY" if proxy_ready else "NOT READY",
         "navsim_v2_stage1": "READY" if (env["official_stage1_possible"] and has_inputs) else "NOT READY",
         "navsim_v2_full": "READY" if (env["official_full_possible"] and has_inputs) else "NOT READY",
+        "INPUT_GRID_READY": input_grid_ready,
+        "MAP_READY": map_ready,
+        "PREDICTION_TIMELINE_READY": bool(len(trajectory_validation_issues) == 0),
+        "GT_TIMELINE_READY": gt_timeline_ready,
+        "TIME_ALIGNMENT_READY": timeline_ready,
+        "COORDINATE_ALIGNMENT_READY": coordinate_ready,
+        "OBSERVATION_COVERAGE_CONTRACT_READY": observation_ready,
+        "blockers": [
+            name for name, ok in (("INPUT_GRID_READY", input_grid_ready), ("MAP_READY", map_ready), ("PREDICTION_TIMELINE_READY", len(trajectory_validation_issues) == 0), ("GT_TIMELINE_READY", gt_timeline_ready), ("TIME_ALIGNMENT_READY", timeline_ready), ("COORDINATE_ALIGNMENT_READY", coordinate_ready), ("OBSERVATION_COVERAGE_CONTRACT_READY", observation_ready)) if not ok
+        ],
+        "dataset_status": "DATASET_READY" if proxy_ready else "DATASET_NOT_READY",
     }
 
     return report
@@ -464,6 +657,41 @@ def run_and_save_audit(config: EvaluationConfig, output_dir: Path) -> Dict[str, 
     with map_md_file.open("w", encoding="utf-8") as f:
         f.write("\n".join(map_lines) + "\n")
 
+    # Round-5 alignment reports are intentionally separate from the map
+    # inventory so a reviewer can distinguish code readiness from dataset
+    # readiness.
+    time_report = contracts.get("time_alignment", {"rows": []})
+    time_csv_file = output_dir / "time_alignment_report.csv"
+    time_fields = [
+        "clip_id", "prediction_t0_us", "gt_t0_us", "context_t0_us",
+        "prediction_first_time_us", "prediction_last_time_us", "gt_first_time_us", "gt_last_time_us",
+        "obstacle_min_us", "obstacle_max_us", "egomotion_min_us", "egomotion_max_us",
+        "candidate_pred_to_obstacle_offset_us", "candidate_pred_to_egomotion_offset_us",
+        "time_alignment_status", "time_alignment_source", "time_alignment_confidence", "failure_reason",
+    ]
+    with time_csv_file.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=time_fields)
+        writer.writeheader()
+        for row in time_report.get("rows", []):
+            writer.writerow({key: row.get(key) for key in time_fields})
+    time_md_file = output_dir / "time_alignment_report.md"
+    time_lines = ["# Time Alignment Report", "", f"Status counts: `{time_report.get('status_counts', {})}`", "", "| Clip | Status | Reason |", "|---|---|---|"]
+    time_lines.extend(f"| `{row.get('clip_id')}` | `{row.get('time_alignment_status')}` | {row.get('failure_reason', '')} |" for row in time_report.get("rows", []))
+    time_md_file.write_text("\n".join(time_lines) + "\n", encoding="utf-8")
+
+    coord_report = contracts.get("coordinate_alignment", {"rows": []})
+    coord_fields = ["clip_id", "prediction_frame", "gt_frame", "obstacle_frame", "map_frame", "prediction_anchor", "gt_anchor", "transform_required", "transform_source", "coordinate_alignment_verified", "failure_reason"]
+    coord_csv_file = output_dir / "coordinate_alignment_report.csv"
+    with coord_csv_file.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=coord_fields)
+        writer.writeheader()
+        for row in coord_report.get("rows", []):
+            writer.writerow({key: row.get(key) for key in coord_fields})
+    coord_md_file = output_dir / "coordinate_alignment_report.md"
+    coord_lines = ["# Coordinate Alignment Report", "", f"Ready: `{coord_report.get('ready', False)}`", "", "| Clip | Verified | Frame/anchor reason |", "|---|---|---|"]
+    coord_lines.extend(f"| `{row.get('clip_id')}` | `{row.get('coordinate_alignment_verified')}` | {row.get('failure_reason', '')} |" for row in coord_report.get("rows", []))
+    coord_md_file.write_text("\n".join(coord_lines) + "\n", encoding="utf-8")
+
     # Save Markdown report
     md_file = output_dir / "data_contract_report.md"
     lines = [
@@ -527,5 +755,9 @@ def run_and_save_audit(config: EvaluationConfig, output_dir: Path) -> Dict[str, 
             str(dup_file),
             str(map_csv_file),
             str(map_md_file),
+            str(time_csv_file),
+            str(time_md_file),
+            str(coord_csv_file),
+            str(coord_md_file),
         ],
     }

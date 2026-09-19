@@ -54,6 +54,12 @@ def main() -> None:
     print(f"  Profile 'navsim_v2_full':       {readiness['navsim_v2_full']}")
     print(f"  Profile 'navsim_v2_stage1':     {readiness['navsim_v2_stage1']}")
     print(f"  Profile 'nurec_safety_proxy_v1': {readiness['nurec_safety_proxy_v1']}")
+    print(f"  Dataset status:                  {readiness.get('dataset_status', 'DATASET_NOT_READY')}")
+    print(f"  Time alignment:                 {'READY' if readiness.get('TIME_ALIGNMENT_READY') else 'BLOCKED'}")
+    print(f"  Coordinate alignment:           {'READY' if readiness.get('COORDINATE_ALIGNMENT_READY') else 'BLOCKED'}")
+    print(f"  Observation coverage contract:  {'READY' if readiness.get('OBSERVATION_COVERAGE_CONTRACT_READY') else 'BLOCKED'}")
+    if readiness.get("blockers"):
+        print(f"  Blockers:                       {', '.join(readiness['blockers'])}")
     print("=" * 60)
     print(f"[+] Files generated:")
     for f in result["files_written"]:
