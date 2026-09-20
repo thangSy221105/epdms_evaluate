@@ -93,7 +93,7 @@ def inspect_clip_map_status(filtered_dir: Path, clip_id: str) -> Dict[str, Any]:
     # 1. Inspect lane.parquet
     if lane_pq.is_file():
         try:
-            df = pd.read_parquet(lane_pq)
+            df = pd.read_parquet(lane_pq, columns=["key", "lane"])
             if "lane" not in df.columns:
                 schema_errors.append(f"lane.parquet missing 'lane' column (columns={list(df.columns)})")
             else:
@@ -148,7 +148,7 @@ def inspect_clip_map_status(filtered_dir: Path, clip_id: str) -> Dict[str, Any]:
     # 2. Inspect intersection_area.parquet
     if ia_pq.is_file():
         try:
-            df = pd.read_parquet(ia_pq)
+            df = pd.read_parquet(ia_pq, columns=["intersection_area"])
             if "intersection_area" not in df.columns:
                 schema_errors.append(f"intersection_area.parquet missing 'intersection_area' column (columns={list(df.columns)})")
             else:

@@ -210,10 +210,34 @@ def points_in_any_polygon(points: np.ndarray, polygons: list[np.ndarray], tol: f
     if not np.all(np.isfinite(points)):
         raise ValueError("Non-finite point coordinates in points_in_any_polygon")
 
+    # Reject points outside each polygon's axis-aligned bounds before the
+    # exact ray-casting test.  This is an exact-preserving acceleration: a
+    # point can only be inside a polygon if it is inside its bounding box.
+    prepared = []
+    for poly in polygons:
+        polygon = np.asarray(poly)
+        if polygon.ndim != 2 or polygon.shape[1] < 2 or len(polygon) == 0:
+            prepared.append((polygon, None))
+            continue
+        prepared.append((
+            polygon,
+            (
+                float(np.min(polygon[:, 0])),
+                float(np.max(polygon[:, 0])),
+                float(np.min(polygon[:, 1])),
+                float(np.max(polygon[:, 1])),
+            ),
+        ))
+
     inside_mask = np.zeros(n_pts, dtype=bool)
     for pt_idx in range(n_pts):
         px, py = points[pt_idx, 0], points[pt_idx, 1]
-        for poly in polygons:
+        for poly, bounds in prepared:
+            if bounds is None:
+                continue
+            min_x, max_x, min_y, max_y = bounds
+            if px < min_x or px > max_x or py < min_y or py > max_y:
+                continue
             if point_in_polygon_ray_casting(px, py, poly, tol=tol):
                 inside_mask[pt_idx] = True
                 break
