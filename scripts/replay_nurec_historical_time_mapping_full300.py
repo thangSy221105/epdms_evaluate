@@ -95,21 +95,25 @@ def wrap(angle: float) -> float:
     return math.atan2(math.sin(angle), math.cos(angle))
 
 
-def discover_pai_egomotion(pai_root: Path, clip_ids: set[str]) -> dict[str, dict[str, str]]:
+def discover_pai_egomotion(pai_roots: Path | Iterable[Path], clip_ids: set[str]) -> dict[str, dict[str, str]]:
     """Index zip members by exact UUID; no filename substring joins."""
+    roots = [pai_roots] if isinstance(pai_roots, Path) else list(pai_roots)
     result: dict[str, dict[str, str]] = {}
-    feature_root = pai_root / "labels" / "egomotion.offline"
-    archives = sorted(feature_root.glob("*.zip")) if feature_root.is_dir() else []
-    for archive in archives:
-        with zipfile.ZipFile(archive) as handle:
-            for member in handle.namelist():
-                match = UUID_MEMBER.search(Path(member).name)
-                if match and match.group(1) in clip_ids and match.group(1) not in result:
-                    result[match.group(1)] = {"archive": str(archive), "member": member}
-    for clip_id in clip_ids:
-        direct = sorted((pai_root / clip_id).glob("*egomotion*.parquet"))
-        if direct and clip_id not in result:
-            result[clip_id] = {"path": str(direct[0])}
+    for pai_root in roots:
+        feature_root = pai_root / "labels" / "egomotion.offline"
+        archives = sorted(feature_root.glob("*.zip")) if feature_root.is_dir() else []
+        for archive in archives:
+            with zipfile.ZipFile(archive) as handle:
+                for member in handle.namelist():
+                    match = UUID_MEMBER.search(Path(member).name)
+                    if match and match.group(1) in clip_ids and match.group(1) not in result:
+                        result[match.group(1)] = {"archive": str(archive), "member": member}
+        for clip_id in clip_ids:
+            direct = sorted((pai_root / "physicalai_offline" / clip_id).glob("*egomotion*.parquet"))
+            direct += sorted((pai_root / "physicalai" / clip_id).glob("*egomotion*.parquet"))
+            direct += sorted((pai_root / clip_id).glob("*egomotion*.parquet"))
+            if direct and clip_id not in result:
+                result[clip_id] = {"path": str(direct[0])}
     return result
 
 
@@ -271,7 +275,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     # 300-ID experiment manifest.  Index both sets, but keep batch counts
     # restricted to the current manifest.
     all_input_ids = clip_ids | set(HISTORICAL_IDS)
-    pai_sources = discover_pai_egomotion(Path(args.pai_root), all_input_ids)
+    pai_sources = discover_pai_egomotion([Path(value) for value in args.pai_root], all_input_ids)
     rig_roots = [Path(value) for value in args.nurec_root]
     rig_paths = discover_rig_trajectories(rig_roots, all_input_ids)
     historical_root = Path(args.historical_nurec_root)
@@ -358,11 +362,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             }
         for row in verified:
             # The accepted row is immutable.  Preserve it exactly at the JSON
-            # object level; only new current-manifest rows use the replay schema.
+            # object level when it already contains the complete accepted
+            # provenance contract; otherwise add only the required source
+            # provenance field without changing its time values.
             if row["clip_id"] in existing_by_id and existing_by_id[row["clip_id"]].get("verified") is True:
-                canonical.append(existing_by_id[row["clip_id"]])
+                preserved = dict(existing_by_id[row["clip_id"]])
+                if not preserved.get("source"):
+                    preserved["source"] = (
+                        "REPRODUCED_HISTORICAL_5CLIP_PIPELINE;"
+                        f"pai={json.dumps(row['pai_source'], sort_keys=True)};"
+                        f"nurec={row['nurec_source']}"
+                    )
+                canonical.append(preserved)
             else:
-                canonical.append({"clip_id": row["clip_id"], "physicalai_t0_us": T0_US, "nurec_t0_us": row["nurec_t0_us"], "offset_us": row["offset_us"], "scale": 1.0, "mapping_type": "PER_CLIP_REBASE", "mapping_status": "VERIFIED_HISTORICAL_METHOD", "verified": True, "verification_method": "REPRODUCED_HISTORICAL_5CLIP_PIPELINE", "pair_count": 2, "offset_residual_max_us": 0, "pai_source": row["pai_source"], "nurec_source": row["nurec_source"], "per_clip_offset_rederived": False})
+                canonical.append({"clip_id": row["clip_id"], "physicalai_t0_us": T0_US, "nurec_t0_us": row["nurec_t0_us"], "offset_us": row["offset_us"], "scale": 1.0, "mapping_type": "PER_CLIP_REBASE", "mapping_status": "VERIFIED_HISTORICAL_METHOD", "verified": True, "verification_method": "REPRODUCED_HISTORICAL_5CLIP_PIPELINE", "pair_count": 2, "offset_residual_max_us": 0, "pai_source": row["pai_source"], "nurec_source": row["nurec_source"], "source": f"REPRODUCED_HISTORICAL_5CLIP_PIPELINE;pai={json.dumps(row['pai_source'], sort_keys=True)};nurec={row['nurec_source']}", "per_clip_offset_rederived": False})
     elif pilot:
         # Preserve the accepted row verbatim if the pilot could not be replayed.
         existing = repo_root / "configs" / "nurec_time_contract_full300.jsonl"
@@ -459,7 +472,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         mapping_lines = []
         for row in sorted(canonical, key=lambda item: item["clip_id"]):
             accepted_raw = existing_raw_by_id.get(row["clip_id"])
-            mapping_lines.append(accepted_raw + "\n" if accepted_raw is not None else json.dumps(row, sort_keys=True) + "\n")
+            if accepted_raw is not None:
+                try:
+                    accepted_obj = json.loads(accepted_raw)
+                except json.JSONDecodeError:
+                    accepted_obj = {}
+            else:
+                accepted_obj = {}
+            # Preserve an already accepted raw row byte-for-byte, but do not
+            # preserve legacy rows that lack the provenance field required by
+            # the full-300 readiness audit.
+            if accepted_raw is not None and accepted_obj.get("source"):
+                mapping_lines.append(accepted_raw + "\n")
+            else:
+                mapping_lines.append(json.dumps(row, sort_keys=True) + "\n")
         mapping_path.write_text("".join(mapping_lines), encoding="utf-8")
     return summary
 
@@ -468,7 +494,7 @@ def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
     p.add_argument("--experiment-manifest", type=Path, default=Path("configs/nurec_cf_ttc_full300_manifest.jsonl"))
-    p.add_argument("--pai-root", type=Path, default=Path(r"D:\300_clip_nurec\hf_probe\pai_obstacle_offline_v1"))
+    p.add_argument("--pai-root", type=Path, action="append", default=[Path(r"D:\300_clip_nurec\hf_probe\pai_obstacle_offline_v1")])
     p.add_argument("--nurec-root", type=Path, action="append", default=[Path(r"D:\300_clip_nurec\hf_probe\pai_nurec_multiclip_v1"), Path(r"D:\300_clip_nurec\hf_probe\coordinate_alignment_v1\nurec_full_metadata"), Path(r"D:\300_clip_nurec\01_context\reasoning_filtered\nurec_reasoning_filtered_300_v2"), Path(r"D:\300_clip_nurec\05_data_contract")])
     p.add_argument("--historical-nurec-root", type=Path, default=Path(r"D:\300_clip_nurec\hf_probe\pai_nurec_multiclip_v1"))
     p.add_argument("--historical-match", type=Path, default=HISTORICAL_MATCH)
