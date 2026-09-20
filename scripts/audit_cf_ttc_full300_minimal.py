@@ -78,6 +78,46 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def load_confirmed_empty_sidecar(path: Path | None) -> tuple[dict[str, set[int]], dict[tuple[str, int], str], list[str]]:
+    """Load only explicitly verified exact empty-frame attestations.
+
+    Invalid rows are reported and never promoted into the classifier.  The
+    sidecar is deliberately separate from the object source: a timestamp is
+    usable here only when an authoritative producer recorded a zero-object
+    label set for that exact timestamp.
+    """
+    by_clip: dict[str, set[int]] = {}
+    sources: dict[tuple[str, int], str] = {}
+    errors: list[str] = []
+    if path is None:
+        return by_clip, sources, errors
+    try:
+        rows = _read_jsonl(path)
+    except Exception as exc:
+        return by_clip, sources, [f"SIDECAR_READ_ERROR:{type(exc).__name__}:{exc}"]
+    for index, row in enumerate(rows, 1):
+        clip_id = str(row.get("clip_id") or "")
+        timestamps = row.get("confirmed_empty_timestamps_us")
+        source = str(row.get("source") or "")
+        valid = (
+            bool(clip_id)
+            and row.get("verified") is True
+            and row.get("attestation_type") == "AUTHORITATIVE_FRAME_LEVEL_ZERO_OBJECT_LABEL_SET"
+            and bool(source)
+            and isinstance(timestamps, list)
+        )
+        if not valid:
+            errors.append(f"line_{index}:INVALID_CONFIRMED_EMPTY_ATTESTATION")
+            continue
+        for value in timestamps:
+            if isinstance(value, bool) or not isinstance(value, int):
+                errors.append(f"line_{index}:NON_INTEGER_TIMESTAMP")
+                continue
+            by_clip.setdefault(clip_id, set()).add(int(value))
+            sources[(clip_id, int(value))] = source
+    return by_clip, sources, errors
+
+
 def _clip_index(rows: list[dict[str, Any]], source_name: str) -> tuple[dict[str, dict[str, Any]], list[str]]:
     """Index experiment records without treating repeated prediction conditions as duplicates."""
     index: dict[str, dict[str, Any]] = {}
@@ -219,22 +259,37 @@ def build_full300_manifest(
     return manifest, input_rows, mapping_rows
 
 
-def _query_rows(clip_id: str, query_type: str, queries: list[int], rows: list[dict[str, Any]], tolerance_us: int) -> list[dict[str, Any]]:
-    classified = classify_scorer_queries(queries, rows, tolerance_us=tolerance_us)
+def _query_rows(
+    clip_id: str,
+    query_type: str,
+    queries: list[int],
+    rows: list[dict[str, Any]],
+    tolerance_us: int,
+    confirmed_empty_by_clip: dict[str, set[int]] | None = None,
+    confirmed_empty_sources: dict[tuple[str, int], str] | None = None,
+) -> list[dict[str, Any]]:
+    empty_timestamps = (confirmed_empty_by_clip or {}).get(clip_id, set())
+    classified = classify_scorer_queries(queries, rows, tolerance_us=tolerance_us, empty_timestamps=empty_timestamps)
     output: list[dict[str, Any]] = []
     for index, row in enumerate(classified):
+        query_timestamp = int(row["query_timestamp_us"])
+        conflict = query_timestamp in empty_timestamps and row["observation_state"] == "OBJECTS_PRESENT"
+        attestation_source = row["attestation_source"]
+        if row["observation_state"] == "CONFIRMED_EMPTY" and confirmed_empty_sources:
+            attestation_source = confirmed_empty_sources.get((clip_id, query_timestamp), attestation_source)
         output.append({
             "clip_id": clip_id,
             "metric": query_type,
             "query_index": index,
-            "query_timestamp_us": row["query_timestamp_us"],
+            "query_timestamp_us": query_timestamp,
             "nearest_object_timestamp_us": row["nearest_obstacle_timestamp_us"],
             "delta_us": row["obstacle_delta_us"],
             "object_count": row["object_count"],
             "observation_state": row["observation_state"],
-            "confirmed_empty": False,
-            "empty_semantics_status": "UNRESOLVED",
-            "attestation_source": row["attestation_source"],
+            "confirmed_empty": row["observation_state"] == "CONFIRMED_EMPTY",
+            "empty_evidence_conflict": conflict,
+            "empty_semantics_status": "VERIFIED_EXACT_ATTESTATION" if row["observation_state"] == "CONFIRMED_EMPTY" else ("CONFLICT" if conflict else "UNRESOLVED"),
+            "attestation_source": attestation_source,
             "tolerance_us": tolerance_us,
             "source_file": "sequence_tracks.json",
         })
@@ -294,6 +349,9 @@ def run_audit(
     output_root: Path,
     manifest_output: Path | None = None,
     expected_clip_count: int = EXPECTED_CLIP_COUNT,
+    confirmed_empty_by_clip: dict[str, set[int]] | None = None,
+    confirmed_empty_sources: dict[tuple[str, int], str] | None = None,
+    confirmed_empty_sidecar_errors: list[str] | None = None,
 ) -> dict[str, Any]:
     output_root.mkdir(parents=True, exist_ok=True)
     if manifest_output is not None:
@@ -384,19 +442,19 @@ def run_audit(
 
         normalized = normalize_sequence_tracks(clip_id, sequence_rows)
         cf_queries, ttc_queries, grid = build_scorer_query_grid(int(item["nurec_t0_us"]), include_t0=True)
-        current_cf = _query_rows(clip_id, "CF", cf_queries, normalized, CF_TOLERANCE_US)
-        current_ttc = _query_rows(clip_id, "TTC", ttc_queries, normalized, TTC_TOLERANCE_US)
+        current_cf = _query_rows(clip_id, "CF", cf_queries, normalized, CF_TOLERANCE_US, confirmed_empty_by_clip, confirmed_empty_sources)
+        current_ttc = _query_rows(clip_id, "TTC", ttc_queries, normalized, TTC_TOLERANCE_US, confirmed_empty_by_clip, confirmed_empty_sources)
         cf_rows.extend(current_cf)
         ttc_rows.extend(current_ttc)
         evaluated += 1
         base["evaluated"] = True
         base["cf_required_query_count"] = len(current_cf)
         base["cf_object_present_count"] = sum(row["observation_state"] == "OBJECTS_PRESENT" for row in current_cf)
-        base["cf_confirmed_empty_count"] = 0
+        base["cf_confirmed_empty_count"] = sum(row["observation_state"] == "CONFIRMED_EMPTY" for row in current_cf)
         base["cf_missing_count"] = sum(row["observation_state"] == "MISSING" for row in current_cf)
         base["ttc_required_query_count"] = len(current_ttc)
         base["ttc_object_present_count"] = sum(row["observation_state"] == "OBJECTS_PRESENT" for row in current_ttc)
-        base["ttc_confirmed_empty_count"] = 0
+        base["ttc_confirmed_empty_count"] = sum(row["observation_state"] == "CONFIRMED_EMPTY" for row in current_ttc)
         base["ttc_missing_count"] = sum(row["observation_state"] == "MISSING" for row in current_ttc)
         base["cf_ready"] = base["cf_missing_count"] == 0
         base["ttc_ready"] = base["ttc_missing_count"] == 0
@@ -448,6 +506,8 @@ def run_audit(
     _write_csv(output_root / "full300_ttc_queries.csv", ttc_rows)
     _write_csv(output_root / "cf_ttc_missing_query_triage.csv", triage)
     _write_csv(output_root / "minimal_fallback_data_plan.csv", fallback_rows)
+    conflicts = [row for row in cf_rows + ttc_rows if row.get("empty_evidence_conflict")]
+    _write_csv(output_root / "observation_evidence_conflicts.csv", conflicts)
 
     cf_summary_payload = {"expected_query_count": expected_clip_count * EXPECTED_CF_QUERIES_PER_CLIP, "evaluated_clip_count": evaluated, "full300_ready": cf_ready_full, **cf_summary}
     ttc_summary_payload = {"expected_query_count": expected_clip_count * EXPECTED_TTC_QUERIES_PER_CLIP, "evaluated_clip_count": evaluated, "full300_ready": ttc_ready_full, **ttc_summary}
@@ -463,7 +523,10 @@ def run_audit(
         blockers.append("FULL300_EVALUATION_INCOMPLETE")
     if cf_summary["TOTAL_CF_MISSING_COUNT"] or ttc_summary["TOTAL_TTC_MISSING_COUNT"]:
         blockers.append("OBSERVATION_QUERY_MISSING")
-    blockers.append("LABEL_SET_EMPTY_SEMANTICS_UNRESOLVED")
+    if conflicts:
+        blockers.append("OBJECT_EMPTY_EVIDENCE_CONFLICT")
+    if not confirmed_empty_by_clip:
+        blockers.append("LABEL_SET_EMPTY_SEMANTICS_UNRESOLVED")
     summary = {
         "BRANCH_SCOPE": "feat/cf-ttc-full300-minimal-readiness",
         "EXPECTED_CLIP_COUNT": expected_clip_count,
@@ -483,7 +546,7 @@ def run_audit(
         "TTC_DATA_READY_FULL_300": ttc_ready_full,
         "CLIPS_WITH_CF_MISSING": cf_missing_clips,
         "CLIPS_WITH_TTC_MISSING": ttc_missing_clips,
-        "LABEL_SET_EMPTY_SEMANTICS_STATUS": "UNRESOLVED",
+        "LABEL_SET_EMPTY_SEMANTICS_STATUS": "VERIFIED_FOR_EXACT_SIDECAR" if confirmed_empty_by_clip else "UNRESOLVED",
         "PHYSICAL_WORLD_OBSTACLE_COMPLETENESS": "NOT_CLAIMED",
         "FULL_CLIP_DOWNLOAD_REQUIRED_COUNT": sum(bool(row["full_clip_download_required"]) for row in fallback_rows),
         "MINIMAL_FALLBACK_CLIP_COUNT": len(fallback_rows),
@@ -495,6 +558,9 @@ def run_audit(
         "OBSTACLE_TRANSFORM_STATUS": "VERIFIED",
         "NORMALIZED_OBSTACLE_STATUS": "VERIFIED_WITH_RETAINED_LOCALIZED_ANOMALIES",
         "EMPTY_FRAMES_INFERRED_FROM_ABSENCE": False,
+        "CONFIRMED_EMPTY_SIDECAR_TIMESTAMP_COUNT": sum(len(values) for values in (confirmed_empty_by_clip or {}).values()),
+        "CONFIRMED_EMPTY_SIDECAR_ERRORS": list(confirmed_empty_sidecar_errors or []),
+        "OBJECT_EMPTY_EVIDENCE_CONFLICT_COUNT": len(conflicts),
         "REMAINING_BLOCKERS": blockers,
         "RECOMMENDED_NEXT_STEP": "obtain only the minimal affected-clip inputs listed in minimal_fallback_data_plan.csv, then rerun this audit" if blockers[:-1] else "freeze full-300 CF/TTC obstacle readiness and move to scorer coordinate integration / DAC",
         "no_full_clip_download_performed": True,
@@ -525,6 +591,7 @@ def main() -> None:
     parser.add_argument("--manifest-output", default="configs/nurec_cf_ttc_full300_manifest.jsonl")
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--pilot-regression-summary", default=None, help="Optional existing 5-clip regression summary to record without recomputing or changing full-300 counts")
+    parser.add_argument("--confirmed-empty-jsonl", default=None, help="Optional exact, verified frame-level empty-label sidecar")
     parser.add_argument("--expected-clip-count", type=int, default=EXPECTED_CLIP_COUNT)
     args = parser.parse_args()
 
@@ -535,7 +602,18 @@ def main() -> None:
         print("INPUT_INDEX_ERRORS=" + json.dumps(index_errors, ensure_ascii=False))
     if mapping_errors:
         print("TIME_MAPPING_INPUT_ERRORS=" + json.dumps(mapping_errors, ensure_ascii=False))
-    summary = run_audit(manifest, Path(args.output_root), Path(args.manifest_output), args.expected_clip_count)
+    confirmed_empty, confirmed_empty_sources, sidecar_errors = load_confirmed_empty_sidecar(Path(args.confirmed_empty_jsonl) if args.confirmed_empty_jsonl else None)
+    if sidecar_errors:
+        print("CONFIRMED_EMPTY_SIDECAR_ERRORS=" + json.dumps(sidecar_errors, ensure_ascii=False))
+    summary = run_audit(
+        manifest,
+        Path(args.output_root),
+        Path(args.manifest_output),
+        args.expected_clip_count,
+        confirmed_empty,
+        confirmed_empty_sources,
+        sidecar_errors,
+    )
     if args.pilot_regression_summary:
         pilot = json.loads(Path(args.pilot_regression_summary).read_text(encoding="utf-8"))
         summary.update({
