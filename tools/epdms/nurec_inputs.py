@@ -68,7 +68,13 @@ def load_observation_readiness(path: Path) -> Dict[str, ObservationReadiness]:
 
 
 def load_time_mapping(path: Path) -> Dict[str, Dict[str, Any]]:
-    return {str(row["clip_id"]): row for row in load_jsonl(path)}
+    result: Dict[str, Dict[str, Any]] = {}
+    for row in load_jsonl(path):
+        normalized = dict(row)
+        if "verified" not in normalized and "time_mapping_verified" in normalized:
+            normalized["verified"] = bool(normalized["time_mapping_verified"])
+        result[str(normalized["clip_id"])] = normalized
+    return result
 
 
 def load_dac_readiness(path: Path) -> Dict[str, Dict[str, Any]]:
@@ -157,7 +163,7 @@ def decorate_inputs(
             "source_clock": "NUREC_GLOBAL",
             "target_clock": "PAI_CLIP_RELATIVE",
             "offset_us": offset_us,
-            "verified": bool(time_record.get("verified", False)),
+            "verified": bool(time_record.get("verified", time_record.get("time_mapping_verified", False))),
             "rederived": False,
         }
     context["observation_readiness"] = {

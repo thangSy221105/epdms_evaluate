@@ -26,6 +26,7 @@ from tools.epdms.condition_identity import parse_condition_identity, record_key_
 from tools.epdms.config import EvaluationConfig
 from tools.epdms.io_jsonl import AtomicJsonlWriter, compute_file_sha256, iter_jsonl, read_jsonl_indexed
 from tools.epdms.map_loader import inspect_clip_map_status, load_lane_polygons_for_clip
+from tools.epdms.map_transform import load_transformed_map_for_clip
 from tools.epdms.nurec_inputs import (
     decorate_inputs,
     load_coordinate_contract,
@@ -93,11 +94,13 @@ def main() -> None:
     parser.add_argument("--retry-invalid", action="store_true", help="Re-evaluate keys found in the previous errors JSONL.")
     parser.add_argument("--score-dir", type=Path, default=None, help="Output directory for scores.")
     parser.add_argument("--max-clips", type=int, default=None, help="Limit number of clips to evaluate.")
+    parser.add_argument("--clip-ids-file", type=Path, default=None, help="Optional newline-delimited clip IDs to evaluate.")
     parser.add_argument("--overwrite-new-run", action="store_true", help="Allow a fresh --no-resume run to replace canonical output in a non-empty score directory.")
     parser.add_argument("--nurec-coordinate-contract", type=Path, default=None, help="Accepted frozen NuRec coordinate contract JSON.")
     parser.add_argument("--nurec-observation-readiness", type=Path, default=None, help="Full-300 observation readiness CSV.")
     parser.add_argument("--nurec-time-mapping", type=Path, default=None, help="Verified per-clip NuRec/PAI time mapping JSONL.")
     parser.add_argument("--nurec-dac-readiness", type=Path, default=None, help="Production DAC readiness CSV; absent means DAC is fail-closed.")
+    parser.add_argument("--nurec-map-transform-contract", type=Path, default=None, help="Verified NuRec map→EGO_AT_T0 transform contract JSON.")
     args = parser.parse_args()
 
     print(f"[*] Loading config from: {args.config}")
@@ -118,6 +121,7 @@ def main() -> None:
             "readiness": load_observation_readiness(args.nurec_observation_readiness),
             "time_mapping": load_time_mapping(args.nurec_time_mapping),
             "dac": load_dac_readiness(args.nurec_dac_readiness) if args.nurec_dac_readiness else {},
+            "map_transform_contract": json.loads(args.nurec_map_transform_contract.read_text(encoding="utf-8")) if args.nurec_map_transform_contract else {},
         }
         print("[*] NuRec frozen input adapter: enabled")
         print(f"[*] NuRec DAC readiness manifest: {'loaded' if args.nurec_dac_readiness else 'absent (fail-closed)'}")
@@ -127,11 +131,18 @@ def main() -> None:
     print(f"[*] Reading predictions from: {config.prediction_jsonl}")
     all_pred_rows = list(iter_jsonl(config.prediction_jsonl))
     all_clip_ids = sorted({str(r.get("clip_id", "")) for r in all_pred_rows})
-    target_clips = all_clip_ids[:args.max_clips] if args.max_clips is not None else all_clip_ids
+    requested_clip_ids = None
+    if args.clip_ids_file is not None:
+        requested_clip_ids = {line.strip() for line in args.clip_ids_file.read_text(encoding="utf-8").splitlines() if line.strip()}
+        target_clips = [cid for cid in all_clip_ids if cid in requested_clip_ids]
+    else:
+        target_clips = all_clip_ids[:args.max_clips] if args.max_clips is not None else all_clip_ids
     all_pred_rows = [r for r in all_pred_rows if str(r.get("clip_id", "")) in set(target_clips)]
     clip_scope = sorted(set(target_clips))
-    if args.max_clips is not None:
+    if args.max_clips is not None and args.clip_ids_file is None:
         print(f"[*] Filtered to first {args.max_clips} clips ({len(all_pred_rows)} conditions)")
+    if args.clip_ids_file is not None:
+        print(f"[*] Filtered to requested clip IDs: {len(target_clips)} clips ({len(all_pred_rows)} conditions)")
 
     # Compute effective fingerprint including sources and map
     source_hashes = {}
@@ -146,6 +157,8 @@ def main() -> None:
         map_sha = compute_map_directory_content_sha256(config.context_filtered_dir)
         if map_sha:
             source_hashes["context_filtered_map"] = map_sha
+    if args.nurec_map_transform_contract is not None and args.nurec_map_transform_contract.is_file():
+        source_hashes["nurec_map_transform_contract"] = compute_file_sha256(args.nurec_map_transform_contract)
 
     current_effective_fingerprint = config.compute_effective_fingerprint(
         source_hashes=source_hashes,
@@ -334,6 +347,7 @@ def main() -> None:
                 rg = rule_group_map.get(record_key)
 
                 dac_ready = False
+                time_record = None
                 if nurec_adapter is not None and ctx_row is not None and gt_row is not None:
                     readiness = nurec_adapter["readiness"].get(clip_id)
                     time_record = nurec_adapter["time_mapping"].get(clip_id)
@@ -346,10 +360,29 @@ def main() -> None:
                         dac_ready = str(dac_row.get("dac_ready", "")).lower() == "true"
 
                 if clip_id not in cached_polygons:
-                    cached_polygons[clip_id] = inspect_clip_map_status(config.context_filtered_dir, clip_id)
+                    if (
+                        nurec_adapter is not None
+                        and nurec_adapter.get("map_transform_contract", {}).get("status") == "VERIFIED"
+                        and time_record is not None
+                    ):
+                        cached_polygons[clip_id] = load_transformed_map_for_clip(
+                            config.context_filtered_dir,
+                            clip_id,
+                            int(time_record["nurec_t0_us"]),
+                            strict=True,
+                        )
+                    else:
+                        cached_polygons[clip_id] = inspect_clip_map_status(config.context_filtered_dir, clip_id)
                 map_res = cached_polygons[clip_id]
-                polygons = map_res.get("lane_polygons", []) + map_res.get("intersection_polygons", [])
+                polygons = (
+                    map_res.get("transformed_lane_polygons", [])
+                    + map_res.get("transformed_intersection_polygons", [])
+                ) if map_res.get("transform_status") == "VERIFIED" else (
+                    map_res.get("lane_polygons", []) + map_res.get("intersection_polygons", [])
+                )
                 clip_map_status = map_res.get("status")
+                if map_res.get("transform_status") == "VERIFIED":
+                    clip_map_status = "OK"
                 if nurec_adapter is not None and not dac_ready:
                     polygons = []
                     clip_map_status = "MAP_TRANSFORM_MISSING" if map_res.get("status") in {"OK", "PARTIAL", "NO_DRIVABLE_POLYGON"} else "MAP_MISSING"
