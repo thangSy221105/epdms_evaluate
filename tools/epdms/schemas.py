@@ -66,6 +66,17 @@ class EvaluationScoreRecord:
     failure_reason: Optional[str] = None
     warning_codes: List[str] = field(default_factory=list)
 
+    # Explicit production-contract statuses. These allow an emitted record
+    # to be auditable even when a metric is unavailable.
+    metric_status: str = "UNSET"
+    cf_status: str = "UNSET"
+    ttc_status: str = "UNSET"
+    dac_status: str = "UNSET"
+    coordinate_status: str = "UNSET"
+    time_mapping_status: str = "UNSET"
+    observation_status: str = "UNSET"
+    overall_score_status: str = "UNSET"
+
     # Core proxy metrics
     collision_free_proxy: Optional[float] = None
     dac_proxy: Optional[float] = None
@@ -157,6 +168,14 @@ class EvaluationScoreRecord:
             "failure_type": self.failure_type,
             "failure_reason": self.failure_reason,
             "warning_codes": self.warning_codes,
+            "metric_status": self.metric_status,
+            "cf_status": self.cf_status,
+            "ttc_status": self.ttc_status,
+            "dac_status": self.dac_status,
+            "coordinate_status": self.coordinate_status,
+            "time_mapping_status": self.time_mapping_status,
+            "observation_status": self.observation_status,
+            "overall_score_status": self.overall_score_status,
             "collision_free_proxy": self.collision_free_proxy,
             "dac_proxy": self.dac_proxy,
             "ttc_proxy": self.ttc_proxy,

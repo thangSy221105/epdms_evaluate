@@ -26,6 +26,13 @@ from tools.epdms.condition_identity import parse_condition_identity, record_key_
 from tools.epdms.config import EvaluationConfig
 from tools.epdms.io_jsonl import AtomicJsonlWriter, compute_file_sha256, iter_jsonl, read_jsonl_indexed
 from tools.epdms.map_loader import inspect_clip_map_status, load_lane_polygons_for_clip
+from tools.epdms.nurec_inputs import (
+    decorate_inputs,
+    load_coordinate_contract,
+    load_dac_readiness,
+    load_observation_readiness,
+    load_time_mapping,
+)
 from tools.epdms.reporting import export_table_to_csv
 from tools.epdms.run_identity import (
     METRIC_IMPLEMENTATION_VERSION,
@@ -87,6 +94,10 @@ def main() -> None:
     parser.add_argument("--score-dir", type=Path, default=None, help="Output directory for scores.")
     parser.add_argument("--max-clips", type=int, default=None, help="Limit number of clips to evaluate.")
     parser.add_argument("--overwrite-new-run", action="store_true", help="Allow a fresh --no-resume run to replace canonical output in a non-empty score directory.")
+    parser.add_argument("--nurec-coordinate-contract", type=Path, default=None, help="Accepted frozen NuRec coordinate contract JSON.")
+    parser.add_argument("--nurec-observation-readiness", type=Path, default=None, help="Full-300 observation readiness CSV.")
+    parser.add_argument("--nurec-time-mapping", type=Path, default=None, help="Verified per-clip NuRec/PAI time mapping JSONL.")
+    parser.add_argument("--nurec-dac-readiness", type=Path, default=None, help="Production DAC readiness CSV; absent means DAC is fail-closed.")
     args = parser.parse_args()
 
     print(f"[*] Loading config from: {args.config}")
@@ -99,6 +110,17 @@ def main() -> None:
     # Enforce profile contract: official navsim profiles must raise NotImplementedError
     if profile in ("navsim_v2_full", "navsim_v2_stage1"):
         raise NotImplementedError("OFFICIAL_PROFILE_NOT_IMPLEMENTED")
+
+    nurec_adapter = None
+    if profile == "nurec_safety_proxy_v1" and all((args.nurec_coordinate_contract, args.nurec_observation_readiness, args.nurec_time_mapping)):
+        nurec_adapter = {
+            "contract": load_coordinate_contract(args.nurec_coordinate_contract),
+            "readiness": load_observation_readiness(args.nurec_observation_readiness),
+            "time_mapping": load_time_mapping(args.nurec_time_mapping),
+            "dac": load_dac_readiness(args.nurec_dac_readiness) if args.nurec_dac_readiness else {},
+        }
+        print("[*] NuRec frozen input adapter: enabled")
+        print(f"[*] NuRec DAC readiness manifest: {'loaded' if args.nurec_dac_readiness else 'absent (fail-closed)'}")
 
     # Resolve the exact clip scope before computing run identity. The scope is
     # the sorted set of clip IDs, not merely the requested count.
@@ -311,11 +333,26 @@ def main() -> None:
                 gt_row = gt_map.get(clip_id)
                 rg = rule_group_map.get(record_key)
 
+                dac_ready = False
+                if nurec_adapter is not None and ctx_row is not None and gt_row is not None:
+                    readiness = nurec_adapter["readiness"].get(clip_id)
+                    time_record = nurec_adapter["time_mapping"].get(clip_id)
+                    if readiness is not None and time_record is not None and time_record.get("verified"):
+                        pred_row, gt_row, ctx_row = decorate_inputs(
+                            pred_row, gt_row, ctx_row,
+                            nurec_adapter["contract"], time_record, readiness,
+                        )
+                        dac_row = nurec_adapter["dac"].get(clip_id, {})
+                        dac_ready = str(dac_row.get("dac_ready", "")).lower() == "true"
+
                 if clip_id not in cached_polygons:
                     cached_polygons[clip_id] = inspect_clip_map_status(config.context_filtered_dir, clip_id)
                 map_res = cached_polygons[clip_id]
                 polygons = map_res.get("lane_polygons", []) + map_res.get("intersection_polygons", [])
                 clip_map_status = map_res.get("status")
+                if nurec_adapter is not None and not dac_ready:
+                    polygons = []
+                    clip_map_status = "MAP_TRANSFORM_MISSING" if map_res.get("status") in {"OK", "PARTIAL", "NO_DRIVABLE_POLYGON"} else "MAP_MISSING"
 
                 # Evaluate condition with full parameter propagation
                 eval_record = evaluate_single_condition(

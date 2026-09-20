@@ -1,0 +1,43 @@
+{
+  "contract_id": "nurec_frozen_coordinate_contract_v1",
+  "status": "VERIFIED_FROZEN_CONTRACT",
+  "common_evaluation_frame": "EGO_AT_T0",
+  "prediction_frame": "EGO_AT_T0",
+  "gt_frame": "EGO_AT_T0",
+  "obstacle_source_frame": "NCORE_LOCAL_WORLD",
+  "map_source_frame": "NCORE_LOCAL_WORLD",
+  "obstacle_transform_status": "VERIFIED",
+  "ego_pose_coordinate_status": "VERIFIED_WITH_NUMERICAL_SUPPORT",
+  "local_ego_frame_status": "VERIFIED_NCORE_LOCAL_WORLD",
+  "world_to_nre_applied_to_ego": false,
+  "time_mapping": {
+    "status": "VERIFIED_REUSED_EXISTING",
+    "source": "configs/nurec_time_contract_full300.jsonl",
+    "per_clip_offset_rederived": false
+  },
+  "geometry": {
+    "block": "CLOSED",
+    "authoritative_obstacle_source": "sequence_tracks.json",
+    "obstacle_frame": "NCORE_LOCAL_WORLD"
+  },
+  "anchor_semantics": {
+    "prediction": "ego_t0_reference",
+    "ground_truth": "ego_t0_reference",
+    "obstacle": "cuboid_center",
+    "map": "drivable_geometry",
+    "alignment_status": "VERIFIED_BY_ACCEPTED_PRIOR_CONTRACT"
+  },
+  "evidence": [
+    "docs/21_nurec_coordinate_alignment.md",
+    "docs/23_nurec_obstacle_normalization.md",
+    "docs/26_nurec_obstacle_normalization_readiness.md",
+    "accepted prior obstacle geometry closure reports"
+  ],
+  "scientific_constraints": {
+    "no_new_transform_search": true,
+    "no_global_fitted_correction": true,
+    "no_new_time_offset": true,
+    "missing_observation_is_not_empty": true,
+    "physical_world_completeness": "NOT_CLAIMED"
+  }
+}

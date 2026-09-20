@@ -190,8 +190,15 @@ def _coordinate_contract(pred_row: Dict[str, Any], context_row: Dict[str, Any], 
     ganchor = first(gt_row, keys=("reference_point", "anchor", "gt_anchor"))
     oanchor = first(context_row, sc, keys=("obstacle_anchor", "reference_point", "anchor"))
     manchor = first(context_row, sc, keys=("map_anchor", "reference_point", "anchor"))
+    adapter_contract = context_row.get("coordinate_contract") if isinstance(context_row, dict) else None
+    adapter_verified = bool(
+        isinstance(adapter_contract, dict)
+        and adapter_contract.get("status") == "VERIFIED_FROZEN_CONTRACT"
+        and context_row.get("coordinate_alignment_verified") is True
+        and adapter_contract.get("world_to_nre_applied_to_ego") is False
+    )
     declared = any(value is not None for value in (pframe, gframe, oframe, mframe, panchor, ganchor, oanchor, manchor))
-    verified = bool(
+    verified = adapter_verified or bool(
         pframe and gframe and oframe and mframe
         and panchor and ganchor and oanchor and manchor
         and pframe == gframe == oframe == mframe
@@ -207,8 +214,9 @@ def _coordinate_contract(pred_row: Dict[str, Any], context_row: Dict[str, Any], 
         "obstacle_anchor": oanchor,
         "map_anchor": manchor,
         "transform_required": False if verified else None,
-        "transform_source": "declared_metadata" if verified else None,
+        "transform_source": "accepted_frozen_contract" if adapter_verified else ("declared_metadata" if verified else None),
         "coordinate_alignment_verified": verified,
+        "coordinate_contract_status": "VERIFIED_FROZEN_CONTRACT" if adapter_verified else ("DECLARED_METADATA" if verified else "UNRESOLVED"),
         "declared": declared,
     }
 
@@ -247,6 +255,14 @@ def evaluate_single_condition(
         observation_policy="strict_full_coverage" if strict_mode else "relaxed",
         timeline_policy="strict_grid" if strict_mode else "relaxed",
         map_status=map_status,
+        metric_status="UNSET",
+        cf_status="NOT_EVALUATED",
+        ttc_status="NOT_EVALUATED",
+        dac_status="NOT_EVALUATED",
+        coordinate_status="UNRESOLVED",
+        time_mapping_status="UNRESOLVED",
+        observation_status="NOT_EVALUATED",
+        overall_score_status="UNSET",
     )
 
     try:
@@ -278,6 +294,11 @@ def evaluate_single_condition(
         rec.clip_id = clip_id
         rec.mode = mode
         rec.alpha = alpha
+        rec.time_mapping_status = (
+            "VERIFIED_REUSED_EXISTING"
+            if isinstance(context_row, dict) and context_row.get("time_mapping_status") == "VERIFIED_REUSED_EXISTING"
+            else "DECLARED_BY_INPUT"
+        )
 
         # Preserve structural diagnostics for legacy records that omit t0.
         # This validation does not crop or reinterpret a long source; the
@@ -411,6 +432,11 @@ def evaluate_single_condition(
         coord_info = _coordinate_contract(pred_row, context_row or {}, gt_row or {}, map_status)
         for key in ("prediction_frame", "gt_frame", "obstacle_frame", "map_frame", "prediction_anchor", "gt_anchor", "obstacle_anchor", "map_anchor", "transform_required", "transform_source", "coordinate_alignment_verified"):
             setattr(rec, key, coord_info.get(key))
+        rec.coordinate_status = (
+            "VERIFIED_FROZEN_CONTRACT"
+            if coord_info.get("coordinate_contract_status") == "VERIFIED_FROZEN_CONTRACT"
+            else ("VERIFIED" if coord_info["coordinate_alignment_verified"] else "UNRESOLVED")
+        )
         # Coordinate alignment is a prerequisite for all geometry-based
         # proxies. Stop here before observation, CF, TTC, or DAC evaluation.
         if strict_mode and not coord_info["coordinate_alignment_verified"]:
@@ -418,6 +444,8 @@ def evaluate_single_condition(
             rec.failure_stage = "coordinate_contract"
             rec.failure_type = "COORDINATE_CONTRACT_UNRESOLVED"
             rec.failure_reason = "Prediction, GT, obstacle and map frame/anchor declarations do not establish a common coordinate contract"
+            rec.metric_status = "COORDINATE_CONTRACT_FAILURE"
+            rec.overall_score_status = "COORDINATE_CONTRACT_FAILURE"
             rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
             return rec
         # 5. Context validation (Obstacles)
@@ -459,6 +487,10 @@ def evaluate_single_condition(
             rec.failure_stage = "obstacle_observation_contract"
             rec.failure_type = "CORRUPTED_OBSERVATION_DATA"
             rec.failure_reason = str(e)
+            rec.cf_status = "CORRUPTED_OBSERVATION_DATA"
+            rec.observation_status = "CORRUPTED_OBSERVATION_DATA"
+            rec.metric_status = "INPUT_ERROR"
+            rec.overall_score_status = "INPUT_ERROR"
             rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
             return rec
 
@@ -467,10 +499,16 @@ def evaluate_single_condition(
             rec.failure_stage = "obstacle_observation_contract"
             rec.failure_type = "INSUFFICIENT_OBSERVATION_DATA"
             rec.failure_reason = f"Obstacles exist but observation coverage is incomplete (coverage={rec.cf_coverage_ratio})"
+            rec.cf_status = "MISSING_OBSERVATION_EVIDENCE"
+            rec.ttc_status = "NOT_EVALUATED_DUE_TO_CF"
+            rec.observation_status = "INCOMPLETE_OBSERVATION_EVIDENCE"
+            rec.metric_status = "INCOMPLETE_OBSERVATION_EVIDENCE"
+            rec.overall_score_status = "INCOMPLETE_OBSERVATION_EVIDENCE"
             rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
             return rec
 
         rec.collision_free_proxy = cf_score
+        rec.cf_status = "AVAILABLE"
         rec.first_collision_time_s = col_t
         rec.minimum_clearance_m = min_clear if (min_clear is not None and np.isfinite(min_clear) and min_clear < float("inf")) else None
         rec.collided_track_ids = col_tracks
@@ -497,6 +535,10 @@ def evaluate_single_condition(
             rec.failure_stage = "obstacle_observation_contract"
             rec.failure_type = "CORRUPTED_OBSERVATION_DATA"
             rec.failure_reason = str(e)
+            rec.ttc_status = "CORRUPTED_OBSERVATION_DATA"
+            rec.observation_status = "CORRUPTED_OBSERVATION_DATA"
+            rec.metric_status = "INPUT_ERROR"
+            rec.overall_score_status = "INPUT_ERROR"
             rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
             return rec
 
@@ -505,10 +547,15 @@ def evaluate_single_condition(
             rec.failure_stage = "obstacle_observation_contract"
             rec.failure_type = "INSUFFICIENT_OBSERVATION_DATA"
             rec.failure_reason = f"TTC observation coverage is incomplete (coverage={rec.ttc_coverage_ratio})"
+            rec.ttc_status = "MISSING_OBSERVATION_EVIDENCE"
+            rec.observation_status = "INCOMPLETE_OBSERVATION_EVIDENCE"
+            rec.metric_status = "INCOMPLETE_OBSERVATION_EVIDENCE"
+            rec.overall_score_status = "INCOMPLETE_OBSERVATION_EVIDENCE"
             rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
             return rec
 
         rec.ttc_proxy = ttc_score
+        rec.ttc_status = "AVAILABLE"
         rec.min_ttc_s = min_ttc if (min_ttc is not None and np.isfinite(min_ttc) and min_ttc < float("inf")) else None
         rec.ttc_failure_time_s = ttc_fail_t
         rec.ttc_track_id = ttc_tr
@@ -530,9 +577,21 @@ def evaluate_single_condition(
             rec.dac_proxy = dac_score
             rec.first_offroad_time_s = off_t
             rec.offroad_frame_count = off_count
+            rec.dac_status = "AVAILABLE"
         else:
             if strict_mode:
-                raise ValueError("missing_drivable_geometry: No road/lane polygons loaded for clip")
+                rec.valid = False
+                rec.failure_stage = "map_geometry_contract"
+                rec.failure_type = "MAP_NOT_READY"
+                rec.failure_reason = "Authoritative drivable geometry or its coordinate transform is unavailable"
+                rec.dac_status = "MAP_NOT_READY"
+                rec.metric_status = "MAP_NOT_READY"
+                rec.observation_status = "COMPLETE"
+                rec.overall_score_status = "MAP_NOT_READY"
+                rec.dac_proxy = None
+                rec.nurec_safety_proxy_v1 = None
+                rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
+                return rec
             dac_score = None
 
         # 7. Ground Truth validation and Progress
@@ -612,8 +671,13 @@ def evaluate_single_condition(
             rec.valid = False
             rec.failure_stage = "compute_composite"
             rec.failure_reason = "One or more required metrics returned None"
+            rec.metric_status = "METRIC_UNAVAILABLE"
+            rec.overall_score_status = "METRIC_UNAVAILABLE"
         else:
             rec.valid = True
+            rec.metric_status = "SCORED"
+            rec.observation_status = "COMPLETE"
+            rec.overall_score_status = "SCORED"
 
     except Exception as e:
         rec.valid = False
@@ -626,6 +690,10 @@ def evaluate_single_condition(
         rec.ttc_proxy = None
         rec.progress_gt_proxy = None
         rec.future_comfort_proxy = None
+        if rec.metric_status == "UNSET":
+            rec.metric_status = "INPUT_ERROR"
+        if rec.overall_score_status == "UNSET":
+            rec.overall_score_status = "INPUT_ERROR"
 
     rec.runtime_ms = (time.perf_counter() - t_start) * 1000.0
     return rec
