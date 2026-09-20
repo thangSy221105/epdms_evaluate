@@ -134,6 +134,7 @@ def main() -> int:
 
     vector_rows: list[dict[str, Any]] = []
     validation_rows: list[dict[str, Any]] = []
+    gt_lk_cache: dict[str, dict[str, Any] | None] = {}
     for record in records:
         clip_id = str(record.get("clip_id"))
         if clip_id not in set(available):
@@ -141,7 +142,17 @@ def main() -> int:
         key = str(record.get("record_key"))
         prediction = predictions.get(key)
         bundle = bundles[clip_id]
-        if prediction is None:
+        if record.get("valid") is not True:
+            # Preserve the full 4,800-row additive vector without turning a
+            # proxy scorer failure into a newly computed metric result.
+            lk = {
+                "lk_proxy": None,
+                "status": "SOURCE_SCORE_INVALID",
+                "associated_lane_ids": [],
+            }
+            gt_result = None
+            diagnostic = {"status": "SOURCE_SCORE_INVALID"}
+        elif prediction is None:
             lk = {"lk_proxy": None, "status": "INPUT_ERROR", "associated_lane_ids": []}
             gt_result = None
             diagnostic = {"status": "INPUT_ERROR"}
@@ -150,7 +161,13 @@ def main() -> int:
                 xy = selected_xy(prediction, float(record.get("alpha", 0.0)))
                 lk = compute_lk_proxy(xy, bundle)
                 diagnostic = compute_lane_direction_alignment_diagnostic(xy, lk)
-                gt_result = compute_lk_proxy(gt_xy(ground_truth[clip_id]), bundle) if clip_id in ground_truth else None
+                if clip_id not in gt_lk_cache:
+                    gt_lk_cache[clip_id] = (
+                        compute_lk_proxy(gt_xy(ground_truth[clip_id]), bundle)
+                        if clip_id in ground_truth
+                        else None
+                    )
+                gt_result = gt_lk_cache[clip_id]
             except Exception as exc:
                 lk = {"lk_proxy": None, "status": "INPUT_ERROR", "error": str(exc), "associated_lane_ids": []}
                 gt_result = None

@@ -34,6 +34,8 @@ class LaneCenterline:
     corridor: np.ndarray
     lane_direction: Optional[str]
     source_row: int
+    bbox_min: Optional[np.ndarray] = None
+    bbox_max: Optional[np.ndarray] = None
 
 
 def _as_xy(points: Any) -> Optional[np.ndarray]:
@@ -167,15 +169,19 @@ def load_lane_centerlines_for_clip(
         if derived is None:
             continue
         center, corridor = derived
+        center_ego = _transform_xy(center, world_to_ego)
+        corridor_ego = _transform_xy(corridor, world_to_ego)
         key = row.get("key") if isinstance(row.get("key"), dict) else {}
         map_id = str(key.get("map_id") or "unknown_map")
         lane_id = f"{map_id}:row_{int(row_index)}"
         lanes.append(LaneCenterline(
             lane_id=lane_id,
-            centerline=_transform_xy(center, world_to_ego),
-            corridor=_transform_xy(corridor, world_to_ego),
+            centerline=center_ego,
+            corridor=corridor_ego,
             lane_direction=str(lane.get("lane_direction")) if lane.get("lane_direction") is not None else None,
             source_row=int(row_index),
+            bbox_min=np.min(corridor_ego, axis=0),
+            bbox_max=np.max(corridor_ego, axis=0),
         ))
     intersections = _load_intersections(clip_dir, world_to_ego)
     status = LK_READY if lanes else LK_MISSING
@@ -210,6 +216,15 @@ def _polyline_distance(point: np.ndarray, line: np.ndarray) -> tuple[float, int]
 
 
 def _lane_contains(point: np.ndarray, lane: LaneCenterline) -> bool:
+    bbox_min = lane.bbox_min if lane.bbox_min is not None else np.min(lane.corridor, axis=0)
+    bbox_max = lane.bbox_max if lane.bbox_max is not None else np.max(lane.corridor, axis=0)
+    if (
+        float(point[0]) < float(bbox_min[0])
+        or float(point[0]) > float(bbox_max[0])
+        or float(point[1]) < float(bbox_min[1])
+        or float(point[1]) > float(bbox_max[1])
+    ):
+        return False
     return point_in_polygon_ray_casting(float(point[0]), float(point[1]), lane.corridor)
 
 
