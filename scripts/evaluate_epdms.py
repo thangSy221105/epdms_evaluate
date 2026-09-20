@@ -28,6 +28,8 @@ from tools.epdms.io_jsonl import AtomicJsonlWriter, compute_file_sha256, iter_js
 from tools.epdms.map_loader import inspect_clip_map_status, load_lane_polygons_for_clip
 from tools.epdms.map_transform import load_transformed_map_for_clip
 from tools.epdms.nurec_inputs import (
+    decorate_context,
+    decorate_prediction_gt,
     decorate_inputs,
     load_coordinate_contract,
     load_dac_readiness,
@@ -258,6 +260,7 @@ def main() -> None:
     print(f"[*] Total conditions to process: {total_conditions}")
 
     cached_polygons: Dict[str, List[Any]] = {}
+    cached_decorated_context: Dict[str, Dict[str, Any]] = {}
 
     start_time = time.time()
     processed_this_run = 0
@@ -352,10 +355,13 @@ def main() -> None:
                     readiness = nurec_adapter["readiness"].get(clip_id)
                     time_record = nurec_adapter["time_mapping"].get(clip_id)
                     if readiness is not None and time_record is not None and time_record.get("verified"):
-                        pred_row, gt_row, ctx_row = decorate_inputs(
-                            pred_row, gt_row, ctx_row,
-                            nurec_adapter["contract"], time_record, readiness,
-                        )
+                        if clip_id not in cached_decorated_context:
+                            cached_decorated_context[clip_id] = decorate_context(
+                                ctx_row, nurec_adapter["contract"], time_record, readiness,
+                            )
+                        pred_row = decorate_prediction_gt(pred_row, nurec_adapter["contract"], "prediction")
+                        gt_row = decorate_prediction_gt(gt_row, nurec_adapter["contract"], "ground_truth")
+                        ctx_row = cached_decorated_context[clip_id]
                         dac_row = nurec_adapter["dac"].get(clip_id, {})
                         dac_ready = str(dac_row.get("dac_ready", "")).lower() == "true"
 

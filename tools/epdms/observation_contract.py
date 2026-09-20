@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 
@@ -225,6 +226,9 @@ def normalize_and_validate_obstacle(
     }
 
 
+_OBSTACLE_INDEX_CACHE: OrderedDict[tuple[int, bool], tuple[Any, Tuple[Dict[int, List[Dict[str, Any]]], np.ndarray, int, int]]] = OrderedDict()
+
+
 def index_and_filter_obstacles(
     raw_obstacles: Optional[List[Dict[str, Any]]],
     raise_on_corrupt: bool = True,
@@ -236,6 +240,16 @@ def index_and_filter_obstacles(
     """
     if raw_obstacles is None or len(raw_obstacles) == 0:
         return {}, np.array([], dtype=np.int64), 0, 0
+
+    # CF and TTC consume the same immutable obstacle list for every condition
+    # of a clip. Keep a small identity-based LRU so repeated conditions do not
+    # normalize the same rows again. The original list is retained in each
+    # cache entry, preventing id reuse from returning stale data.
+    cache_key = (id(raw_obstacles), bool(raise_on_corrupt))
+    cached = _OBSTACLE_INDEX_CACHE.get(cache_key)
+    if cached is not None and cached[0] is raw_obstacles:
+        _OBSTACLE_INDEX_CACHE.move_to_end(cache_key)
+        return cached[1]
 
     obs_by_time: Dict[int, List[Dict[str, Any]]] = {}
     invalid_count = 0
@@ -256,7 +270,12 @@ def index_and_filter_obstacles(
                 raise
 
     all_ts = np.array(sorted(obs_by_time.keys()), dtype=np.int64) if obs_by_time else np.array([], dtype=np.int64)
-    return obs_by_time, all_ts, invalid_count, missing_ts_count
+    result = (obs_by_time, all_ts, invalid_count, missing_ts_count)
+    _OBSTACLE_INDEX_CACHE[cache_key] = (raw_obstacles, result)
+    _OBSTACLE_INDEX_CACHE.move_to_end(cache_key)
+    while len(_OBSTACLE_INDEX_CACHE) > 8:
+        _OBSTACLE_INDEX_CACHE.popitem(last=False)
+    return result
 
 
 def evaluate_query_coverage(

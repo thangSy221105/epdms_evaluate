@@ -107,24 +107,37 @@ def decorate_inputs(
     readiness: ObservationReadiness,
 ) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     """Return deep-copied rows with explicit, accepted provenance metadata."""
-    pred = copy.deepcopy(pred_row)
-    gt = copy.deepcopy(gt_row)
+    pred = decorate_prediction_gt(pred_row, contract, "prediction")
+    gt = decorate_prediction_gt(gt_row, contract, "ground_truth")
+    context = decorate_context(context_row, contract, time_record, readiness)
+    return pred, gt, context
+
+
+def decorate_prediction_gt(row: Dict[str, Any], contract: Dict[str, Any], role: str) -> Dict[str, Any]:
+    """Decorate one prediction/GT row without copying the large obstacle context."""
+
+    result = copy.deepcopy(row)
+    common = str(contract["common_evaluation_frame"])
+    result.update({
+        "coordinate_frame": common,
+        "reference_point": contract["anchor_semantics"][role],
+        "source_includes_t0": False,
+        "trajectory_origin_policy": "future_only",
+        "coordinate_contract": {"status": contract["status"], "source": "accepted_frozen_contract"},
+    })
+    return result
+
+
+def decorate_context(
+    context_row: Dict[str, Any],
+    contract: Dict[str, Any],
+    time_record: Dict[str, Any],
+    readiness: ObservationReadiness,
+) -> Dict[str, Any]:
+    """Decorate a context once per clip; the scorer treats it as read-only."""
+
     context = copy.deepcopy(context_row)
     common = str(contract["common_evaluation_frame"])
-    pred.update({
-        "coordinate_frame": common,
-        "reference_point": contract["anchor_semantics"]["prediction"],
-        "source_includes_t0": False,
-        "trajectory_origin_policy": "future_only",
-        "coordinate_contract": {"status": contract["status"], "source": "accepted_frozen_contract"},
-    })
-    gt.update({
-        "coordinate_frame": common,
-        "reference_point": contract["anchor_semantics"]["ground_truth"],
-        "source_includes_t0": False,
-        "trajectory_origin_policy": "future_only",
-        "coordinate_contract": {"status": contract["status"], "source": "accepted_frozen_contract"},
-    })
     context["coordinate_contract"] = {
         "status": contract["status"],
         "source": "accepted_frozen_contract",
@@ -174,4 +187,4 @@ def decorate_inputs(
         "observation_ready": readiness.observation_ready,
         "source": "full300_readiness_audit",
     }
-    return pred, gt, context
+    return context
