@@ -678,7 +678,8 @@ def _upstream_provenance_report(repo_root: Path, trace: Optional[Mapping[str, An
     if trace.get("matches"):
         lines += ["## Line-level trace", "", "| FILE | LINE | FUNCTION | MATCH | PROVENANCE STATUS |", "|---|---:|---|---|---|"]
         for item in trace["matches"]:
-            lines.append(f"| `{item['file']}` | {item['line']} | `{item.get('function') or ''}` | `{str(item['match']).replace('|', '\\|')}` | `{item['provenance_status']}` |")
+            escaped_match = str(item["match"]).replace("|", "\\|")
+            lines.append(f"| `{item['file']}` | {item['line']} | `{item.get('function') or ''}` | `{escaped_match}` | `{item['provenance_status']}` |")
     else:
         lines += ["UPSTREAM_T0_PROVENANCE_NOT_FOUND_IN_REPOSITORY", "", "No requested upstream construction term was found."]
     lines += ["", "Matches in tests/docs/config are not treated as generation provenance. A raw NuRec frame/pose bridge must still be explicit before alignment can be verified."]
