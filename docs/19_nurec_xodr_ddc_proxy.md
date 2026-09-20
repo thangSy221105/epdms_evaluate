@@ -2,14 +2,24 @@
 
 This round inventories the released NuRec USDZ central directories and
 recovers only the `map.xodr` member.  All 300 clips in the full-300 manifest
-were scanned and their XODR files parsed.  Geometry is present, and each file
-contains a `geoReference`, but this is not by itself a proof that XODR
-coordinates are `NCORE_LOCAL_WORLD` coordinates.
+were scanned and their XODR files parsed.  NVIDIA's published NuRec coordinate
+chain provides the per-clip binding:
 
-The current files contain no explicit OpenDRIVE lane `direction` attributes.
-The audit therefore does not turn lane sign/order into legal travel direction,
-does not fit a transform from GT or local lane geometry, and does not infer a
-DDC value from the existing `lane_direction` field.
+```text
+T_map_ncore = inverse(T_ecef_enu @ T_world_base)
+```
+
+where `T_world_base` is the frame-0 rig-to-ECEF pose and `T_ecef_enu` is
+constructed from the XODR `geoReference`.  This makes the XODR coordinate
+contract `VERIFIED` for the released files; geometry comparison against
+`lane.parquet` is retained as independent validation and never used to fit a
+correction.
+
+The current files contain no explicit OpenDRIVE lane `direction` attributes,
+and all 35,003 road records lack `road.rule`.  The audit therefore does not
+turn lane sign/order into legal travel direction, does not fit a transform from
+GT or local lane geometry, and does not infer a DDC value from the existing
+`lane_direction` field.  The legal-direction contract remains `UNRESOLVED`.
 
 The interpretation follows the [ASAM OpenDRIVE lane-group direction
 semantics](https://publications.pages.asam.net/standards/ASAM_OpenDRIVE/ASAM_OpenDRIVE_Specification/1.8.0/specification/11_lanes/11_02_lane_groups.html)
