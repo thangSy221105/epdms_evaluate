@@ -28,6 +28,8 @@ NRE_SKILL = "https://github.com/NVIDIA/nurec-skills/blob/main/skills/nre/referen
 ASAM_LANES = "https://publications.pages.asam.net/standards/ASAM_OpenDRIVE/ASAM_OpenDRIVE_Specification/1.8.0/specification/11_lanes/11_02_lane_groups.html"
 ASAM_ROADS = "https://simulation.pages.asam.net/opendrive-group/opendrive-antora-gen/ASAM_OpenDRIVE_Specification/v1.9.0/specification/10_roads/10_01_introduction.html"
 ASAM_REF = "https://publications.pages.asam.net/standards/ASAM_OpenDRIVE/ASAM_OpenDRIVE_Specification/v1.9.0/specification/09_geometries/09_02_road_reference_line.html"
+ASAM_JUNCTION_14 = "https://www.asam.net/fileadmin/Standards/OpenDRIVE/OpenDRIVEFormatSpecDelta_1.5M_vs_1.4H_VIRES.pdf"
+ASAM_JUNCTION_17 = "https://www.asam.net/fileadmin/Standards/OpenDRIVE/ASAM_OpenDRIVE_BS_V1-7-0.html"
 ALPASIM_CONVENTIONS = "https://github.com/NVlabs/alpasim/blob/main/CONTRIBUTING.md"
 NCORE_CONVENTIONS = "https://nvidia.github.io/ncore/data/conventions.html"
 
@@ -220,6 +222,271 @@ def direction_contract_for_root(root: ET.Element, version: str) -> dict[str, Any
         "legal_direction_status": status,
         "blockers": blockers,
         **lane_meta,
+    }
+
+
+LANE_TYPE_BUCKETS = {
+    "driving": "driving",
+    "bidirectional": "bidirectional",
+    "shoulder": "shoulder",
+    "border": "border",
+    "restricted": "restricted",
+    "parking": "parking",
+    "stop": "stop",
+    "none": "none",
+}
+
+
+def lane_type_bucket(value: str | None) -> str:
+    normalized = (value or "").strip().lower()
+    return LANE_TYPE_BUCKETS.get(normalized, "other")
+
+
+def road_lane_types(root: ET.Element) -> tuple[dict[str, dict[int, set[str]]], dict[str, int]]:
+    """Index lane types by road/lane id without using geometry or trajectories."""
+    by_road: dict[str, dict[int, set[str]]] = {}
+    counts = {key: 0 for key in (*LANE_TYPE_BUCKETS.values(), "other")}
+    for road in (node for node in root.iter() if local_name(node.tag) == "road"):
+        road_id = road.attrib.get("id")
+        if road_id is None:
+            continue
+        lanes = by_road.setdefault(road_id, {})
+        for lane in (node for node in road.iter() if local_name(node.tag) == "lane"):
+            try:
+                lane_id = int(lane.attrib["id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            bucket = lane_type_bucket(lane.attrib.get("type"))
+            lanes.setdefault(lane_id, set()).add(bucket)
+            counts[bucket] = counts.get(bucket, 0) + 1
+    return by_road, counts
+
+
+def road_links(root: ET.Element) -> dict[str, list[dict[str, str | None]]]:
+    links: dict[str, list[dict[str, str | None]]] = {}
+    for road in (node for node in root.iter() if local_name(node.tag) == "road"):
+        road_id = road.attrib.get("id")
+        if road_id is None:
+            continue
+        entries: list[dict[str, str | None]] = []
+        link = next((node for node in road if local_name(node.tag) == "link"), None)
+        if link is not None:
+            for relation in link:
+                relation_name = local_name(relation.tag)
+                if relation_name not in {"predecessor", "successor"}:
+                    continue
+                entries.append({
+                    "relation": relation_name,
+                    "element_type": relation.attrib.get("elementType"),
+                    "element_id": relation.attrib.get("elementId"),
+                    "contact_point": relation.attrib.get("contactPoint"),
+                })
+        links[road_id] = entries
+    return links
+
+
+def resolve_lane_default_direction(lane_id: int | None, effective_rule: str | None, lane_types: set[str] | None) -> tuple[str | None, str]:
+    if lane_id is None or lane_id == 0:
+        return None, "INVALID_LANE_ID"
+    if not lane_types:
+        return None, "INVALID_LANE_ID"
+    if len(lane_types) != 1:
+        return None, "AMBIGUOUS_LANE_TYPE"
+    lane_type = next(iter(lane_types))
+    if lane_type == "bidirectional":
+        return None, "BIDIRECTIONAL_EXCLUDED"
+    if lane_type != "driving":
+        return None, "NON_DRIVING_LANE"
+    if effective_rule not in {"RHT", "LHT"}:
+        return None, "UNSUPPORTED"
+    if effective_rule == "RHT":
+        return ("+s" if lane_id < 0 else "-s"), "RESOLVED"
+    return ("-s" if lane_id < 0 else "+s"), "RESOLVED"
+
+
+def junction_topology_for_root(root: ET.Element, version: str) -> dict[str, Any]:
+    roads = {
+        node.attrib.get("id"): node
+        for node in root.iter()
+        if local_name(node.tag) == "road" and node.attrib.get("id") is not None
+    }
+    lane_types, lane_type_counts = road_lane_types(root)
+    links = road_links(root)
+    junction_nodes = [node for node in root.iter() if local_name(node.tag) == "junction"]
+    connection_rows: list[dict[str, Any]] = []
+    lane_link_rows: list[dict[str, Any]] = []
+    consistency_rows: list[dict[str, Any]] = []
+    for junction in junction_nodes:
+        junction_id = junction.attrib.get("id")
+        junction_type = junction.attrib.get("type", "default")
+        connections = [node for node in junction if local_name(node.tag) == "connection"]
+        for connection in connections:
+            connection_id = connection.attrib.get("id")
+            incoming_id = connection.attrib.get("incomingRoad")
+            connecting_id = connection.attrib.get("connectingRoad")
+            linked_id = connection.attrib.get("linkedRoad")
+            contact_point = connection.attrib.get("contactPoint")
+            incoming_road = roads.get(incoming_id or "")
+            connecting_road = roads.get(connecting_id or "")
+            incoming_rule, incoming_rule_source = effective_road_rule(version, incoming_road.attrib.get("rule") if incoming_road is not None else None)
+            connecting_rule, connecting_rule_source = effective_road_rule(version, connecting_road.attrib.get("rule") if connecting_road is not None else None)
+            incoming_links = links.get(incoming_id or "", [])
+            connecting_links = links.get(connecting_id or "", [])
+            incoming_junction_relations = [
+                item for item in incoming_links
+                if item.get("element_type") == "junction" and item.get("element_id") == junction_id
+            ]
+            incoming_orientation = "UNRESOLVED"
+            if len(incoming_junction_relations) == 1:
+                incoming_orientation = f"INCOMING_JUNCTION_AT_{str(incoming_junction_relations[0].get('relation')).upper()}"
+            elif len(incoming_junction_relations) > 1:
+                incoming_orientation = "AMBIGUOUS"
+            expected_relation = "predecessor" if contact_point == "start" else "successor" if contact_point == "end" else None
+            expected_road_contact = "end" if contact_point == "start" else "start" if contact_point == "end" else None
+            connecting_relation_matches = [
+                item for item in connecting_links
+                if item.get("relation") == expected_relation
+                and item.get("element_type") == "road"
+                and item.get("element_id") == incoming_id
+                and (expected_road_contact is None or item.get("contact_point") == expected_road_contact)
+            ]
+            road_link_consistent = bool(
+                incoming_id in roads
+                and connecting_id in roads
+                and incoming_orientation.startswith("INCOMING_JUNCTION_AT_")
+                and len(connecting_relation_matches) == 1
+                and connecting_road.attrib.get("junction") == junction_id
+            )
+            contact_point_valid = contact_point in {"start", "end"}
+            link_nodes = [node for node in connection if local_name(node.tag) == "laneLink"]
+            if not incoming_id or incoming_id == "-1" or not connecting_id or connecting_id not in roads:
+                connection_base_status = "UNSUPPORTED"
+            elif not contact_point_valid or version not in SUPPORTED_DIRECTION_VERSIONS:
+                connection_base_status = "UNSUPPORTED"
+            elif not link_nodes:
+                connection_base_status = "AMBIGUOUS"
+            elif not road_link_consistent:
+                connection_base_status = "INCONSISTENT_TOPOLOGY"
+            else:
+                connection_base_status = "RESOLVED"
+            connection_link_statuses: list[str] = []
+            connection_lane_id_valid = True
+            for lane_link in link_nodes:
+                from_id: int | None = None
+                to_id: int | None = None
+                try:
+                    from_id = int(lane_link.attrib["from"])
+                    to_id = int(lane_link.attrib["to"])
+                except (KeyError, TypeError, ValueError):
+                    connection_lane_id_valid = False
+                from_types = lane_types.get(incoming_id or "", {}).get(from_id, set()) if from_id is not None else set()
+                to_types = lane_types.get(connecting_id or "", {}).get(to_id, set()) if to_id is not None else set()
+                from_type = ";".join(sorted(from_types)) or None
+                to_type = ";".join(sorted(to_types)) or None
+                from_direction, from_status = resolve_lane_default_direction(from_id, incoming_rule, from_types)
+                to_direction, to_status = resolve_lane_default_direction(to_id, connecting_rule, to_types)
+                mapping_status = "RESOLVED"
+                blocker = ""
+                if not connection_lane_id_valid or not from_types or not to_types:
+                    mapping_status, blocker = "UNSUPPORTED", "INVALID_OR_MISSING_LANE_ID"
+                elif from_status == "BIDIRECTIONAL_EXCLUDED" or to_status == "BIDIRECTIONAL_EXCLUDED":
+                    mapping_status, blocker = "BIDIRECTIONAL_EXCLUDED", "BIDIRECTIONAL_LANE"
+                elif from_status == "NON_DRIVING_LANE" or to_status == "NON_DRIVING_LANE":
+                    mapping_status, blocker = "NON_DRIVING_LANE", "NON_DRIVING_LANE_TYPE"
+                elif from_status != "RESOLVED" or to_status != "RESOLVED":
+                    mapping_status, blocker = "AMBIGUOUS", f"{from_status};{to_status}"
+                elif connection_base_status == "INCONSISTENT_TOPOLOGY":
+                    mapping_status, blocker = "INCONSISTENT_TOPOLOGY", "ROAD_LINK_INCONSISTENT"
+                elif connection_base_status != "RESOLVED":
+                    mapping_status, blocker = connection_base_status, "CONNECTION_SEMANTICS_UNRESOLVED"
+                elif to_direction != ("+s" if contact_point == "start" else "-s"):
+                    mapping_status, blocker = "INCONSISTENT_TOPOLOGY", "CONTACT_POINT_DIRECTION_CONTRADICTION"
+                lane_link_rows.append({
+                    "clip_id": "",
+                    "junction_id": junction_id,
+                    "connection_id": connection_id,
+                    "incoming_road_id": incoming_id,
+                    "connecting_road_id": connecting_id,
+                    "contact_point": contact_point,
+                    "from_lane_id": from_id,
+                    "to_lane_id": to_id,
+                    "from_lane_type": from_type,
+                    "to_lane_type": to_type,
+                    "incoming_reference_orientation_role": incoming_orientation,
+                    "connecting_reference_orientation_role": "TRAVERSAL_START_TO_END" if contact_point == "start" else "TRAVERSAL_END_TO_START" if contact_point == "end" else "UNRESOLVED",
+                    "incoming_effective_road_rule": incoming_rule,
+                    "connecting_effective_road_rule": connecting_rule,
+                    "from_lane_default_direction": from_direction,
+                    "to_lane_default_direction": to_direction,
+                    "mapping_status": mapping_status,
+                    "blocker": blocker,
+                })
+                connection_link_statuses.append(mapping_status)
+            if connection_base_status == "RESOLVED" and connection_link_statuses and all(status == "RESOLVED" for status in connection_link_statuses):
+                connection_status = "RESOLVED"
+            elif connection_base_status == "INCONSISTENT_TOPOLOGY" or "INCONSISTENT_TOPOLOGY" in connection_link_statuses:
+                connection_status = "INCONSISTENT_TOPOLOGY"
+            elif "BIDIRECTIONAL_EXCLUDED" in connection_link_statuses:
+                connection_status = "BIDIRECTIONAL_EXCLUDED"
+            elif "NON_DRIVING_LANE" in connection_link_statuses:
+                connection_status = "NON_DRIVING_LANE"
+            elif connection_base_status == "UNSUPPORTED" or "UNSUPPORTED" in connection_link_statuses:
+                connection_status = "UNSUPPORTED"
+            else:
+                connection_status = "AMBIGUOUS"
+            connection_rows.append({
+                "junction_id": junction_id,
+                "connection_id": connection_id,
+                "incoming_road_id": incoming_id,
+                "connecting_road_id": connecting_id,
+                "linked_road_id_if_present": linked_id,
+                "contact_point": contact_point,
+                "lane_link_count": len(link_nodes),
+                "incoming_road_rule": incoming_road.attrib.get("rule", "") if incoming_road is not None else None,
+                "incoming_effective_rule": incoming_rule,
+                "connecting_road_rule": connecting_road.attrib.get("rule", "") if connecting_road is not None else None,
+                "connecting_effective_rule": connecting_rule,
+                "incoming_road_junction_attr": incoming_road.attrib.get("junction") if incoming_road is not None else None,
+                "connecting_road_junction_attr": connecting_road.attrib.get("junction") if connecting_road is not None else None,
+                "connection_parse_status": connection_status,
+                "road_link_consistent": road_link_consistent,
+                "lane_link_resolves": bool(connection_link_statuses) and all(status == "RESOLVED" for status in connection_link_statuses),
+                "contact_point_valid": contact_point_valid,
+                "lane_id_valid": connection_lane_id_valid,
+                "topology_status": connection_status,
+                "blocker": "" if connection_status == "RESOLVED" else "JUNCTION_MAPPING_NOT_RESOLVED",
+            })
+            consistency_rows.append({
+                "junction_id": junction_id,
+                "connection_id": connection_id,
+                "incoming_road_id": incoming_id,
+                "connecting_road_id": connecting_id,
+                "road_link_consistent": road_link_consistent,
+                "lane_link_resolves": bool(connection_link_statuses) and all(status == "RESOLVED" for status in connection_link_statuses),
+                "contact_point_valid": contact_point_valid,
+                "lane_id_valid": connection_lane_id_valid,
+                "topology_status": connection_status,
+                "blocker": "" if connection_status == "RESOLVED" else "JUNCTION_MAPPING_NOT_RESOLVED",
+            })
+    metrics = {
+        "junction_count": len(junction_nodes),
+        "connection_count": len(connection_rows),
+        "lane_link_count": len(lane_link_rows),
+        "resolved_connection_count": sum(row["connection_parse_status"] == "RESOLVED" for row in connection_rows),
+        "ambiguous_connection_count": sum(row["connection_parse_status"] == "AMBIGUOUS" for row in connection_rows),
+        "unsupported_connection_count": sum(row["connection_parse_status"] == "UNSUPPORTED" for row in connection_rows),
+        "inconsistent_connection_count": sum(row["connection_parse_status"] == "INCONSISTENT_TOPOLOGY" for row in connection_rows),
+        "resolved_lanelink_count": sum(row["mapping_status"] == "RESOLVED" for row in lane_link_rows),
+        "ambiguous_lanelink_count": sum(row["mapping_status"] == "AMBIGUOUS" for row in lane_link_rows),
+        "non_driving_lanelink_count": sum(row["mapping_status"] == "NON_DRIVING_LANE" for row in lane_link_rows),
+        "bidirectional_excluded_count": sum(row["mapping_status"] == "BIDIRECTIONAL_EXCLUDED" for row in lane_link_rows),
+    }
+    return {
+        "connection_rows": connection_rows,
+        "lane_link_rows": lane_link_rows,
+        "consistency_rows": consistency_rows,
+        "lane_type_counts": lane_type_counts,
+        "metrics": metrics,
     }
 
 
@@ -436,6 +703,14 @@ def evidence_rows() -> list[dict[str, Any]]:
     ]
 
 
+def junction_evidence_rows() -> list[dict[str, Any]]:
+    return [
+        {"evidence_id": "ASAM_JUNCTION_14_001", "repository": "ASAM OpenDRIVE 1.4/1.45 official source", "commit_sha": "PUBLISHED_SPEC", "file_path": ASAM_JUNCTION_14, "symbol": "Junction connection and lane linkage", "line_range_or_section": "Junctions; incomingRoad/connectingRoad/contactPoint/laneLink", "claim_type": "JUNCTION_SEMANTICS", "claim": "A connection identifies an incoming road and a connecting road; laneLink from is the incoming lane and laneLink to is the connection lane.", "supports_legal_direction": True, "confidence": "HIGH", "notes": "Official ASAM 1.4/1.45-era source; no trajectory or GT inference."},
+        {"evidence_id": "ASAM_JUNCTION_17_001", "repository": "ASAM OpenDRIVE", "commit_sha": "PUBLISHED_SPEC", "file_path": ASAM_JUNCTION_17, "symbol": "Direction of connecting roads", "line_range_or_section": "§10.3.2", "claim_type": "CONTACT_POINT", "claim": "contactPoint=start means the connecting road runs along the laneLink direction; contactPoint=end means it runs opposite to that direction.", "supports_legal_direction": True, "confidence": "HIGH", "notes": "Later official HTML retains the semantics and explicitly states the 1.4.0 linkage rules; used only to make the resolver auditable."},
+        {"evidence_id": "ASAM_ROAD_LINK_14_001", "repository": "ASAM OpenDRIVE", "commit_sha": "PUBLISHED_SPEC", "file_path": ASAM_JUNCTION_17, "symbol": "Road linkage", "line_range_or_section": "§10.3; asam.net:xodr:1.4.0 road linkage rules", "claim_type": "ROAD_LINK", "claim": "Predecessor/successor road links use elementType, elementId, and contactPoint and must be consistent; the audit never repairs or flips inconsistent links.", "supports_legal_direction": True, "confidence": "HIGH", "notes": "Version-specific 1.4.0 rule identifiers are cited in the official source."},
+    ]
+
+
 def audit(args: argparse.Namespace) -> dict[str, Any]:
     clip_ids = sorted(path.name for path in args.xodr_root.iterdir() if path.is_dir())
     georef_rows: list[dict[str, Any]] = []
@@ -455,6 +730,24 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
     legal_status_counts = {"VERIFIED": 0, "PARTIAL": 0, "UNRESOLVED": 0}
     observed_lane_direction_attribute_count = 0
     observed_dynamic_lane_direction_count = 0
+    lane_type_counts_total = {key: 0 for key in (*LANE_TYPE_BUCKETS.values(), "other")}
+    junction_inventory_rows: list[dict[str, Any]] = []
+    junction_lanelink_rows: list[dict[str, Any]] = []
+    junction_consistency_rows: list[dict[str, Any]] = []
+    lane_type_rows: list[dict[str, Any]] = []
+    junction_metrics_total = {
+        "junction_count": 0,
+        "connection_count": 0,
+        "lane_link_count": 0,
+        "resolved_connection_count": 0,
+        "ambiguous_connection_count": 0,
+        "unsupported_connection_count": 0,
+        "inconsistent_connection_count": 0,
+        "resolved_lanelink_count": 0,
+        "ambiguous_lanelink_count": 0,
+        "non_driving_lanelink_count": 0,
+        "bidirectional_excluded_count": 0,
+    }
     for clip_id in clip_ids:
         xodr_path = args.xodr_root / clip_id / "map.xodr"
         context_clip = args.context_root / clip_id
@@ -477,9 +770,20 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
                 road_rule_attribute_counts[key] += count
             for key, count in direction["effective_road_rule_counts"].items():
                 effective_road_rule_counts[key] += count
-            legal_status_counts[direction["legal_direction_status"]] += 1
             observed_lane_direction_attribute_count += direction["lane_direction_attribute_count"]
             observed_dynamic_lane_direction_count += direction["dynamic_lane_direction_attribute_count"]
+            topology = junction_topology_for_root(root, version)
+            for key, count in topology["lane_type_counts"].items():
+                lane_type_counts_total[key] += count
+            for key, count in topology["metrics"].items():
+                junction_metrics_total[key] += count
+            lane_type_rows.append({"clip_id": clip_id, **topology["lane_type_counts"]})
+            for row in topology["connection_rows"]:
+                junction_inventory_rows.append({"clip_id": clip_id, **row})
+            for row in topology["lane_link_rows"]:
+                junction_lanelink_rows.append({"clip_id": clip_id, **row})
+            for row in topology["consistency_rows"]:
+                junction_consistency_rows.append({"clip_id": clip_id, **row})
             rig_path = context_clip / "rig_trajectories.json"
             rig = json.loads(rig_path.read_text(encoding="utf-8"))
             world_base = np.asarray(rig.get("T_world_base"), dtype=float)
@@ -529,10 +833,29 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
                 "blocker": "" if source_transform_available and validation.get("transform_implemented") and validation.get("geometry_validated") and validation.get("systematic_contradiction") is False else "GEOMETRY_VALIDATION_NOT_ACCEPTED_OR_INCOMPLETE" if source_transform_available else "MISSING_VALID_GEOREFERENCE_OR_T_WORLD_BASE",
             })
             coordinate_status = "VERIFIED" if source_transform_available and validation.get("transform_implemented") and validation.get("geometry_validated") and validation.get("systematic_contradiction") is False else "PARTIAL" if source_transform_available and validation.get("transform_implemented") else "UNRESOLVED"
+            topology_statuses = [row["connection_parse_status"] for row in topology["connection_rows"]]
+            has_topology_contradiction = "INCONSISTENT_TOPOLOGY" in topology_statuses
+            has_topology_exclusion = any(status in {"AMBIGUOUS", "UNSUPPORTED", "NON_DRIVING_LANE", "BIDIRECTIONAL_EXCLUDED"} for status in topology_statuses)
+            if direction["legal_direction_status"] == "UNRESOLVED":
+                clip_legal_status = "UNRESOLVED"
+            elif has_topology_contradiction:
+                clip_legal_status = "PARTIAL"
+            elif has_topology_exclusion:
+                clip_legal_status = "PARTIAL"
+            else:
+                clip_legal_status = "VERIFIED"
+            legal_status_counts[clip_legal_status] += 1
+            junction_mapping_resolved = bool(topology["connection_rows"]) and all(status == "RESOLVED" for status in topology_statuses)
+            if not topology["connection_rows"]:
+                junction_mapping_resolved = True
             blockers = list(direction["blockers"])
+            if has_topology_contradiction:
+                blockers.append("JUNCTION_TOPOLOGY_INCONSISTENT")
+            elif has_topology_exclusion:
+                blockers.append("JUNCTION_MAPPING_HAS_FAIL_CLOSED_EXCLUSIONS")
             if coordinate_status != "VERIFIED":
                 blockers.append("XODR_COORDINATE_GEOMETRY_VALIDATION_NOT_ACCEPTED")
-            ddc_ready = coordinate_status == "VERIFIED" and direction["legal_direction_status"] == "VERIFIED" and not blockers
+            ddc_ready = coordinate_status == "VERIFIED" and clip_legal_status == "VERIFIED" and not blockers
             readiness_rows.append({
                 "clip_id": clip_id,
                 "road_rule_attribute_available": direction["road_rule_attribute_available"],
@@ -541,8 +864,15 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
                 "effective_road_rule_source": direction["effective_road_rule_source"],
                 "lane_topology_available": direction["lane_topology_available"],
                 "junction_topology_available": direction["junction_topology_available"],
-                "legal_direction_supported": direction["legal_direction_supported"],
-                "legal_direction_status": direction["legal_direction_status"],
+                "junction_count": topology["metrics"]["junction_count"],
+                "connection_count": topology["metrics"]["connection_count"],
+                "lane_link_count": topology["metrics"]["lane_link_count"],
+                "junction_mapping_resolved": junction_mapping_resolved,
+                "junction_mapping_status": clip_legal_status,
+                "bidirectional_lane_present": topology["lane_type_counts"].get("bidirectional", 0) > 0,
+                "unsupported_lane_type_present": any(topology["lane_type_counts"].get(key, 0) > 0 for key in ("shoulder", "border", "restricted", "parking", "stop", "none", "other")),
+                "legal_direction_supported": direction["legal_direction_supported"] and clip_legal_status == "VERIFIED",
+                "legal_direction_status": clip_legal_status,
                 "coordinate_supported": coordinate_status == "VERIFIED",
                 "coordinate_status": coordinate_status,
                 "ddc_proxy_ready": ddc_ready,
@@ -555,15 +885,22 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
             binding_rows.append({"clip_id": clip_id, "coordinate_contract_status": "UNRESOLVED", "blocker": f"{type(exc).__name__}: {exc}"})
             validation_rows.append({"clip_id": clip_id, "validation_status": "FAILED", "error": f"{type(exc).__name__}: {exc}"})
             legal_status_counts["UNRESOLVED"] += 1
+            legal_status_counts["UNRESOLVED"] += 1
             readiness_rows.append({"clip_id": clip_id, "legal_direction_status": "UNRESOLVED", "coordinate_status": "UNRESOLVED", "ddc_proxy_ready": False, "blockers": f"{type(exc).__name__}: {exc}"})
 
     evidence = evidence_rows()
+    junction_evidence = junction_evidence_rows()
+    write_csv(args.output_dir / "upstream_junction_direction_evidence.csv", junction_evidence)
     write_csv(args.output_dir / "upstream_coordinate_direction_evidence.csv", evidence)
     write_csv(args.output_dir / "xodr_georeference_inventory_full300.csv", georef_rows)
     write_csv(args.output_dir / "opendrive_version_inventory.csv", version_rows)
     write_csv(args.output_dir / "xodr_coordinate_binding_full300.csv", binding_rows)
     write_csv(args.output_dir / "xodr_lane_geometry_validation.csv", validation_rows)
     write_csv(args.output_dir / "ddc_direction_readiness_full300.csv", readiness_rows)
+    write_csv(args.output_dir / "xodr_junction_inventory_full300.csv", junction_inventory_rows)
+    write_csv(args.output_dir / "xodr_junction_lanelink_full300.csv", junction_lanelink_rows)
+    write_csv(args.output_dir / "xodr_junction_topology_consistency_full300.csv", junction_consistency_rows)
+    write_csv(args.output_dir / "xodr_lane_type_inventory_full300.csv", lane_type_rows)
     write_csv(args.output_dir / "metadata_origin_evidence_full300.csv", origin_rows)
 
     validation_attempted_count = len(validation_rows)
@@ -622,16 +959,24 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
         "road_rule_semantics": "For OpenDRIVE 1.4, RHT/LHT controls default direction and an omitted road/@rule defaults to RHT.",
         "rht_direction_rule": "right/negative lanes follow positive reference-line direction; left/positive lanes oppose it.",
         "lht_direction_rule": "left/positive lanes follow positive reference-line direction; right/negative lanes oppose it.",
-        "junction_policy": "No DDC evaluation until connecting-road laneLink/contactPoint semantics are resolved; unresolved junction association is null/excluded.",
+        "junction_semantics": "connection.incomingRoad identifies the incoming road; connection.connectingRoad identifies the connecting road; laneLink.from is the incoming lane and laneLink.to is the connecting-road lane.",
+        "contact_point_semantics": "contactPoint=start means the connecting road runs along the laneLink direction; contactPoint=end means it runs opposite to the laneLink direction.",
+        "lane_link_semantics": "Only exact integer lane IDs present on the referenced roads are considered; missing or ambiguous IDs fail closed.",
+        "road_link_consistency_policy": "The incoming road must link to this junction and the connecting road must link to the incoming road at the contactPoint-consistent side; contradictions are never repaired or flipped.",
+        "lane_type_policy": "Only lane type driving is eligible; shoulder/border/restricted/parking/stop/none/other are excluded or unresolved.",
+        "bidirectional_policy": "bidirectional lanes are excluded/null unless a version-supported explicit traversal semantics is available; no one-way direction is invented.",
+        "junction_policy": "Resolved laneLinks may be used for direction audit; ambiguous, unsupported, non-driving, and bidirectional cases are explicitly fail-closed and excluded from DDC readiness.",
         "missing_rule_policy": "ASAM_DEFAULT_RHT_FOR_SUPPORTED_VERSION_1.4",
-        "unsupported_cases": ["unsupported OpenDRIVE version", "ambiguous lane association", "unresolved junction lane linkage", "lane direction override if present but unsupported by file version"],
-        "evidence": ["ASAM_ROAD_RULE_001", "ASAM_DIRECTION_001", "ASAM_LANE_ID_001", "ASAM_REF_001"],
+        "unsupported_cases": ["unsupported OpenDRIVE version", "ambiguous lane association", "unresolved junction lane linkage", "lane direction override if present but unsupported by file version", "non-driving lane", "bidirectional lane"],
+        "evidence": ["ASAM_ROAD_RULE_001", "ASAM_DIRECTION_001", "ASAM_LANE_ID_001", "ASAM_REF_001", "ASAM_JUNCTION_14_001", "ASAM_JUNCTION_17_001", "ASAM_ROAD_LINK_14_001"],
         "observed_road_rule_attribute_counts": road_rule_attribute_counts,
         "observed_effective_road_rule_counts": effective_road_rule_counts,
         "observed_explicit_lane_direction_attribute_count": observed_lane_direction_attribute_count,
         "observed_dynamic_lane_direction_attribute_count": observed_dynamic_lane_direction_count,
         "lane_direction_override_policy": "NOT_PRESENT_IN_RELEASED_1.4_FILES; NEWER_VERSION_FEATURES_NOT_USED",
-        "junction_status": "JUNCTION_EXCLUDED" if legal_direction_status == "PARTIAL" else "NOT_PRESENT_OR_RESOLVED",
+        "junction_status": legal_direction_status,
+        **junction_metrics_total,
+        "lane_type_counts": lane_type_counts_total,
     }
     write_json(args.output_dir / "xodr_coordinate_contract.json", coordinate_contract)
     write_json(args.output_dir / "xodr_legal_direction_contract.json", legal_contract)
@@ -657,8 +1002,10 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
         remaining_blockers.append("XODR_COORDINATE_CONTRACT_NOT_VERIFIED")
     if legal_contract["status"] != "VERIFIED":
         remaining_blockers.append("LEGAL_DIRECTION_CONTRACT_NOT_VERIFIED")
-    if legal_contract["status"] == "PARTIAL":
-        remaining_blockers.append("JUNCTION_LANE_LINK_POLICY_NOT_IMPLEMENTED")
+    if junction_metrics_total["inconsistent_connection_count"]:
+        remaining_blockers.append("JUNCTION_TOPOLOGY_INCONSISTENCY")
+    elif any(junction_metrics_total[key] for key in ("ambiguous_connection_count", "unsupported_connection_count", "ambiguous_lanelink_count", "non_driving_lanelink_count", "bidirectional_excluded_count")):
+        remaining_blockers.append("JUNCTION_MAPPING_HAS_EXPLICIT_FAIL_CLOSED_EXCLUSIONS")
     if legal_contract["status"] == "UNRESOLVED":
         remaining_blockers.append("EFFECTIVE_ROAD_RULE_OR_VERSION_UNRESOLVED")
     if actual_vector_count != expected_vector_count or unique_record_keys != expected_vector_count:
@@ -677,6 +1024,19 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
         "effective_rht_count": effective_road_rule_counts["RHT"],
         "effective_lht_count": effective_road_rule_counts["LHT"],
         "effective_rule_unresolved_count": effective_road_rule_counts["UNRESOLVED"],
+        "lane_type_counts": lane_type_counts_total,
+        "bidirectional_lane_count": lane_type_counts_total.get("bidirectional", 0),
+        "junction_total_count": junction_metrics_total["junction_count"],
+        "connection_total_count": junction_metrics_total["connection_count"],
+        "lane_link_total_count": junction_metrics_total["lane_link_count"],
+        "resolved_connection_count": junction_metrics_total["resolved_connection_count"],
+        "ambiguous_connection_count": junction_metrics_total["ambiguous_connection_count"],
+        "unsupported_connection_count": junction_metrics_total["unsupported_connection_count"],
+        "inconsistent_connection_count": junction_metrics_total["inconsistent_connection_count"],
+        "resolved_lanelink_count": junction_metrics_total["resolved_lanelink_count"],
+        "ambiguous_lanelink_count": junction_metrics_total["ambiguous_lanelink_count"],
+        "non_driving_lanelink_count": junction_metrics_total["non_driving_lanelink_count"],
+        "bidirectional_excluded_count": junction_metrics_total["bidirectional_excluded_count"],
         "xodr_coordinate_contract_status": coordinate_contract["status"],
         "xodr_coordinate_binding_method": coordinate_contract["binding_method"],
         "legal_direction_contract_status": legal_contract["status"],
@@ -713,11 +1073,14 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
         "gt_fitted_transform_used": False,
         "lane_fitted_transform_used": False,
         "heuristic_direction_used": False,
-        "scientific_limitations": ["OpenDRIVE 1.4 missing road/@rule is interpreted as ASAM default RHT for regular roads; junction lane-link/contact-point semantics remain excluded.", "Nearest-lane distances are measured diagnostics. No distance threshold or fitted transform was introduced, so they do not by themselves prove semantic coordinate equivalence."],
+        "gt_direction_inference_used": False,
+        "trajectory_direction_inference_used": False,
+        "heuristic_direction_flip_used": False,
+        "scientific_limitations": ["OpenDRIVE 1.4 missing road/@rule is interpreted as ASAM default RHT for regular roads.", "Junction statuses are derived only from XML topology, exact lane IDs/types, road links, and contactPoint; no trajectory or GT is read.", "Nearest-lane distances are measured diagnostics. No distance threshold or fitted transform was introduced, so they do not by themselves prove semantic coordinate equivalence."],
         "remaining_blockers": remaining_blockers,
-        "recommended_next_step": "Keep ddc_proxy disabled until the coordinate geometry validation has a pre-declared acceptance contract and junction legal-direction semantics are resolved.",
+        "recommended_next_step": "Keep ddc_proxy disabled while coordinate contract is PARTIAL; resolve any reported junction topology exclusions before considering a later scorer-contract round.",
     }
-    write_json(args.output_dir / "ddc_final_v2_summary.json", summary)
+    write_json(args.output_dir / "ddc_junction_final_summary.json", summary)
     return summary
 
 

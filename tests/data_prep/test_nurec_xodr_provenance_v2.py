@@ -6,8 +6,10 @@ import numpy as np
 from scripts.audit_nurec_xodr_provenance_v2 import (
     direction_contract_for_root,
     effective_road_rule,
+    junction_topology_for_root,
     map_to_ncore_transform,
     parse_geo_reference,
+    resolve_lane_default_direction,
     sample_reference_geometry,
 )
 
@@ -22,6 +24,23 @@ def _root(road_rule=None, version="1.4", junction="-1", lane_direction=None):
         f'</planView><lanes><laneSection s="0"><left><lane id="1"{direction}/></left>'
         '<center><lane id="0"/></center><right><lane id="-1"/></right>'
         '</laneSection></lanes></road></OpenDRIVE>'
+    )
+
+
+def _junction_root(contact_point="start", connecting_relation="predecessor", relation_contact="end", lane_type="driving", lane_id="-1"):
+    connecting_lane_id = "-1" if contact_point == "start" else "1"
+    incoming_successor = '<successor elementType="junction" elementId="9"/>'
+    if connecting_relation == "predecessor":
+        connecting_link = f'<predecessor elementType="road" elementId="1" contactPoint="{relation_contact}"/><successor elementType="road" elementId="3" contactPoint="start"/>'
+    else:
+        connecting_link = f'<predecessor elementType="road" elementId="3" contactPoint="end"/><successor elementType="road" elementId="1" contactPoint="{relation_contact}"/>'
+    return ET.fromstring(
+        '<OpenDRIVE><header revMajor="1" revMinor="4"/>'
+        f'<road id="1" junction="-1"><link>{incoming_successor}</link><lanes><laneSection s="0"><right><lane id="{lane_id}" type="driving"/></right></laneSection></lanes></road>'
+        f'<road id="2" junction="9"><link>{connecting_link}</link><lanes><laneSection s="0"><right><lane id="{connecting_lane_id}" type="{lane_type}"/></right></laneSection></lanes></road>'
+        '<road id="3" junction="-1"><lanes><laneSection s="0"><right><lane id="-1" type="driving"/></right></laneSection></lanes></road>'
+        f'<junction id="9"><connection id="0" incomingRoad="1" connectingRoad="2" contactPoint="{contact_point}"><laneLink from="{lane_id}" to="{connecting_lane_id}"/></connection></junction>'
+        '</OpenDRIVE>'
     )
 
 
@@ -62,6 +81,49 @@ class NuRecXodrProvenanceV2Tests(unittest.TestCase):
         self.assertEqual(effective_road_rule("1.4", "LHT"), ("LHT", "ROAD_ATTRIBUTE"))
         self.assertEqual(direction_contract_for_root(_root("RHT"), "1.4")["effective_road_rule"], "RHT")
         self.assertEqual(direction_contract_for_root(_root("LHT"), "1.4")["effective_road_rule"], "LHT")
+
+    def test_lane_default_direction_respects_rht_and_lht(self):
+        self.assertEqual(resolve_lane_default_direction(-1, "RHT", {"driving"}), ("+s", "RESOLVED"))
+        self.assertEqual(resolve_lane_default_direction(1, "RHT", {"driving"}), ("-s", "RESOLVED"))
+        self.assertEqual(resolve_lane_default_direction(-1, "LHT", {"driving"}), ("-s", "RESOLVED"))
+        self.assertEqual(resolve_lane_default_direction(1, "LHT", {"driving"}), ("+s", "RESOLVED"))
+
+    def test_junction_connection_and_lane_link_are_resolved_without_trajectory(self):
+        result = junction_topology_for_root(_junction_root(), "1.4")
+        self.assertEqual(result["metrics"]["connection_count"], 1)
+        self.assertEqual(result["metrics"]["lane_link_count"], 1)
+        self.assertEqual(result["metrics"]["resolved_connection_count"], 1)
+        self.assertEqual(result["lane_link_rows"][0]["mapping_status"], "RESOLVED")
+
+    def test_contact_point_end_reverses_connecting_road_traversal(self):
+        result = junction_topology_for_root(_junction_root(contact_point="end", connecting_relation="successor", relation_contact="start", lane_id="1"), "1.4")
+        self.assertEqual(result["lane_link_rows"][0]["connecting_reference_orientation_role"], "TRAVERSAL_END_TO_START")
+        self.assertEqual(result["metrics"]["resolved_connection_count"], 1)
+
+    def test_invalid_lane_id_and_missing_road_fail_closed(self):
+        invalid_root = _junction_root()
+        lane_link = next(node for node in invalid_root.iter() if node.tag == "laneLink")
+        lane_link.set("from", "99")
+        result = junction_topology_for_root(invalid_root, "1.4")
+        self.assertEqual(result["lane_link_rows"][0]["mapping_status"], "UNSUPPORTED")
+        result = junction_topology_for_root(_junction_root(), "1.4")
+        # Remove the connecting road from the input without changing the
+        # resolver's policy: a referenced road that is absent is unsupported.
+        root = _junction_root()
+        for node in list(root):
+            if node.tag == "road" and node.attrib.get("id") == "2":
+                root.remove(node)
+        result = junction_topology_for_root(root, "1.4")
+        self.assertEqual(result["connection_rows"][0]["connection_parse_status"], "UNSUPPORTED")
+
+    def test_road_link_inconsistency_is_not_repaired(self):
+        root = _junction_root(relation_contact="start")
+        result = junction_topology_for_root(root, "1.4")
+        self.assertEqual(result["connection_rows"][0]["connection_parse_status"], "INCONSISTENT_TOPOLOGY")
+
+    def test_bidirectional_lane_is_excluded(self):
+        result = junction_topology_for_root(_junction_root(lane_type="bidirectional"), "1.4")
+        self.assertEqual(result["lane_link_rows"][0]["mapping_status"], "BIDIRECTIONAL_EXCLUDED")
 
     def test_lane_id_and_reference_line_are_recorded_without_independent_direction_claim(self):
         contract = direction_contract_for_root(_root(), "1.4")
