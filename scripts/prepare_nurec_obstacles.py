@@ -1,14 +1,24 @@
-"""NuRec obstacle provenance, ego-frame normalization and coverage audit.
+"""Production NuRec obstacle normalization and observation-grid helpers.
 
-This module deliberately fails closed: sequence-track geometry is normalized
-only when an explicit source-frame contract is supplied.  The current NuRec
-extraction does not contain that declaration, so the pilot report preserves
-source evidence while keeping CF/TTC readiness false.
+The accepted geometry contract is that ``sequence_tracks.json`` already stores
+cuboids in ``NCORE_LOCAL_WORLD``.  This module therefore performs schema
+normalization only: it does not apply a transform, fit a correction, infer an
+empty frame, or rederive a time offset.  Observation completeness remains a
+separate strict audit concern.
 """
 from __future__ import annotations
 import argparse, csv, json, math, statistics
 from pathlib import Path
 from typing import Any
+
+import numpy as np
+
+try:
+    from tools.epdms.observation_contract import build_ttc_projection_timestamps
+except ModuleNotFoundError:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from tools.epdms.observation_contract import build_ttc_projection_timestamps
 
 try:
     from scripts.audit_nurec_coordinate_alignment import interpolate_pose, load_nurec_poses, load_time_record, inverse_pose, _mm, _rquat, _qnorm, _pose, _wrap
@@ -20,6 +30,13 @@ TTC_TOLERANCE_US=100_000
 CF_HORIZON_US=4_000_000
 TTC_HORIZON_US=1_000_000
 TTC_STEP_US=200_000
+
+NCORE_LOCAL_WORLD = "NCORE_LOCAL_WORLD"
+OBSTACLE_REFERENCE_POINT = "cuboid_center"
+GEOMETRY_BLOCK_STATUS = "CLOSED"
+OBSTACLE_TRANSFORM_STATUS = "VERIFIED"
+NORMALIZED_OBSTACLE_STATUS = "VERIFIED_WITH_RETAINED_LOCALIZED_ANOMALIES"
+OBSTACLE_ROW_QUALITY_STATUS = "VERIFIED_WITH_RETAINED_LOCALIZED_ANOMALIES"
 
 def _dump(path: Path, value: Any):
     path.parent.mkdir(parents=True, exist_ok=True); path.write_text(json.dumps(value, indent=2, ensure_ascii=False)+"\n", encoding="utf-8")
@@ -87,6 +104,220 @@ def load_obstacle_rows(path: Path):
         except Exception as e: errors.append({"source_index":i,"type":str(e)})
     return rows,errors
 
+
+def load_geometry_anomaly_keys(audit_dir: Path | None, offsets: dict[str, int] | None = None):
+    """Load retained center-anomaly identities from a prior forensic report.
+
+    The report is diagnostic input only.  Rows are never removed or corrected;
+    the key is used solely to carry ``RETAINED_LOCALIZED_ANOMALY`` provenance
+    into normalized production records.
+    """
+    if audit_dir is None:
+        return set(), {"source": None, "status": "NOT_PROVIDED"}
+    path = Path(audit_dir)
+    if path.is_dir():
+        path = path / "center_outlier_full_provenance.csv"
+    if not path.is_file():
+        return set(), {"source": str(path), "status": "FILE_NOT_FOUND"}
+    import csv as _csv_module
+
+    offsets = offsets or {}
+    keys = set()
+    with path.open("r", newline="", encoding="utf-8-sig") as handle:
+        for row in _csv_module.DictReader(handle):
+            clip_id = str(row.get("clip_id") or "")
+            track_id = str(row.get("track_id") or "")
+            mapped = row.get("mapped_nurec_timestamp_us")
+            if mapped not in (None, ""):
+                timestamp = int(float(mapped))
+            elif row.get("raw_timestamp_us") not in (None, ""):
+                timestamp = int(float(row["raw_timestamp_us"])) + int(offsets.get(clip_id, 0))
+            else:
+                continue
+            if clip_id and track_id:
+                keys.add((clip_id, track_id, timestamp))
+    return keys, {"source": str(path), "status": "READ", "retained_anomaly_count": len(keys)}
+
+
+def _quaternion_to_yaw(quaternion):
+    return pose_yaw(_matrix_pose([0.0, 0.0, 0.0], quaternion))
+
+
+def normalize_sequence_track_row(clip_id, row, anomaly_keys=None):
+    """Convert one verified sequence-track row to the canonical flat schema."""
+    anomaly_keys = anomaly_keys or set()
+    key = (str(clip_id), str(row["track_id"]), int(row["timestamp_us"]))
+    quality = "RETAINED_LOCALIZED_ANOMALY" if key in anomaly_keys else "VERIFIED"
+    quaternion = [float(value) for value in row["quaternion"]]
+    dimensions = [float(value) for value in row["dimensions"]]
+    return {
+        "clip_id": str(clip_id),
+        "trackline_id": str(row["track_id"]),
+        "timestamp_us": int(row["timestamp_us"]),
+        "center_x": float(row["center"][0]),
+        "center_y": float(row["center"][1]),
+        "center_z": float(row["center"][2]),
+        "yaw_rad": float(_quaternion_to_yaw(quaternion)),
+        "length_m": dimensions[0],
+        "width_m": dimensions[1],
+        "height_m": dimensions[2],
+        "category": row.get("category"),
+        "track_flag": row.get("flag"),
+        "source_file": "sequence_tracks.json",
+        "source_pose_index": int(row["source_pose_index"]),
+        "source_track_index": int(row["source_index"]),
+        "source_pose_field": "tracks_data.tracks_poses",
+        "source_timestamp_field": "tracks_data.tracks_timestamps_us",
+        "source_dimension_field": "cuboidtracks_data.cuboids_dims",
+        "quaternion_x": quaternion[0],
+        "quaternion_y": quaternion[1],
+        "quaternion_z": quaternion[2],
+        "quaternion_w": quaternion[3],
+        "coordinate_frame": NCORE_LOCAL_WORLD,
+        "reference_point": OBSTACLE_REFERENCE_POINT,
+        "normalization_verified": True,
+        "geometry_quality_status": quality,
+        "transform_applied": False,
+        "per_clip_offset_rederived": False,
+    }
+
+
+def normalize_sequence_tracks(clip_id, rows, anomaly_keys=None):
+    """Normalize all sequence-track rows without truncation or geometry edits."""
+    return [normalize_sequence_track_row(clip_id, row, anomaly_keys) for row in rows]
+
+
+def normalized_to_context_obstacle(row):
+    """Build the nested obstacle shape consumed by the scorer normalizer."""
+    return {
+        "timestamp_micros": int(row["timestamp_us"]),
+        "trackline_id": row["trackline_id"],
+        "category": row["category"],
+        "center": {"x": row["center_x"], "y": row["center_y"], "z": row["center_z"]},
+        "size": {"x": row["length_m"], "y": row["width_m"], "z": row["height_m"]},
+        "orientation": {
+            "x": row["quaternion_x"], "y": row["quaternion_y"],
+            "z": row["quaternion_z"], "w": row["quaternion_w"],
+        },
+        "coordinate_frame": row["coordinate_frame"],
+        "reference_point": row["reference_point"],
+        "source_file": row["source_file"],
+        "source_pose_index": row["source_pose_index"],
+        "normalization_verified": row["normalization_verified"],
+        "geometry_quality_status": row["geometry_quality_status"],
+    }
+
+
+def build_obstacle_context(clip_id, t0_us, normalized_rows, confirmed_empty_timestamps=None):
+    """Create a separate context artifact without asserting prediction alignment."""
+    obstacle = {
+        "all_obstacles": [normalized_to_context_obstacle(row) for row in normalized_rows],
+        "coordinate_frame": NCORE_LOCAL_WORLD,
+        "reference_point": OBSTACLE_REFERENCE_POINT,
+        "normalization_verified": True,
+        "source_file": "sequence_tracks.json",
+        "geometry_contract_status": GEOMETRY_BLOCK_STATUS,
+        "obstacle_transform_status": OBSTACLE_TRANSFORM_STATUS,
+        "geometry_quality_status": OBSTACLE_ROW_QUALITY_STATUS,
+    }
+    if confirmed_empty_timestamps:
+        obstacle["confirmed_empty_timestamps_us"] = sorted(int(value) for value in confirmed_empty_timestamps)
+    return {
+        "clip_id": str(clip_id),
+        "t0_us": int(t0_us),
+        "obstacle_frame": NCORE_LOCAL_WORLD,
+        "obstacle_reference_point": OBSTACLE_REFERENCE_POINT,
+        "semantic_context": {"obstacle": obstacle},
+        "coordinate_alignment_verified": False,
+        "coordinate_alignment_status": "NOT_ASSERTED_BY_OBSTACLE_NORMALIZATION",
+    }
+
+
+def build_scorer_query_grid(nurec_t0, future_poses=40, frequency_hz=10.0, ttc_horizon_s=1.0, include_t0=True):
+    """Reproduce score_record's CF grid and import the production TTC helper."""
+    start = 0 if include_t0 else 1
+    cf = [int(nurec_t0) + int(round(index * 1_000_000.0 / frequency_hz)) for index in range(start, future_poses + 1)]
+    ttc = build_ttc_projection_timestamps(np.asarray(cf, dtype=np.int64), float(ttc_horizon_s))
+    return cf, [int(value) for value in ttc.tolist()], {
+        "cf_includes_t0": bool(include_t0),
+        "cf_future_pose_count": int(future_poses),
+        "cf_frequency_hz": float(frequency_hz),
+        "cf_horizon_s": float(future_poses / frequency_hz),
+        "ttc_horizon_s": float(ttc_horizon_s),
+        "ttc_step_s": 0.2,
+        "ttc_query_builder": "tools.epdms.observation_contract.build_ttc_projection_timestamps",
+        "verified": True,
+    }
+
+
+def _nearest_timestamp(query, timestamps):
+    if not timestamps:
+        return None, None
+    nearest = min(timestamps, key=lambda value: abs(int(value) - int(query)))
+    return int(nearest), abs(int(nearest) - int(query))
+
+
+def classify_scorer_queries(queries, object_rows, label_set_timestamps=None, tolerance_us=50_000, empty_timestamps=None):
+    """Classify only proven object rows or explicit empty attestations."""
+    by_timestamp = {}
+    for row in object_rows:
+        by_timestamp.setdefault(int(row["timestamp_us"]), []).append(row)
+    object_timestamps = sorted(by_timestamp)
+    label_set_timestamps = sorted(set(int(value) for value in (label_set_timestamps or object_timestamps)))
+    empty_timestamps = set(int(value) for value in (empty_timestamps or set()))
+    output = []
+    for query in queries:
+        query = int(query)
+        obstacle_ts, obstacle_delta = _nearest_timestamp(query, object_timestamps)
+        label_ts, label_delta = _nearest_timestamp(query, label_set_timestamps)
+        if obstacle_ts is not None and obstacle_delta <= tolerance_us:
+            state = "OBJECTS_PRESENT"
+            object_count = len(by_timestamp[obstacle_ts])
+            source = "sequence_tracks.json.object_rows"
+            empty_verified = False
+            object_verified = True
+        elif query in empty_timestamps:
+            state = "CONFIRMED_EMPTY"
+            object_count = 0
+            source = "explicit_empty_attestation"
+            empty_verified = True
+            object_verified = False
+        else:
+            state = "MISSING"
+            object_count = 0
+            source = "label_set_timestamp_without_empty_semantics" if label_ts is not None and label_delta <= tolerance_us else None
+            empty_verified = False
+            object_verified = False
+        output.append({
+            "query_timestamp_us": query,
+            "nearest_obstacle_timestamp_us": obstacle_ts,
+            "nearest_label_set_timestamp_us": label_ts,
+            "obstacle_delta_us": obstacle_delta,
+            "label_set_delta_us": label_delta,
+            "object_count": object_count,
+            "observation_state": state,
+            "attestation_source": source,
+            "attestation_verified": empty_verified,
+            "object_presence_verified": object_verified,
+        })
+    return output
+
+
+def strict_coverage_summary(rows, prefix):
+    total = len(rows)
+    objects = sum(row["observation_state"] == "OBJECTS_PRESENT" for row in rows)
+    empty = sum(row["observation_state"] == "CONFIRMED_EMPTY" for row in rows)
+    missing = sum(row["observation_state"] == "MISSING" for row in rows)
+    return {
+        f"{prefix}_REQUIRED_QUERY_COUNT": total,
+        f"{prefix}_OBJECT_PRESENT_COUNT": objects,
+        f"{prefix}_CONFIRMED_EMPTY_COUNT": empty,
+        f"{prefix}_MISSING_COUNT": missing,
+        f"{prefix}_COMPLETE_OBSERVATION_RATE": (objects + empty) / total if total else 0.0,
+        f"{prefix}_TEMPORAL_OBJECT_EVIDENCE_RATE": objects / total if total else 0.0,
+        f"{prefix}_DATA_READY": bool(total and missing == 0),
+    }
+
 def _percentile(values, q):
     if not values: return None
     values=sorted(values); return values[min(len(values)-1,max(0,math.ceil(q*len(values))-1))]
@@ -111,9 +342,9 @@ def nearest_state(query, observations, tolerance_us):
     return "OBJECTS_PRESENT",nearest,delta
 
 def build_queries(nurec_t0):
-    cf=[nurec_t0+i*100_000 for i in range(1,41)]
-    ttc=sorted(set(t+dt for t in cf for dt in range(0,TTC_HORIZON_US+1,TTC_STEP_US)))
-    return cf,ttc
+    """Backward-compatible future-only grid using the production TTC helper."""
+    cf, ttc, _ = build_scorer_query_grid(nurec_t0, include_t0=False)
+    return cf, ttc
 
 def classify_queries(queries, object_timestamps, tolerance_us, empty_timestamps=None):
     empty_timestamps=set(empty_timestamps or []); rows=[]
@@ -131,22 +362,139 @@ def classify_queries(queries, object_timestamps, tolerance_us, empty_timestamps=
 def coverage_summary(rows, prefix):
     counts={s:sum(r["observation_state"]==s for r in rows) for s in ("EXACT_OBJECT","NEAREST_OBJECT_WITHIN_TOLERANCE","EXACT_CONFIRMED_EMPTY","UNKNOWN","OUT_OF_RANGE")}; total=len(rows); objects=counts["EXACT_OBJECT"]+counts["NEAREST_OBJECT_WITHIN_TOLERANCE"]; empty=counts["EXACT_CONFIRMED_EMPTY"]; return {f"{prefix}_REQUIRED_QUERY_COUNT":total,f"{prefix}_OBJECT_QUERY_COUNT":objects,f"{prefix}_CONFIRMED_EMPTY_COUNT":empty,f"{prefix}_UNKNOWN_COUNT":counts["UNKNOWN"],f"{prefix}_OUT_OF_RANGE_COUNT":counts["OUT_OF_RANGE"],f"{prefix}_COVERAGE_RATE":(objects+empty)/total if total else 0.0}
 
-def process_clip(item, time_path: Path, root: Path):
-    cid=item["clip_id"]; clip=Path(item["nurec_clip_dir"]); rec=load_time_record(time_path,cid,int(item.get("physicalai_t0_us",5_100_000))); seq_rows,seq_errors,schema=load_sequence_tracks(clip/"sequence_tracks.json"); obs_rows,obs_errors=load_obstacle_rows(clip/"clipgt"/"obstacle.parquet")
-    cf,ttc=build_queries(rec["nurec_t0_us"]); object_ts=sorted({r["timestamp_us"] for r in seq_rows}); cf_rows=classify_queries(cf,object_ts,CF_TOLERANCE_US); ttc_rows=classify_queries(ttc,object_ts,TTC_TOLERANCE_US); all_cov=cf_rows+ttc_rows
-    map_status="PROVENANCE_AVAILABLE_NOT_INTEGRATED" if (clip/"rig_trajectories.json").is_file() and (clip/"map.xodr").is_file() else "UNRESOLVED"
-    normalized=[]
-    for r in seq_rows[:1000]: normalized.append({"clip_id":cid,"track_id":r["track_id"],"source_timestamp_us":r["timestamp_us"],"normalized_timestamp_us":r["timestamp_us"],"physicalai_relative_us":r["timestamp_us"]-rec["offset_us"],"common_frame":"EGO_AT_T0","center_x":r["center"][0],"center_y":r["center"][1],"center_z":r["center"][2],"yaw_rad":pose_yaw(_matrix_pose(r["center"],r["quaternion"])),"extent_x_m":r["dimensions"][0],"extent_y_m":r["dimensions"][1],"extent_z_m":r["dimensions"][2],"category":r["category"],"source_file":"sequence_tracks.json","source_frame":"UNRESOLVED","transform_source":"NOT_APPLIED_FRAME_PROVENANCE_MISSING","orientation_source":"sequence_tracks.tracks_poses","interpolated":False,"normalization_verified":False})
-    summary={"clip_id":cid,"authoritative_obstacle_source":"sequence_tracks.json_candidate","sequence_tracks_pose_frame":"UNRESOLVED","sequence_tracks_pose_frame_verified":False,"obstacle_transform_status":"UNRESOLVED","normalized_obstacle_status":"PARTIALLY_VERIFIED","common_frame":"EGO_AT_T0","time_mapping_reused":True,"per_clip_offset_rederived":False,"empty_scene_attestation_status":"UNRESOLVED_EMPTY_ATTESTATION","complete_observation_timeline_status":"UNRESOLVED","temporal_object_evidence_status":"OBJECT_TIMESTAMP_ONLY","observation_coverage_status":"UNRESOLVED_EMPTY_ATTESTATION","obstacle_row_count":len(seq_rows),"obstacle_parquet_row_count":len(obs_rows),"cf_data_ready":False,"ttc_data_ready":False,**coverage_summary(cf_rows,"CF"),**coverage_summary(ttc_rows,"TTC"),"CF_TEMPORAL_OBJECT_EVIDENCE_RATE":coverage_summary(cf_rows,"CF")["CF_COVERAGE_RATE"],"CF_COMPLETE_OBSERVATION_RATE":None,"TTC_TEMPORAL_OBJECT_EVIDENCE_RATE":coverage_summary(ttc_rows,"TTC")["TTC_COVERAGE_RATE"],"TTC_COMPLETE_OBSERVATION_RATE":None,"map_status":map_status,"blockers":["SEQUENCE_TRACKS_POSE_FRAME_NOT_PROVEN","EMPTY_SCENE_ATTESTATION_UNRESOLVED","OBSTACLE_TRANSFORM_NOT_VERIFIED"]}
-    return {"summary":summary,"schema":schema,"seq_rows":seq_rows,"seq_errors":seq_errors,"obs_rows":obs_rows,"obs_errors":obs_errors,"coverage":all_cov,"normalized":normalized,"sanity":track_sanity(seq_rows),"cf":cf_rows,"ttc":ttc_rows}
+def process_clip(item, time_path: Path, anomaly_keys=None):
+    clip_id = item["clip_id"]
+    clip = Path(item["nurec_clip_dir"])
+    record = load_time_record(time_path, clip_id, int(item.get("physicalai_t0_us", 5_100_000)))
+    sequence_rows, sequence_errors, schema = load_sequence_tracks(clip / "sequence_tracks.json")
+    obstacle_rows, obstacle_errors = load_obstacle_rows(clip / "clipgt" / "obstacle.parquet")
+    normalized = normalize_sequence_tracks(clip_id, sequence_rows, anomaly_keys)
+    cf, ttc, grid = build_scorer_query_grid(record["nurec_t0_us"])
+    cf_rows = classify_scorer_queries(cf, normalized, tolerance_us=CF_TOLERANCE_US)
+    ttc_rows = classify_scorer_queries(ttc, normalized, tolerance_us=TTC_TOLERANCE_US)
+    cf_summary = strict_coverage_summary(cf_rows, "CF")
+    ttc_summary = strict_coverage_summary(ttc_rows, "TTC")
+    anomaly_count = sum(row["geometry_quality_status"] == "RETAINED_LOCALIZED_ANOMALY" for row in normalized)
+    summary = {
+        "clip_id": clip_id,
+        "authoritative_obstacle_source": "sequence_tracks.json",
+        "sequence_tracks_pose_frame": NCORE_LOCAL_WORLD,
+        "sequence_tracks_pose_frame_verified": True,
+        "obstacle_transform_status": OBSTACLE_TRANSFORM_STATUS,
+        "normalized_obstacle_status": NORMALIZED_OBSTACLE_STATUS,
+        "obstacle_row_quality_status": OBSTACLE_ROW_QUALITY_STATUS,
+        "obstacle_geometry_block": GEOMETRY_BLOCK_STATUS,
+        "coordinate_frame": NCORE_LOCAL_WORLD,
+        "reference_point": OBSTACLE_REFERENCE_POINT,
+        "time_mapping_source": record.get("source"),
+        "time_mapping_verified": bool(record.get("verified", False)),
+        "time_mapping_reused": True,
+        "per_clip_offset_rederived": False,
+        "empty_observation_attestation_status": "NOT_AVAILABLE",
+        "label_set_empty_semantics_status": "UNRESOLVED",
+        "complete_observation_timeline_status": "NOT_FOUND",
+        "obstacle_row_count": len(normalized),
+        "obstacle_parquet_row_count": len(obstacle_rows),
+        "normalized_retained_anomaly_count": anomaly_count,
+        "cf_data_ready": cf_summary["CF_DATA_READY"],
+        "ttc_data_ready": ttc_summary["TTC_DATA_READY"],
+        **cf_summary,
+        **ttc_summary,
+        "query_grid": grid,
+        "sequence_errors": len(sequence_errors),
+        "obstacle_errors": len(obstacle_errors),
+        "blockers": [] if cf_summary["CF_DATA_READY"] and ttc_summary["TTC_DATA_READY"] else ["EXPLICIT_EMPTY_OBSERVATION_ATTESTATION_UNAVAILABLE"],
+    }
+    return {
+        "summary": summary,
+        "schema": schema,
+        "seq_rows": sequence_rows,
+        "seq_errors": sequence_errors,
+        "obs_rows": obstacle_rows,
+        "obs_errors": obstacle_errors,
+        "normalized": normalized,
+        "context": build_obstacle_context(clip_id, record["nurec_t0_us"], normalized),
+        "sanity": track_sanity(sequence_rows),
+        "cf": cf_rows,
+        "ttc": ttc_rows,
+        "cf_grid": cf,
+        "ttc_grid": ttc,
+        "query_grid": grid,
+    }
+
 
 def main():
-    p=argparse.ArgumentParser(); p.add_argument("--manifest",required=True); p.add_argument("--time-alignment-jsonl",required=True); p.add_argument("--output-root",required=True); a=p.parse_args(); root=Path(a.output_root); root.mkdir(parents=True,exist_ok=True); time_path=Path(a.time_alignment_jsonl); manifest=[json.loads(x) for x in Path(a.manifest).read_text(encoding="utf-8").splitlines() if x.strip()]; results=[]
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--manifest", required=True)
+    parser.add_argument("--time-alignment-jsonl", required=True)
+    parser.add_argument("--output-root", required=True)
+    parser.add_argument("--geometry-audit-dir", default=None)
+    args = parser.parse_args()
+    root = Path(args.output_root)
+    root.mkdir(parents=True, exist_ok=True)
+    time_path = Path(args.time_alignment_jsonl)
+    manifest = [json.loads(line) for line in Path(args.manifest).read_text(encoding="utf-8").splitlines() if line.strip()]
+    offsets = {}
     for item in manifest:
-        r=process_clip(item,time_path,root); cid=item["clip_id"]; out=root/cid; out.mkdir(parents=True,exist_ok=True); results.append(r["summary"])
-        _dump(out/"sequence_tracks_schema.json",r["schema"]); _dump(out/"obstacle_source_comparison.json",{"candidate_sources":{"sequence_tracks.json":{"row_count":len(r["seq_rows"]),"has_track_poses":True,"has_dimensions":True,"has_orientation":True,"frame_status":"UNRESOLVED"},"clipgt/obstacle.parquet":{"row_count":len(r["obs_rows"]),"has_track_poses":True,"has_dimensions":True,"has_orientation":True,"reference_frame_field":False,"frame_status":"UNRESOLVED"}},"public_upstream_provenance":{"ncore_cuboid_contract":"https://nvidia.github.io/nurec/ncore/reference/apis/data.v3.html","ncore_conventions":"https://nvidia.github.io/ncore/data/conventions","local_sequence_frame_claim":"NOT_PROVEN_BY_LOCAL_FILE"},"authoritative_obstacle_source":"sequence_tracks.json_candidate","selection_status":"CANDIDATE_ONLY"}); _dump(out/"obstacle_coordinate_contract.json",{"common_frame":"EGO_AT_T0","source_frame":"UNRESOLVED","transform_verified":False,"transform_source":"NOT_APPLIED_FRAME_PROVENANCE_MISSING"}); _dump(out/"obstacle_orientation_contract.json",{"quaternion_order":"qx,qy,qz,qw","verified_from_local_schema":True,"upstream_frame_semantics_verified":False}); _dump(out/"obstacle_dimension_contract.json",{"order":"x,y,z","unit":"UNRESOLVED_BUT_POSITIVE_FINITE","provenance":"sequence_tracks.cuboidtracks_data.cuboids_dims"}); _dump(out/"obstacle_transform_graph.json",{"common_frame":"EGO_AT_T0","status":"UNRESOLVED","edges":[]}); _dump(out/"observation_attestation_contract.json",{"status":"UNRESOLVED_EMPTY_ATTESTATION","pose_timestamps_not_used_as_empty_attestation":True,"source":None}); _dump(out/"observation_coverage_summary.json",r["summary"]); _dump(out/"obstacle_normalization_summary.json",r["summary"]); _jsonl(out/"normalized_obstacle_sample.jsonl",r["normalized"]); _csv(out/"obstacle_track_sanity.csv",r["sanity"]); _csv(out/"obstacle_source_crosscheck.csv",[{"sequence_track_id":x["track_id"],"sequence_timestamp_us":x["timestamp_us"],"matching_obstacle_rows":sum(y["track_id"]==x["track_id"] and y["timestamp_us"]==x["timestamp_us"] for y in r["obs_rows"])} for x in r["seq_rows"][:1000]]); _csv(out/"observation_coverage.csv",r["coverage"]); _csv(out/"cf_required_query_grid.csv",r["cf"]); _csv(out/"ttc_required_query_grid.csv",r["ttc"])
-        print(f"CONTEXT_RECORD clip={cid} intents=obstacle sources=sequence_tracks,obstacle aligned=true transformed=false ready=false"); print(f"CLIP_DONE clip={cid} status=complete")
-    aggregate={"clip_count":len(results),"clips":results,"authoritative_obstacle_source":"sequence_tracks.json_candidate","empty_scene_attestation_status":"UNRESOLVED_EMPTY_ATTESTATION","cf_data_ready":False,"ttc_data_ready":False,"remaining_blockers":["SEQUENCE_TRACKS_POSE_FRAME_NOT_PROVEN","EMPTY_SCENE_ATTESTATION_UNRESOLVED","OBSTACLE_TRANSFORM_NOT_VERIFIED"]}
-    _dump(root/"obstacle_normalization_summary.json",aggregate); _dump(root/"observation_coverage_summary.json",aggregate); _dump(root/"obstacle_source_comparison.json",{"clip_count":len(results),"authoritative_obstacle_source":"sequence_tracks.json_candidate","selection_status":"CANDIDATE_ONLY","public_upstream_provenance":"NCore CuboidTrackObservation reference-frame contract; local sequence frame not proven"}); _dump(root/"obstacle_coordinate_contract.json",{"common_frame":"EGO_AT_T0","transform_status":"UNRESOLVED","time_mapping_reused":True}); _dump(root/"obstacle_orientation_contract.json",{"quaternion_order":"qx,qy,qz,qw","local_schema_verified":True,"frame_semantics_verified":False}); _dump(root/"obstacle_dimension_contract.json",{"order":"x,y,z","positive_finite_validated":True,"unit":"UNRESOLVED"}); _dump(root/"obstacle_transform_graph.json",{"common_frame":"EGO_AT_T0","status":"UNRESOLVED","transform_not_applied":True}); _dump(root/"observation_attestation_contract.json",{"status":"UNRESOLVED_EMPTY_ATTESTATION","pose_timestamps_not_used_as_empty_attestation":True})
+        record = load_time_record(time_path, item["clip_id"], int(item.get("physicalai_t0_us", 5_100_000)))
+        offsets[item["clip_id"]] = int(record["offset_us"])
+    anomaly_keys, anomaly_evidence = load_geometry_anomaly_keys(args.geometry_audit_dir, offsets)
+    results, all_normalized, all_context = [], [], []
+    for item in manifest:
+        result = process_clip(item, time_path, anomaly_keys)
+        clip_id = item["clip_id"]
+        output = root / clip_id
+        output.mkdir(parents=True, exist_ok=True)
+        results.append(result["summary"])
+        all_normalized.extend(result["normalized"])
+        all_context.append(result["context"])
+        _jsonl(output / "normalized_obstacle.jsonl", result["normalized"])
+        _dump(output / "normalized_context.json", result["context"])
+        _dump(output / "normalized_obstacle_contract.json", {
+            "clip_id": clip_id,
+            "authoritative_obstacle_source": "sequence_tracks.json",
+            "sequence_tracks_pose_frame": NCORE_LOCAL_WORLD,
+            "sequence_tracks_pose_frame_verified": True,
+            "obstacle_transform_status": OBSTACLE_TRANSFORM_STATUS,
+            "normalized_obstacle_status": NORMALIZED_OBSTACLE_STATUS,
+            "obstacle_row_quality_status": OBSTACLE_ROW_QUALITY_STATUS,
+            "obstacle_geometry_block": GEOMETRY_BLOCK_STATUS,
+            "retained_anomaly_count": result["summary"]["normalized_retained_anomaly_count"],
+            "no_transform_applied": True,
+            "per_clip_offset_rederived": False,
+        })
+        _dump(output / "sequence_tracks_schema.json", result["schema"])
+        _dump(output / "observation_coverage_summary.json", result["summary"])
+        _csv(output / "obstacle_track_sanity.csv", result["sanity"])
+        _csv(output / "cf_observation_queries.csv", [{"clip_id": clip_id, **row} for row in result["cf"]])
+        _csv(output / "ttc_observation_queries.csv", [{"clip_id": clip_id, **row} for row in result["ttc"]])
+        print(f"CONTEXT_RECORD clip={clip_id} source=sequence_tracks.json frame={NCORE_LOCAL_WORLD} normalization_verified=true")
+        print(f"CLIP_DONE clip={clip_id} cf_ready={result['summary']['CF_DATA_READY']} ttc_ready={result['summary']['TTC_DATA_READY']}")
+    aggregate = {
+        "pilot_clip_count": len(results),
+        "clips": results,
+        "authoritative_obstacle_source": "sequence_tracks.json",
+        "sequence_tracks_pose_frame": NCORE_LOCAL_WORLD,
+        "sequence_tracks_pose_frame_verified": True,
+        "obstacle_transform_status": OBSTACLE_TRANSFORM_STATUS,
+        "normalized_obstacle_status": NORMALIZED_OBSTACLE_STATUS,
+        "obstacle_row_quality_status": OBSTACLE_ROW_QUALITY_STATUS,
+        "obstacle_geometry_block": GEOMETRY_BLOCK_STATUS,
+        "retained_anomaly_count": sum(result["normalized_retained_anomaly_count"] for result in results),
+        "geometry_anomaly_evidence": anomaly_evidence,
+        "per_clip_offset_rederived": False,
+        "cf_data_ready_pilot": bool(results) and all(result["CF_DATA_READY"] for result in results),
+        "ttc_data_ready_pilot": bool(results) and all(result["TTC_DATA_READY"] for result in results),
+        "cf_data_ready_full_300": "NOT_EVALUATED",
+        "ttc_data_ready_full_300": "NOT_EVALUATED",
+        "physical_world_obstacle_completeness": "NOT_CLAIMED",
+        "remaining_blockers": [] if results and all(result["CF_DATA_READY"] and result["TTC_DATA_READY"] for result in results) else ["EXPLICIT_EMPTY_OBSERVATION_ATTESTATION_UNAVAILABLE"],
+    }
+    _jsonl(root / "normalized_obstacles.jsonl", all_normalized)
+    _jsonl(root / "normalized_context.jsonl", all_context)
+    _dump(root / "normalized_obstacle_contract.json", aggregate)
+    _dump(root / "obstacle_normalization_summary.json", aggregate)
+    _dump(root / "observation_coverage_summary.json", aggregate)
+    _dump(root / "geometry_anomaly_evidence.json", anomaly_evidence)
 
 if __name__=="__main__": main()

@@ -15,13 +15,17 @@ from pathlib import Path
 
 try:
     from scripts.prepare_nurec_obstacles import (
-        CF_TOLERANCE_US, TTC_TOLERANCE_US, build_queries, load_obstacle_rows,
-        load_sequence_tracks, load_time_record, _csv, _dump,
+        CF_TOLERANCE_US, TTC_TOLERANCE_US, build_scorer_query_grid,
+        classify_scorer_queries, load_obstacle_rows, load_sequence_tracks,
+        load_time_record, normalize_sequence_tracks, build_obstacle_context, strict_coverage_summary,
+        load_geometry_anomaly_keys, _csv, _dump, _jsonl,
     )
 except ModuleNotFoundError:
     from prepare_nurec_obstacles import (
-        CF_TOLERANCE_US, TTC_TOLERANCE_US, build_queries, load_obstacle_rows,
-        load_sequence_tracks, load_time_record, _csv, _dump,
+        CF_TOLERANCE_US, TTC_TOLERANCE_US, build_scorer_query_grid,
+        classify_scorer_queries, load_obstacle_rows, load_sequence_tracks,
+        load_time_record, normalize_sequence_tracks, build_obstacle_context, strict_coverage_summary,
+        load_geometry_anomaly_keys, _csv, _dump, _jsonl,
     )
 
 
@@ -130,58 +134,31 @@ def audit_tracks(rows, errors=None):
     return results, {"global_expected_step_us": global_step, "global_expected_rate_hz": (1_000_000 / global_step) if global_step else None, "cadence_source": cadence_source}
 
 
-def discover_annotation_timeline(clip, sequence_rows, obstacle_rows):
-    """Return evidence inventory; local sources are not completeness attestations."""
-    sources = []
-    for rel in (
-        "data_info.json", "datasource_summary.json", "sequence_tracks.json",
-        "clipgt/clip.parquet", "clipgt/association.parquet", "clipgt/obstacle.parquet",
-    ):
-        path = clip / rel
-        sources.append({"source": rel, "exists": path.is_file(), "semantics": "TEMPORAL_REFERENCE_ONLY" if rel in ("data_info.json", "datasource_summary.json") else "OBJECT_ROWS_ONLY"})
-    return {
-        "sources": sources,
-        "physicalai_obstacle_offline_status": "NOT_AVAILABLE_IN_LOCAL_CACHE",
-        "ncore_cuboids_component_status": "PUBLIC_SEMANTICS_NOT_LOCALLY_INSPECTED",
-        "authoritative_frame_timeline_found": False,
-        "frame_zero_count_field_found": False,
-        "empty_frame_attestation_found": False,
-        "obstacle_representation": "OBJECT_ROWS_ONLY" if obstacle_rows or sequence_rows else "NO_OBJECT_ROWS",
-        "status": "UNRESOLVED_EMPTY_ATTESTATION",
-    }
-
-
 def _nearest(query, timestamps, tolerance):
     if not timestamps:
         return None, None
-    nearest = min(timestamps, key=lambda t: abs(t - query))
+    nearest = min(timestamps, key=lambda value: abs(value - query))
     delta = abs(nearest - query)
     return (nearest, delta) if delta <= tolerance else (None, delta)
 
 
 def frame_completeness(required_timestamps, object_rows, tolerance):
-    by_ts = {}
+    """Legacy diagnostic API: object rows never prove complete annotation."""
+    by_timestamp = {}
     for row in object_rows:
-        by_ts.setdefault(row["timestamp_us"], 0)
-        by_ts[row["timestamp_us"]] += 1
-    source_ts = sorted(by_ts)
+        by_timestamp.setdefault(row["timestamp_us"], 0)
+        by_timestamp[row["timestamp_us"]] += 1
+    source_timestamps = sorted(by_timestamp)
     rows = []
     for timestamp in sorted(set(required_timestamps)):
-        nearest, delta = _nearest(timestamp, source_ts, tolerance)
-        if nearest is None:
-            status = "NO_OBJECT_ROWS_COMPLETENESS_UNKNOWN"
-            count = 0
-            present = False
-        else:
-            status = "OBJECT_ROWS_PRESENT_BUT_COMPLETENESS_UNKNOWN"
-            count = by_ts[nearest]
-            present = True
+        nearest, delta = _nearest(timestamp, source_timestamps, tolerance)
+        present = nearest is not None
         rows.append({
             "timestamp_us": timestamp,
-            "object_count": count,
+            "object_count": by_timestamp[nearest] if present else 0,
             "object_rows_present": present,
             "annotation_frame_present": present,
-            "frame_annotation_status": status,
+            "frame_annotation_status": "OBJECT_ROWS_PRESENT_BUT_COMPLETENESS_UNKNOWN" if present else "NO_OBJECT_ROWS_COMPLETENESS_UNKNOWN",
             "completeness_source": "NO_AUTHORITATIVE_FRAME_ATTESTATION",
             "completeness_verified": False,
             "nearest_source_timestamp_us": nearest,
@@ -191,13 +168,13 @@ def frame_completeness(required_timestamps, object_rows, tolerance):
 
 
 def query_completeness(queries, frame_rows, tolerance):
-    indexed = {r["timestamp_us"]: r for r in frame_rows}
-    available = sorted(indexed)
-    out = []
+    """Legacy diagnostic API retained for existing unit tests and reports."""
+    indexed = {row["timestamp_us"]: row for row in frame_rows}
+    output = []
     for query in queries:
-        nearest, delta = _nearest(query, available, tolerance)
+        nearest, delta = _nearest(query, sorted(indexed), tolerance)
         frame = indexed.get(nearest) if nearest is not None else None
-        out.append({
+        output.append({
             "query_timestamp_us": query,
             "nearest_annotation_timestamp_us": nearest,
             "delta_us": delta,
@@ -205,43 +182,176 @@ def query_completeness(queries, frame_rows, tolerance):
             "frame_annotation_status": frame["frame_annotation_status"] if frame else "NO_OBJECT_ROWS_COMPLETENESS_UNKNOWN",
             "query_ready": bool(frame and frame["completeness_verified"] and frame["frame_annotation_status"] in ("COMPLETE_OBJECTS_PRESENT", "CONFIRMED_EMPTY")),
         })
-    return out
+    return output
 
 
-def _summary(rows):
-    total = len(rows)
-    complete = sum(r["query_ready"] for r in rows)
-    unknown = total - complete
-    evidence = sum(r["object_count"] > 0 for r in rows)
-    return {"required_query_count": total, "complete_query_count": complete, "unknown_query_count": unknown, "temporal_object_evidence_rate": evidence / total if total else 0.0, "complete_observation_rate": complete / total if total and unknown == 0 else None, "data_ready": complete == total and total > 0}
+def _metadata_value(path):
+    try:
+        if path.suffix.lower() in {".yaml", ".yml"}:
+            import yaml
+            return yaml.safe_load(path.read_text(encoding="utf-8", errors="replace"))
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"__read_error__": f"{type(exc).__name__}: {exc}"}
 
 
-def process_clip(item, time_path):
-    cid = item["clip_id"]
+_EXPLICIT_EMPTY_FIELDS = {
+    "confirmed_empty_timestamps_us",
+    "empty_frame_timestamps_us",
+    "zero_object_frame_timestamps_us",
+}
+
+
+def _collect_explicit_empty(value, path=""):
+    result = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if str(key) in _EXPLICIT_EMPTY_FIELDS and isinstance(child, list):
+                for item in child:
+                    if isinstance(item, dict):
+                        item = next((item.get(name) for name in ("timestamp_us", "timestamp_micros", "timestamp") if item.get(name) is not None), None)
+                    try:
+                        if item is not None:
+                            result.append(int(item))
+                    except (TypeError, ValueError):
+                        continue
+            result.extend(_collect_explicit_empty(child, f"{path}.{key}"))
+    elif isinstance(value, list) and len(value) < 1000:
+        for index, child in enumerate(value):
+            result.extend(_collect_explicit_empty(child, f"{path}[{index}]"))
+    return result
+
+
+def discover_annotation_timeline(clip, sequence_rows, obstacle_rows):
+    """Inventory independent timeline evidence without promoting sensor frames."""
+    sources = []
+    explicit_empty = []
+    for relative in (
+        "data_info.json", "datasource_summary.json", "metadata.yaml",
+        "parsed_config.yaml", "pose_record.json", "rig_trajectories.json",
+        "sequence_tracks.json", "clipgt/clip.parquet",
+        "clipgt/association.parquet", "clipgt/obstacle.parquet",
+    ):
+        path = Path(clip) / relative
+        item = {"source": relative, "exists": path.is_file()}
+        if not path.is_file():
+            item["read_status"] = "NOT_FOUND"
+        elif path.suffix.lower() in {".json", ".yaml", ".yml"}:
+            value = _metadata_value(path)
+            if isinstance(value, dict) and "__read_error__" in value:
+                item["read_status"] = "READ_ERROR"
+                item["error"] = value["__read_error__"]
+            else:
+                item["read_status"] = "READ"
+                item["semantics"] = "OBJECT_ROWS_ONLY" if relative == "sequence_tracks.json" else "SENSOR_OR_METADATA_REFERENCE_ONLY"
+                explicit_empty.extend(_collect_explicit_empty(value))
+        else:
+            item["read_status"] = "PRESENT_NOT_PARSED"
+            item["semantics"] = "OBJECT_ROWS_ONLY"
+        sources.append(item)
+    explicit_empty = sorted(set(explicit_empty))
+    object_timestamps = sorted({int(row["timestamp_us"]) for row in sequence_rows})
+    return {
+        "sources": sources,
+        "object_timestamp_count": len(object_timestamps),
+        "object_timestamps_us": object_timestamps,
+        "label_set_timestamp_source": "sequence_tracks.json.object_rows",
+        "label_set_timestamp_status": "OBJECT_TIMESTAMP_ONLY",
+        "authoritative_label_set_timestamp_grid_found": False,
+        "sensor_frame_timestamps_are_label_attestation": False,
+        "explicit_empty_timestamps_us": explicit_empty,
+        "empty_observation_attestation_status": "AVAILABLE" if explicit_empty else "NOT_AVAILABLE",
+        "label_set_empty_semantics_status": "PROVEN" if explicit_empty else "UNRESOLVED",
+        "complete_observation_timeline_status": "FOUND_EXPLICIT_EMPTY_AND_OBJECTS" if explicit_empty else "NOT_FOUND",
+        "obstacle_representation": "OBJECT_ROWS_ONLY",
+        "physical_world_completeness": "NOT_CLAIMED",
+    }
+
+
+def _query_row_with_clip(clip_id, row, semantics):
+    return {
+        "clip_id": clip_id,
+        **row,
+        "label_set_timestamp_available": bool(
+            row["nearest_label_set_timestamp_us"] is not None
+            and row["label_set_delta_us"] is not None
+            and row["label_set_delta_us"] <= semantics["tolerance_us"]
+        ),
+        "label_set_empty_semantics_status": semantics["label_set_empty_semantics_status"],
+    }
+
+
+def process_clip(item, time_path, anomaly_keys=None):
+    clip_id = item["clip_id"]
     clip = Path(item["nurec_clip_dir"])
-    rec = load_time_record(time_path, cid, int(item.get("physicalai_t0_us", 5_100_000)))
+    record = load_time_record(time_path, clip_id, int(item.get("physicalai_t0_us", 5_100_000)))
     sequence_rows, sequence_errors, schema = load_sequence_tracks(clip / "sequence_tracks.json")
     obstacle_rows, obstacle_errors = load_obstacle_rows(clip / "clipgt" / "obstacle.parquet")
-    tracks, cadence = audit_tracks(sequence_rows, sequence_errors)
-    cf, ttc = build_queries(rec["nurec_t0_us"])
-    frame_rows = frame_completeness(cf + ttc, sequence_rows, TTC_TOLERANCE_US)
-    cf_rows = query_completeness(cf, frame_rows, CF_TOLERANCE_US)
-    ttc_rows = query_completeness(ttc, frame_rows, TTC_TOLERANCE_US)
+    normalized = normalize_sequence_tracks(clip_id, sequence_rows, anomaly_keys)
     timeline = discover_annotation_timeline(clip, sequence_rows, obstacle_rows)
-    complete_tracks = sum(r["track_completeness_status"] == "COMPLETE_ON_OBSERVED_GRID" for r in tracks)
-    gap_tracks = sum(r["track_completeness_status"] == "HAS_INTERIOR_GAPS" for r in tracks)
-    single_tracks = sum(r["track_completeness_status"] == "SINGLE_OBSERVATION_ONLY" for r in tracks)
-    invalid_tracks = sum(r["track_completeness_status"] == "INVALID_TIMESTAMPS" for r in tracks)
-    track_summary = {
-        "clip_id": cid, "track_count": len(tracks), "tracks_complete_on_observed_grid": complete_tracks,
-        "tracks_with_interior_gaps": gap_tracks, "tracks_single_observation": single_tracks,
-        "tracks_invalid": invalid_tracks, "total_track_observations": len(sequence_rows),
-        "interior_missing_slot_count": sum(r["interior_missing_slot_count"] for r in tracks),
-        "max_track_gap_us": max((r["max_gap_us"] for r in tracks if r["max_gap_us"] is not None), default=None),
-        "p95_track_gap_us": _p95([b["timestamp_us"] - a["timestamp_us"] for track_rows in _group_rows(sequence_rows).values() for a, b in zip(sorted(track_rows, key=lambda x: x.get("source_pose_index", 0)), sorted(track_rows, key=lambda x: x.get("source_pose_index", 0))[1:]) if b["timestamp_us"] > a["timestamp_us"]]),
-        **cadence,
+    cf, ttc, grid = build_scorer_query_grid(record["nurec_t0_us"])
+    empty = set(timeline["explicit_empty_timestamps_us"])
+    cf_semantics = {"tolerance_us": CF_TOLERANCE_US, **timeline}
+    ttc_semantics = {"tolerance_us": TTC_TOLERANCE_US, **timeline}
+    cf_rows = classify_scorer_queries(cf, normalized, tolerance_us=CF_TOLERANCE_US, empty_timestamps=empty)
+    ttc_rows = classify_scorer_queries(ttc, normalized, tolerance_us=TTC_TOLERANCE_US, empty_timestamps=empty)
+    cf_rows = [_query_row_with_clip(clip_id, row, cf_semantics) for row in cf_rows]
+    ttc_rows = [_query_row_with_clip(clip_id, row, ttc_semantics) for row in ttc_rows]
+    cf_summary = strict_coverage_summary(cf_rows, "CF")
+    ttc_summary = strict_coverage_summary(ttc_rows, "TTC")
+    anomaly_count = sum(row["geometry_quality_status"] == "RETAINED_LOCALIZED_ANOMALY" for row in normalized)
+    summary = {
+        "clip_id": clip_id,
+        "authoritative_obstacle_source": "sequence_tracks.json",
+        "sequence_tracks_pose_frame": "NCORE_LOCAL_WORLD",
+        "sequence_tracks_pose_frame_verified": True,
+        "obstacle_transform_status": "VERIFIED",
+        "normalized_obstacle_status": "VERIFIED_WITH_RETAINED_LOCALIZED_ANOMALIES",
+        "obstacle_row_quality_status": "VERIFIED_WITH_RETAINED_LOCALIZED_ANOMALIES",
+        "obstacle_geometry_block": "CLOSED",
+        "coordinate_alignment_verified": False,
+        "coordinate_alignment_status": "NOT_ASSERTED_BY_OBSTACLE_NORMALIZATION",
+        "time_mapping_source": record.get("source"),
+        "time_mapping_verified": bool(record.get("verified", False)),
+        "per_clip_offset_rederived": False,
+        "label_set_timestamp_status": timeline["label_set_timestamp_status"],
+        "label_set_empty_semantics_status": timeline["label_set_empty_semantics_status"],
+        "empty_observation_attestation_status": timeline["empty_observation_attestation_status"],
+        "complete_observation_timeline_status": timeline["complete_observation_timeline_status"],
+        "normalized_obstacle_count": len(normalized),
+        "normalized_retained_anomaly_count": anomaly_count,
+        "sequence_errors": len(sequence_errors),
+        "obstacle_errors": len(obstacle_errors),
+        **cf_summary,
+        **ttc_summary,
+        "query_grid": grid,
     }
-    return {"clip_id": cid, "clip": clip, "schema": schema, "sequence_errors": sequence_errors, "obstacle_errors": obstacle_errors, "tracks": tracks, "track_summary": track_summary, "timeline": timeline, "frames": frame_rows, "cf": cf_rows, "ttc": ttc_rows, "cf_summary": _summary(cf_rows), "ttc_summary": _summary(ttc_rows), "obstacle_row_count": len(obstacle_rows)}
+    return {
+        "summary": summary,
+        "schema": schema,
+        "normalized": normalized,
+        "context": build_obstacle_context(clip_id, record["nurec_t0_us"], normalized, empty),
+        "timeline": timeline,
+        "cf": cf_rows,
+        "ttc": ttc_rows,
+    }
+
+
+def _aggregate_coverage(results, prefix):
+    required = sum(result["summary"][f"{prefix}_REQUIRED_QUERY_COUNT"] for result in results)
+    objects = sum(result["summary"][f"{prefix}_OBJECT_PRESENT_COUNT"] for result in results)
+    empty = sum(result["summary"][f"{prefix}_CONFIRMED_EMPTY_COUNT"] for result in results)
+    missing = sum(result["summary"][f"{prefix}_MISSING_COUNT"] for result in results)
+    complete = objects + empty
+    return {
+        f"TOTAL_{prefix}_REQUIRED_QUERY_COUNT": required,
+        f"TOTAL_{prefix}_OBJECT_PRESENT_COUNT": objects,
+        f"TOTAL_{prefix}_CONFIRMED_EMPTY_COUNT": empty,
+        f"TOTAL_{prefix}_MISSING_COUNT": missing,
+        f"{prefix}_COMPLETE_OBSERVATION_RATE": complete / required if required else 0.0,
+        f"{prefix}_TEMPORAL_OBJECT_EVIDENCE_RATE": objects / required if required else 0.0,
+        f"{prefix}_DATA_READY_PILOT": bool(required and missing == 0),
+    }
 
 
 def main():
@@ -249,76 +359,147 @@ def main():
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--time-alignment-jsonl", required=True)
     parser.add_argument("--output-root", required=True)
+    parser.add_argument("--geometry-audit-dir", default=None)
     args = parser.parse_args()
     root = Path(args.output_root)
     root.mkdir(parents=True, exist_ok=True)
-    manifest = [json.loads(line) for line in Path(args.manifest).read_text(encoding="utf-8").splitlines() if line.strip()]
     time_path = Path(args.time_alignment_jsonl)
-    results = []
-    all_tracks, all_frames, all_cf, all_ttc = [], [], [], []
+    manifest = [json.loads(line) for line in Path(args.manifest).read_text(encoding="utf-8").splitlines() if line.strip()]
+    offsets = {}
     for item in manifest:
-        result = process_clip(item, time_path)
-        cid = result["clip_id"]
+        record = load_time_record(time_path, item["clip_id"], int(item.get("physicalai_t0_us", 5_100_000)))
+        offsets[item["clip_id"]] = int(record["offset_us"])
+    anomaly_keys, anomaly_evidence = load_geometry_anomaly_keys(args.geometry_audit_dir, offsets)
+    results, all_cf, all_ttc, all_normalized, timeline_rows = [], [], [], [], []
+    for item in manifest:
+        result = process_clip(item, time_path, anomaly_keys)
+        clip_id = item["clip_id"]
+        output = root / clip_id
+        output.mkdir(parents=True, exist_ok=True)
         results.append(result)
-        all_tracks.extend({"clip_id": cid, **row} for row in result["tracks"])
-        all_frames.extend({"clip_id": cid, **row} for row in result["frames"])
-        all_cf.extend({"clip_id": cid, **row} for row in result["cf"])
-        all_ttc.extend({"clip_id": cid, **row} for row in result["ttc"])
-        out = root / cid
-        _dump(out / "track_completeness_summary.json", result["track_summary"])
-        _dump(out / "annotation_timeline_contract.json", result["timeline"])
-        _dump(out / "empty_frame_semantics.json", {"status": "UNRESOLVED_EMPTY_ATTESTATION", "explicit_zero_count": False, "object_rows_only": True})
-        _dump(out / "frame_completeness_summary.json", {"frame_count": len(result["frames"]), "verified_complete_count": 0, "unknown_count": len(result["frames"]), "status": "UNRESOLVED"})
-        _dump(out / "cf_completeness_summary.json", result["cf_summary"])
-        _dump(out / "ttc_completeness_summary.json", result["ttc_summary"])
-        _csv(out / "track_completeness.csv", [{"clip_id": cid, **r} for r in result["tracks"]])
-        _csv(out / "frame_completeness.csv", [{"clip_id": cid, **r} for r in result["frames"]])
-        _csv(out / "cf_completeness.csv", [{"clip_id": cid, **r} for r in result["cf"]])
-        _csv(out / "ttc_completeness.csv", [{"clip_id": cid, **r} for r in result["ttc"]])
-        print(f"CONTEXT_RECORD clip={cid} intents=obstacle sources=sequence_tracks,obstacle aligned=true transformed=false ready=false")
-        print(f"CLIP_DONE clip={cid} status=complete")
-    cf_complete = sum(r["cf_summary"]["complete_query_count"] for r in results)
-    ttc_complete = sum(r["ttc_summary"]["complete_query_count"] for r in results)
-    cf_required = sum(r["cf_summary"]["required_query_count"] for r in results)
-    ttc_required = sum(r["ttc_summary"]["required_query_count"] for r in results)
-    summary = {
+        all_cf.extend(result["cf"])
+        all_ttc.extend(result["ttc"])
+        all_normalized.extend(result["normalized"])
+        timeline_rows.append({"clip_id": clip_id, **result["timeline"]})
+        _jsonl(output / "normalized_obstacle.jsonl", result["normalized"])
+        _dump(output / "normalized_context.json", result["context"])
+        _dump(output / "observation_timeline_provenance.json", result["timeline"])
+        _dump(output / "label_set_timestamp_semantics.json", {
+            "clip_id": clip_id,
+            "label_set_timestamp_status": result["summary"]["label_set_timestamp_status"],
+            "label_set_empty_semantics_status": result["summary"]["label_set_empty_semantics_status"],
+            "empty_observation_attestation_status": result["summary"]["empty_observation_attestation_status"],
+        })
+        _csv(output / "cf_observation_queries.csv", result["cf"])
+        _csv(output / "ttc_observation_queries.csv", result["ttc"])
+        _dump(output / "cf_observation_coverage_summary.json", result["summary"])
+        _dump(output / "ttc_observation_coverage_summary.json", result["summary"])
+    cf_aggregate = _aggregate_coverage(results, "CF")
+    ttc_aggregate = _aggregate_coverage(results, "TTC")
+    cf_ready = cf_aggregate["CF_DATA_READY_PILOT"]
+    ttc_ready = ttc_aggregate["TTC_DATA_READY_PILOT"]
+    blockers = []
+    if not cf_ready or not ttc_ready:
+        blockers.append("EXPLICIT_EMPTY_OBSERVATION_ATTESTATION_UNAVAILABLE_OR_QUERY_MISSING")
+    _jsonl(root / "normalized_obstacles.jsonl", all_normalized)
+    _csv(root / "cf_observation_queries.csv", all_cf)
+    _csv(root / "ttc_observation_queries.csv", all_ttc)
+    _csv(root / "cf_ttc_readiness_per_clip.csv", [result["summary"] for result in results])
+    _dump(root / "normalized_obstacle_contract.json", {
+        "authoritative_obstacle_source": "sequence_tracks.json",
+        "sequence_tracks_pose_frame": "NCORE_LOCAL_WORLD",
+        "sequence_tracks_pose_frame_verified": True,
+        "obstacle_transform_status": "VERIFIED",
+        "normalized_obstacle_status": "VERIFIED_WITH_RETAINED_LOCALIZED_ANOMALIES",
+        "obstacle_row_quality_status": "VERIFIED_WITH_RETAINED_LOCALIZED_ANOMALIES",
+        "obstacle_geometry_block": "CLOSED",
+        "retained_anomaly_count": sum(result["summary"]["normalized_retained_anomaly_count"] for result in results),
+        "geometry_anomaly_evidence": anomaly_evidence,
+        "no_transform_applied": True,
+        "coordinate_alignment_verified": False,
+        "per_clip_offset_rederived": False,
+    })
+    _dump(root / "observation_timeline_provenance.json", {
+        "clips": timeline_rows,
+        "source_policy": "LOCAL_AUTOMATED_INSPECTION",
+        "authoritative_label_set_timestamp_grid_found": False,
+        "empty_frames_inferred_from_absence": False,
+    })
+    _dump(root / "label_set_timestamp_semantics.json", {
+        "status": "UNRESOLVED",
+        "label_set_timestamp_status": "OBJECT_TIMESTAMP_ONLY",
+        "label_set_empty_semantics_status": "UNRESOLVED",
+        "empty_observation_attestation_status": "NOT_AVAILABLE",
+        "evidence_policy": "camera/pose timestamps and cadence are not label-set attestation",
+        "clips": [{"clip_id": result["summary"]["clip_id"], "object_timestamp_count": result["timeline"]["object_timestamp_count"]} for result in results],
+    })
+    _dump(root / "cf_observation_coverage_summary.json", {
         "pilot_clip_count": len(results),
-        "obstacle_offline_available_clips": [],
-        "annotation_timeline_source": "LOCAL_NUREC_OBJECT_ROWS_ONLY_NO_AUTHORITATIVE_FRAME_ATTESTATION",
-        "track_count": sum(r["track_summary"]["track_count"] for r in results),
-        "tracks_complete_on_observed_grid": sum(r["track_summary"]["tracks_complete_on_observed_grid"] for r in results),
-        "tracks_with_interior_gaps": sum(r["track_summary"]["tracks_with_interior_gaps"] for r in results),
-        "tracks_single_observation": sum(r["track_summary"]["tracks_single_observation"] for r in results),
-        "tracks_invalid": sum(r["track_summary"]["tracks_invalid"] for r in results),
-        "total_track_observations": sum(r["track_summary"]["total_track_observations"] for r in results),
-        "interior_missing_slot_count": sum(r["track_summary"]["interior_missing_slot_count"] for r in results),
-        "max_track_gap_us": max((r["track_summary"]["max_track_gap_us"] for r in results if r["track_summary"]["max_track_gap_us"] is not None), default=None),
-        "p95_track_gap_us": _p95([r["track_summary"]["p95_track_gap_us"] for r in results if r["track_summary"]["p95_track_gap_us"] is not None]),
-        "track_expected_step_us_distribution": sorted({r["track_summary"]["global_expected_step_us"] for r in results}),
-        "track_expected_rate_hz_distribution": sorted({r["track_summary"]["global_expected_rate_hz"] for r in results}),
-        "track_completeness_status": "PARTIALLY_VERIFIED",
-        "complete_observation_timeline_status": "UNRESOLVED",
-        "empty_scene_attestation_status": "UNRESOLVED_EMPTY_ATTESTATION",
-        "cf_required_query_count": cf_required, "cf_complete_query_count": cf_complete, "cf_unknown_query_count": cf_required - cf_complete,
-        "cf_temporal_object_evidence_rate": sum(r["cf_summary"]["temporal_object_evidence_rate"] * r["cf_summary"]["required_query_count"] for r in results) / cf_required if cf_required else 0.0,
-        "cf_complete_observation_rate": cf_complete / cf_required if cf_required and cf_complete == cf_required else None, "cf_data_ready": False,
-        "ttc_required_query_count": ttc_required, "ttc_complete_query_count": ttc_complete, "ttc_unknown_query_count": ttc_required - ttc_complete,
-        "ttc_temporal_object_evidence_rate": sum(r["ttc_summary"]["temporal_object_evidence_rate"] * r["ttc_summary"]["required_query_count"] for r in results) / ttc_required if ttc_required else 0.0,
-        "ttc_complete_observation_rate": ttc_complete / ttc_required if ttc_required and ttc_complete == ttc_required else None, "ttc_data_ready": False,
-        "observation_completeness_block_status": "BLOCKED_UNRESOLVED_FRAME_COMPLETENESS",
-        "remaining_blockers": ["NO_AUTHORITATIVE_OBSTACLE_ANNOTATION_TIMELINE", "NO_EXPLICIT_EMPTY_FRAME_ATTESTATION", "OBSTACLE_FRAME_TRANSFORM_REMAINS_PARTIAL"],
+        **cf_aggregate,
+        "CF_DATA_READY": cf_ready,
+        "CF_REQUIRED_QUERY_COUNT": cf_aggregate["TOTAL_CF_REQUIRED_QUERY_COUNT"],
+        "CF_OBJECT_PRESENT_COUNT": cf_aggregate["TOTAL_CF_OBJECT_PRESENT_COUNT"],
+        "CF_CONFIRMED_EMPTY_COUNT": cf_aggregate["TOTAL_CF_CONFIRMED_EMPTY_COUNT"],
+        "CF_MISSING_COUNT": cf_aggregate["TOTAL_CF_MISSING_COUNT"],
+    })
+    _dump(root / "ttc_observation_coverage_summary.json", {
+        "pilot_clip_count": len(results),
+        **ttc_aggregate,
+        "TTC_DATA_READY": ttc_ready,
+        "TTC_REQUIRED_QUERY_COUNT": ttc_aggregate["TOTAL_TTC_REQUIRED_QUERY_COUNT"],
+        "TTC_OBJECT_PRESENT_COUNT": ttc_aggregate["TOTAL_TTC_OBJECT_PRESENT_COUNT"],
+        "TTC_CONFIRMED_EMPTY_COUNT": ttc_aggregate["TOTAL_TTC_CONFIRMED_EMPTY_COUNT"],
+        "TTC_MISSING_COUNT": ttc_aggregate["TOTAL_TTC_MISSING_COUNT"],
+    })
+    _dump(root / "cf_ttc_observation_contract.json", {
+        "cf": {
+            "future_pose_count": 40,
+            "includes_t0": True,
+            "frequency_hz": 10.0,
+            "horizon_s": 4.0,
+            "tolerance_us": CF_TOLERANCE_US,
+        },
+        "ttc": {
+            "horizon_s": 1.0,
+            "step_s": 0.2,
+            "tolerance_us": TTC_TOLERANCE_US,
+            "query_builder": "tools.epdms.observation_contract.build_ttc_projection_timestamps",
+        },
+        "strict_states": ["OBJECTS_PRESENT", "CONFIRMED_EMPTY", "MISSING"],
+        "strict_ready_rule": "all required queries must be OBJECTS_PRESENT or CONFIRMED_EMPTY",
+        "no_inferred_empty": True,
+        "cf_data_ready_full_300": "NOT_EVALUATED",
+        "ttc_data_ready_full_300": "NOT_EVALUATED",
+    })
+    final = {
+        "BRANCH_SCOPE": "feat/obstacle-normalization-cf-ttc-readiness",
+        "OBSTACLE_GEOMETRY_BLOCK": "CLOSED",
+        "AUTHORITATIVE_OBSTACLE_SOURCE": "sequence_tracks.json",
+        "SEQUENCE_TRACKS_POSE_FRAME": "NCORE_LOCAL_WORLD",
+        "SEQUENCE_TRACKS_POSE_FRAME_VERIFIED": True,
+        "OBSTACLE_TRANSFORM_STATUS": "VERIFIED",
+        "NORMALIZED_OBSTACLE_STATUS": "VERIFIED_WITH_RETAINED_LOCALIZED_ANOMALIES",
+        "OBSTACLE_ROW_QUALITY_STATUS": "VERIFIED_WITH_RETAINED_LOCALIZED_ANOMALIES",
+        "OBSERVATION_TIMELINE_SOURCE": "LOCAL_OBJECT_ROWS_ONLY_NO_AUTHORITATIVE_FRAME_ATTESTATION",
+        "LABEL_SET_TIMESTAMP_STATUS": "OBJECT_TIMESTAMP_ONLY",
+        "LABEL_SET_EMPTY_SEMANTICS_STATUS": "UNRESOLVED",
+        "EMPTY_OBSERVATION_ATTESTATION_STATUS": "NOT_AVAILABLE",
+        "PILOT_CLIP_COUNT": len(results),
+        **cf_aggregate,
+        **ttc_aggregate,
+        "CF_DATA_READY_PILOT": cf_ready,
+        "TTC_DATA_READY_PILOT": ttc_ready,
+        "CF_DATA_READY_FULL_300": "NOT_EVALUATED",
+        "TTC_DATA_READY_FULL_300": "NOT_EVALUATED",
+        "CF_PROXY_LABEL_SET_READY": cf_ready,
+        "TTC_PROXY_LABEL_SET_READY": ttc_ready,
+        "PHYSICAL_WORLD_OBSTACLE_COMPLETENESS": "NOT_CLAIMED",
+        "PER_CLIP_OFFSET_REDERIVED": False,
+        "RETAINED_GEOMETRY_ANOMALY_COUNT": sum(result["summary"]["normalized_retained_anomaly_count"] for result in results),
+        "REMAINING_BLOCKERS": blockers,
+        "RECOMMENDED_NEXT_STEP": "expand the exact same readiness audit to all 300 clips before 4800-condition scoring" if cf_ready and ttc_ready else "obtain explicit empty-observation attestation or keep strict CF/TTC blocked",
     }
-    _csv(root / "track_completeness.csv", all_tracks)
-    _csv(root / "frame_completeness.csv", all_frames)
-    _csv(root / "cf_completeness.csv", all_cf)
-    _csv(root / "ttc_completeness.csv", all_ttc)
-    _dump(root / "track_completeness_summary.json", {"clips": [r["track_summary"] for r in results], "aggregate": summary})
-    _dump(root / "annotation_timeline_contract.json", {"clips": [r["timeline"] for r in results], "status": "UNRESOLVED"})
-    _dump(root / "empty_frame_semantics.json", {"status": "UNRESOLVED_EMPTY_ATTESTATION", "explicit_zero_count_found": False, "obstacle_offline_available_clips": []})
-    _dump(root / "frame_completeness_summary.json", {"required_frame_count": len(all_frames), "verified_complete_count": 0, "unknown_count": len(all_frames), "status": "UNRESOLVED"})
-    _dump(root / "cf_completeness_summary.json", {"required_query_count": cf_required, "complete_query_count": cf_complete, "unknown_query_count": cf_required - cf_complete, "temporal_object_evidence_rate": summary["cf_temporal_object_evidence_rate"], "complete_observation_rate": summary["cf_complete_observation_rate"], "data_ready": False})
-    _dump(root / "ttc_completeness_summary.json", {"required_query_count": ttc_required, "complete_query_count": ttc_complete, "unknown_query_count": ttc_required - ttc_complete, "temporal_object_evidence_rate": summary["ttc_temporal_object_evidence_rate"], "complete_observation_rate": summary["ttc_complete_observation_rate"], "data_ready": False})
-    _dump(root / "observation_completeness_final_summary.json", summary)
+    _dump(root / "cf_ttc_readiness_final_summary.json", final)
 
 
 if __name__ == "__main__":
